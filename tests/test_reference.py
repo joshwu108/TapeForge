@@ -117,9 +117,6 @@ def test_burst_of_100_records_matches_closed_form() -> None:
     assert f.vwap[3] == pytest.approx(expected_vwap, rel=contract.VWAP_RTOL)
 
 
-def test_out_of_order_input_is_rejected_not_silently_wrong() -> None:
-    trades = _trades([(5, 100.0, 1.0, False), (1, 100.0, 1.0, False)])
-    with pytest.raises(ValueError, match="non-decreasing"):
-        windows.build_offsets(
-            trades["timestamp"], 0, 10, contract.DEFAULT_BUCKET_WIDTH_US
-        )
+# Out-of-order input is rejected by windows.build_offsets, which owns that
+# precondition; see test_windows.py::test_non_monotonic_input_names_the_
+# offending_record. The reference never sees unsorted records.
