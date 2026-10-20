@@ -53,6 +53,11 @@ data/
 *.parquet
 *.feather
 
+# Exception: the tiny committed test fixtures. They are 5-row excerpts, not
+# datasets, and a fresh clone cannot run the ingest tests without them.
+!tests/fixtures/
+!tests/fixtures/**
+
 # Profiler and trace artifacts
 *.nsys-rep
 *.sqlite

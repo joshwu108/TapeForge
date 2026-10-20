@@ -1,12 +1,21 @@
 """Public aggTrades loading, normalization and validation (TF-02).
 
-Loads one symbol / one day of Binance spot ``aggTrades`` from the public
-archive, normalizes timestamps to ``contract.TIME_UNIT``, converts price and
-quantity to scaled integers, and records dataset provenance.
+Loads one symbol-day of Binance spot ``aggTrades`` from the public archive,
+normalizes timestamps to ``contract.TIME_UNIT``, converts price and quantity
+to exactly scaled integers, and records dataset provenance.
 
-Never trust the archive: validate the column count, the timestamp unit
-(microseconds from 2025-01-01, milliseconds before -- PRD section 3), the
-sort order, and the checksum before any feature code sees the rows.
+Never trust the archive. Two layouts have shipped:
+
+  * 2025 onward: a header row, ``transact_time`` in **microseconds**;
+  * earlier:     no header row, ``transact_time`` in **milliseconds**.
+
+Both are detected from the file itself rather than from the filename, since a
+filename can be renamed and a unit cannot. Column count, value signs, decimal
+precision, timestamp plausibility and sort order are all checked before any
+feature code sees the rows.
+
+A row is an *aggregate* trade record, not an individual fill. Record counts
+in this project always mean aggregate-trade records (PRD section 3).
 
 Downloaded archives land in ``data/`` and are git-ignored (PRD section 10:
 do not commit large downloaded files).
@@ -18,11 +27,44 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
+import io
+import zipfile
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Final
 
 import numpy as np
 
-BASE_URL = "https://data.binance.vision/data/spot/daily/aggTrades"
+from tapeforge.contract import (
+    PRICE_SCALE,
+    QUANTITY_SCALE,
+    TRADE_DTYPE,
+    US_PER_SECOND,
+)
+
+BASE_URL: Final[str] = "https://data.binance.vision/data/spot/daily/aggTrades"
+
+# Column layout. Spot ships 8 columns; some mirrors drop is_best_match.
+EXPECTED_COLUMNS: Final[tuple[int, ...]] = (7, 8)
+COL_AGG_TRADE_ID: Final[int] = 0
+COL_PRICE: Final[int] = 1
+COL_QUANTITY: Final[int] = 2
+COL_TRANSACT_TIME: Final[int] = 5
+COL_IS_BUYER_MAKER: Final[int] = 6
+
+# Timestamp unit detection. A microsecond timestamp for any plausible date is
+# ~1e15; a millisecond one is ~1e12. Anything above this threshold is us.
+US_DETECTION_THRESHOLD: Final[int] = 10**14
+
+# Plausibility window for a normalized timestamp, in microseconds:
+# 2015-01-01 to 2100-01-01. Outside this, the unit detection was wrong.
+MIN_PLAUSIBLE_US: Final[int] = 1_420_070_400 * US_PER_SECOND
+MAX_PLAUSIBLE_US: Final[int] = 4_102_444_800 * US_PER_SECOND
+
+TRUE_STRINGS: Final[frozenset[str]] = frozenset({"true", "True", "TRUE", "1"})
+FALSE_STRINGS: Final[frozenset[str]] = frozenset({"false", "False", "FALSE", "0"})
 
 
 @dataclass(frozen=True)
@@ -35,6 +77,7 @@ class Provenance:
     sha256: str
     n_records: int
     timestamp_unit: str
+    was_resorted: bool = False
 
 
 def archive_url(symbol: str, date: str) -> str:
@@ -42,14 +85,192 @@ def archive_url(symbol: str, date: str) -> str:
     return f"{BASE_URL}/{symbol}/{symbol}-aggTrades-{date}.zip"
 
 
-def load_agg_trades(path: str) -> tuple[np.ndarray, Provenance]:
+def _scale_digits(scale: int) -> int:
+    """Number of decimal places a power-of-ten scale can represent exactly."""
+    digits = len(str(scale)) - 1
+    if 10**digits != scale:
+        raise ValueError(f"scale {scale} is not a power of ten")
+    return digits
+
+
+def decimal_strings_to_ticks(values: np.ndarray, scale: int) -> np.ndarray:
+    """Convert decimal strings to exactly scaled int64 ticks.
+
+    Integer string arithmetic, not a float round-trip: ``"100.12345678"`` at
+    scale 1e8 must come out as exactly ``10012345678``, and a value carrying
+    more precision than the scale can hold is an error rather than a silent
+    truncation.
+
+    Raises:
+        ValueError: on a negative value, scientific notation, more than one
+            decimal point, or precision beyond ``scale``.
+    """
+    digits = _scale_digits(scale)
+    text = np.asarray(values, dtype=np.str_)
+    if text.size == 0:
+        return np.zeros(0, dtype=np.int64)
+
+    if np.any(np.char.find(np.char.lower(text), "e") >= 0):
+        raise ValueError("scientific notation is not supported; expected plain decimals")
+    # Leading sign only: a "-" elsewhere belongs to an exponent, caught above.
+    if np.any(np.char.startswith(np.char.strip(text), "-")):
+        raise ValueError("negative price or quantity in the archive; refusing to continue")
+    if np.any(np.char.count(text, ".") > 1):
+        raise ValueError("value with more than one decimal point")
+
+    whole, _, frac = (np.char.partition(text, ".")[:, i] for i in range(3))
+    if np.any(np.char.str_len(frac) > digits):
+        worst = text[np.argmax(np.char.str_len(frac))]
+        raise ValueError(
+            f"value {worst!r} carries more precision than the {digits}-digit scale "
+            f"{scale} can represent exactly; change the scale rather than truncating"
+        )
+
+    whole = np.where(whole == "", "0", whole)
+    frac = np.char.ljust(frac, digits, "0")
+    frac = np.where(frac == "", "0" * digits, frac)
+    return whole.astype(np.int64) * scale + frac.astype(np.int64)
+
+
+def detect_timestamp_unit(raw: np.ndarray) -> str:
+    """Return "us" or "ms" from the magnitude of the raw timestamps."""
+    if raw.size == 0:
+        raise ValueError("no records: cannot detect the timestamp unit")
+    return "us" if int(raw.max()) > US_DETECTION_THRESHOLD else "ms"
+
+
+def _booleans(values: np.ndarray) -> np.ndarray:
+    """Parse the ``is_buyer_maker`` column strictly: no silent truthiness."""
+    text = np.asarray(values, dtype=np.str_)
+    is_true = np.isin(text, list(TRUE_STRINGS))
+    is_false = np.isin(text, list(FALSE_STRINGS))
+    unknown = ~(is_true | is_false)
+    if np.any(unknown):
+        raise ValueError(f"unparseable is_buyer_maker value {text[unknown][0]!r}")
+    return is_true
+
+
+def _read_rows(path: Path) -> tuple[list[list[str]], bytes]:
+    """Return the CSV rows (header dropped) and the raw bytes for checksumming.
+
+    Accepts a ZIP exactly as the archive ships it, or a bare CSV.
+
+    TODO(week 6, if profiling says ingest matters): this parses with the csv
+    module, which costs roughly a microsecond per row and holds the rows as
+    Python strings. Fine at 1M records; revisit with chunked parsing only if a
+    trace shows this stage is the bottleneck (PRD section 10, overengineering).
+    """
+    raw = path.read_bytes()
+    if zipfile.is_zipfile(io.BytesIO(raw)):
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            names = [n for n in archive.namelist() if n.lower().endswith(".csv")]
+            if len(names) != 1:
+                raise ValueError(f"expected exactly one CSV inside {path.name}, found {names}")
+            text = archive.read(names[0]).decode("utf-8")
+    else:
+        text = raw.decode("utf-8")
+
+    rows = [row for row in csv.reader(io.StringIO(text)) if row]
+    if not rows:
+        raise ValueError(f"{path.name} contains no records")
+    if len(rows[0]) not in EXPECTED_COLUMNS:
+        raise ValueError(
+            f"{path.name} has {len(rows[0])} columns; expected one of {EXPECTED_COLUMNS}. "
+            "Is this an aggTrades file?"
+        )
+    if not rows[0][COL_AGG_TRADE_ID].lstrip("-").isdigit():
+        rows = rows[1:]  # header row (2025-onward layout)
+    if not rows:
+        raise ValueError(f"{path.name} contains no records after the header")
+    return rows, raw
+
+
+def _symbol_and_date(path: Path) -> tuple[str, str]:
+    """Best-effort provenance from the archive's documented filename pattern."""
+    parts = path.stem.split("-")
+    if len(parts) >= 5 and parts[1] == "aggTrades":
+        return parts[0], "-".join(parts[2:5])
+    return "unknown", "unknown"
+
+
+def load_agg_trades(path: str | Path) -> tuple[np.ndarray, Provenance]:
     """Parse a downloaded aggTrades ZIP/CSV into ``TRADE_DTYPE`` + provenance.
 
-    Note (PRD section 3): a row is an *aggregate* trade record, not an
-    individual fill. Record counts must be described as aggregate-trade
-    records in every benchmark report.
+    Returns a timestamp-sorted array. Duplicate timestamps are preserved:
+    several aggregate records legitimately share a millisecond.
     """
-    raise NotImplementedError("week 1: implement after tests/test_ingest.py is RED")
+    path = Path(path)
+    rows, raw = _read_rows(path)
+    columns = list(zip(*rows, strict=False))
+
+    raw_time = np.array(columns[COL_TRANSACT_TIME], dtype=np.int64)
+    unit = detect_timestamp_unit(raw_time)
+    timestamps = raw_time if unit == "us" else raw_time * 1_000
+    out_of_range = (timestamps < MIN_PLAUSIBLE_US) | (timestamps > MAX_PLAUSIBLE_US)
+    if np.any(out_of_range):
+        raise ValueError(
+            f"timestamp {int(timestamps[out_of_range][0])} is outside the plausible range "
+            f"after assuming {unit}; the unit detection is wrong for {path.name}"
+        )
+
+    trades = np.zeros(len(rows), dtype=TRADE_DTYPE)
+    trades["timestamp"] = timestamps
+    trades["price"] = decimal_strings_to_ticks(np.array(columns[COL_PRICE]), PRICE_SCALE)
+    trades["quantity"] = decimal_strings_to_ticks(
+        np.array(columns[COL_QUANTITY]), QUANTITY_SCALE
+    )
+    trades["buyer_is_maker"] = _booleans(np.array(columns[COL_IS_BUYER_MAKER]))
+    trades["agg_trade_id"] = np.array(columns[COL_AGG_TRADE_ID], dtype=np.int64)
+
+    was_resorted = bool(np.any(np.diff(trades["timestamp"]) < 0))
+    if was_resorted:
+        trades = trades[np.argsort(trades["timestamp"], kind="stable")]
+
+    symbol, date = _symbol_and_date(path)
+    return trades, Provenance(
+        symbol=symbol,
+        date=date,
+        url=archive_url(symbol, date),
+        sha256=hashlib.sha256(raw).hexdigest(),
+        n_records=len(rows),
+        timestamp_unit=unit,
+        was_resorted=was_resorted,
+    )
+
+
+def download(symbol: str, date: str, out_dir: str | Path = "data") -> Path:
+    """Fetch one symbol-day ZIP and verify it against the published CHECKSUM.
+
+    Network access lives here and nowhere else, so the test suite stays
+    offline and reproducible.
+    """
+    from urllib.request import urlopen  # local import: keeps the module import-light
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    url = archive_url(symbol, date)
+    target = out_dir / Path(url).name
+
+    if not target.exists():
+        print(f"downloading {url}")
+        with urlopen(url) as response, target.open("wb") as handle:  # noqa: S310
+            handle.write(response.read())
+
+    digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    try:
+        with urlopen(f"{url}.CHECKSUM") as response:  # noqa: S310
+            published = response.read().decode().split()[0]
+    except OSError as exc:
+        print(f"WARNING: could not fetch the published checksum ({exc}); local sha256 {digest}")
+        return target
+    if published != digest:
+        target.unlink()
+        raise ValueError(
+            f"checksum mismatch for {target.name}: published {published}, got {digest}. "
+            "The partial download was deleted."
+        )
+    print(f"checksum verified: {digest}")
+    return target
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,8 +279,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--date", default="2025-01-02")
     parser.add_argument("--out-dir", default="data")
-    parser.parse_args(argv)
-    raise NotImplementedError("week 1: implement after tests/test_ingest.py is RED")
+    parser.add_argument("--path", default=None, help="skip the download, read this file")
+    args = parser.parse_args(argv)
+
+    path = Path(args.path) if args.path else download(args.symbol, args.date, args.out_dir)
+    trades, prov = load_agg_trades(path)
+
+    span_s = (int(trades["timestamp"][-1]) - int(trades["timestamp"][0])) / US_PER_SECOND
+    print(f"{prov.symbol} {prov.date}: {prov.n_records} aggregate-trade records")
+    print(f"  sha256:    {prov.sha256}")
+    print(f"  timestamps: {prov.timestamp_unit} in the file, normalized to us")
+    print(f"  span:       {span_s:.1f} s, resorted: {prov.was_resorted}")
+    print(f"  price:      {trades['price'].min() / PRICE_SCALE:.8f}"
+          f" .. {trades['price'].max() / PRICE_SCALE:.8f}")
+    print(f"  quantity:   {trades['quantity'].min() / QUANTITY_SCALE:.8f}"
+          f" .. {trades['quantity'].max() / QUANTITY_SCALE:.8f}")
+    print(f"  buyer_is_maker true: {int(trades['buyer_is_maker'].sum())}")
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover
