@@ -45,11 +45,31 @@ def test_trade_dtype_carries_the_documented_fields() -> None:
     assert contract.TRADE_DTYPE["quantity"] == np.int64
 
 
-def test_scaled_integer_products_fit_in_int64() -> None:
-    """Overflow bound of the VWAP numerator, stated as a test (PRD section 6)."""
+def test_scaled_integer_products_fit_in_int64_at_real_magnitudes() -> None:
+    """D-003's overflow bound, asserted against measured data, not unit values.
+
+    The original version of this test multiplied PRICE_SCALE by
+    QUANTITY_SCALE -- a price of 1.0 and a quantity of 1.0 -- and so passed
+    happily while the committed scales overflowed int64 on a single row of
+    real BTCUSDT data. See planning/experiments.md E-002.
+    """
     max_i64 = np.iinfo(np.int64).max
-    # One bucket's numerator is sum(price_ticks * quantity_ticks).
-    worst_single_product = contract.PRICE_SCALE * contract.QUANTITY_SCALE
-    assert worst_single_product < max_i64
-    # Headroom left for accumulation across a bucket, in units of worst-case rows.
-    assert max_i64 // worst_single_product >= 1
+
+    # Measured on BTCUSDT 2025-01-02: the highest price and largest quantity.
+    worst_price_ticks = round(97_839.50 * contract.PRICE_SCALE)
+    worst_quantity_ticks = round(18.89042 * contract.QUANTITY_SCALE)
+    worst_row = worst_price_ticks * worst_quantity_ticks
+    assert worst_row < max_i64, "a single row overflows the VWAP numerator"
+
+    # The busiest second of that day, scaled to the chosen factors.
+    assert max_i64 > contract.MEASURED_MAX_BUCKET_NUMERATOR
+    assert max_i64 // contract.MEASURED_MAX_BUCKET_NUMERATOR > 1_000, (
+        "less than 1000x headroom on the measured worst bucket: too tight for "
+        "a busier symbol or a wider bucket"
+    )
+
+
+def test_scales_match_the_precision_the_canonical_day_actually_uses() -> None:
+    """BTCUSDT: 2 price decimals, 5 quantity decimals (measured)."""
+    assert contract.PRICE_SCALE == 10**2
+    assert contract.QUANTITY_SCALE == 10**5

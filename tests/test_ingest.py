@@ -26,15 +26,19 @@ ZIP_US = FIXTURES / "BTCUSDT-aggTrades-2025-01-02.zip"
 @pytest.mark.parametrize(
     ("text", "scale", "expected"),
     [
-        ("100.12345678", contract.PRICE_SCALE, 10_012_345_678),
+        # Archive formatting: everything is padded to 8 decimals, so the
+        # trailing zeros must not count against the scale (D-003).
+        ("94591.78000000", contract.PRICE_SCALE, 9_459_178),
+        ("94591.79000000", contract.PRICE_SCALE, 9_459_179),
         ("100", contract.PRICE_SCALE, 100 * contract.PRICE_SCALE),
-        ("0.00100000", contract.QUANTITY_SCALE, 100_000),
-        ("0.00000001", contract.QUANTITY_SCALE, 1),
+        ("0.00100000", contract.QUANTITY_SCALE, 100),
+        ("0.00001000", contract.QUANTITY_SCALE, 1),
         ("3.00000000", contract.QUANTITY_SCALE, 3 * contract.QUANTITY_SCALE),
+        ("18.89042000", contract.QUANTITY_SCALE, 1_889_042),
     ],
 )
 def test_decimal_strings_convert_exactly(text: str, scale: int, expected: int) -> None:
-    """No float round-trip: 100.12345678 must not land one tick off."""
+    """Integer string arithmetic, not a float round-trip: never a tick off."""
     got = ingest.decimal_strings_to_ticks(np.array([text]), scale)
     assert got.dtype == np.int64
     assert got[0] == expected
@@ -42,7 +46,23 @@ def test_decimal_strings_convert_exactly(text: str, scale: int, expected: int) -
 
 def test_precision_beyond_the_scale_is_rejected_not_truncated() -> None:
     with pytest.raises(ValueError, match="precision"):
-        ingest.decimal_strings_to_ticks(np.array(["1.123456789"]), contract.PRICE_SCALE)
+        ingest.decimal_strings_to_ticks(np.array(["1.123"]), contract.PRICE_SCALE)
+
+
+def test_trailing_zeros_are_not_precision() -> None:
+    """"1.10000000" is two significant decimals, not eight."""
+    got = ingest.decimal_strings_to_ticks(np.array(["1.10000000"]), contract.PRICE_SCALE)
+    assert got[0] == 110
+
+
+def test_a_symbol_the_scales_cannot_represent_fails_loudly(tmp_path: Path) -> None:
+    """D-003's accepted limitation: refuse, never truncate.
+
+    SHIBUSDT-style prices carry 8 significant decimals. The chosen BTCUSDT
+    scales cannot hold them, and the error says what to do about it.
+    """
+    with pytest.raises(ValueError, match="per-symbol scales"):
+        ingest.load_agg_trades(FIXTURES / "aggTrades_overprecise_price.csv")
 
 
 def test_negative_price_is_rejected() -> None:
@@ -84,9 +104,9 @@ def test_output_matches_the_trade_dtype() -> None:
 
 def test_prices_and_quantities_are_scaled_integers() -> None:
     trades, _ = ingest.load_agg_trades(CSV_US)
-    assert trades["price"][0] == 10_012_345_678
+    assert trades["price"][0] == 9_459_178          # 94591.78
     assert trades["quantity"][0] == 2 * contract.QUANTITY_SCALE
-    assert trades["quantity"][3] == 100_000  # 0.001 units
+    assert trades["quantity"][3] == 100            # 0.001 units at 1e5
 
 
 def test_buyer_is_maker_parses_as_bool_both_ways() -> None:
@@ -190,6 +210,20 @@ def test_a_scale_that_is_not_a_power_of_ten_is_rejected() -> None:
 def test_leading_decimal_point_is_handled() -> None:
     assert ingest.decimal_strings_to_ticks(np.array([".5"]), contract.PRICE_SCALE)[0] == (
         contract.PRICE_SCALE // 2
+    )
+
+
+def test_real_archive_values_round_trip_exactly() -> None:
+    """Rows copied verbatim from BTCUSDT 2025-01-02, the canonical day."""
+    prices = np.array(["94591.78000000", "97839.50000000", "94392.00000000"])
+    quantities = np.array(["0.00181000", "18.89042000", "0.00001000"])
+    np.testing.assert_array_equal(
+        ingest.decimal_strings_to_ticks(prices, contract.PRICE_SCALE),
+        [9_459_178, 9_783_950, 9_439_200],
+    )
+    np.testing.assert_array_equal(
+        ingest.decimal_strings_to_ticks(quantities, contract.QUANTITY_SCALE),
+        [181, 1_889_042, 1],
     )
 
 

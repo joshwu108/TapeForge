@@ -1,0 +1,2 @@
+agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,is_buyer_maker,is_best_match
+1,0.00002341,100000.00000000,10,12,1735776000100000,false,true

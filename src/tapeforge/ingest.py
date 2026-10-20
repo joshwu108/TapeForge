@@ -119,17 +119,23 @@ def decimal_strings_to_ticks(values: np.ndarray, scale: int) -> np.ndarray:
         raise ValueError("value with more than one decimal point")
 
     whole, _, frac = (np.char.partition(text, ".")[:, i] for i in range(3))
-    if np.any(np.char.str_len(frac) > digits):
-        worst = text[np.argmax(np.char.str_len(frac))]
+
+    # The archive pads every decimal to 8 places ("94591.78000000"), so only
+    # *significant* digits count against the scale. Trailing zeros carry no
+    # information and must not trigger a precision error.
+    significant = np.char.rstrip(frac, "0")
+    if np.any(np.char.str_len(significant) > digits):
+        worst = text[np.argmax(np.char.str_len(significant))]
         raise ValueError(
             f"value {worst!r} carries more precision than the {digits}-digit scale "
-            f"{scale} can represent exactly; change the scale rather than truncating"
+            f"{scale} can represent exactly; change the scale rather than truncating. "
+            "This symbol needs per-symbol scales (see contract.py, D-003)."
         )
 
     whole = np.where(whole == "", "0", whole)
-    frac = np.char.ljust(frac, digits, "0")
-    frac = np.where(frac == "", "0" * digits, frac)
-    return whole.astype(np.int64) * scale + frac.astype(np.int64)
+    padded = np.char.ljust(significant, digits, "0")
+    padded = np.where(padded == "", "0" * digits, padded)
+    return whole.astype(np.int64) * scale + padded.astype(np.int64)
 
 
 def detect_timestamp_unit(raw: np.ndarray) -> str:

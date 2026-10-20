@@ -29,12 +29,35 @@ US_PER_SECOND: Final[int] = 1_000_000
 DEFAULT_BUCKET_WIDTH_US: Final[int] = 1 * US_PER_SECOND
 
 # --- Scaled-integer price / quantity -------------------------------------
-# DECISION: scale factors. Scaled integers make count and signed-sum results
-# bit-exact between CPU and GPU; only VWAP needs a float tolerance.
-# Overflow bound must be stated here once the factors are fixed:
-#   max_total_quantity_ticks * PRICE_SCALE must fit in int64.
-PRICE_SCALE: Final[int] = 100_000_000       # 1e8 ticks per unit price
-QUANTITY_SCALE: Final[int] = 100_000_000    # 1e8 ticks per unit quantity
+# DECISION D-003 (ACCEPTED 2026-10-19, from measurement -- see
+# planning/experiments.md E-002). Scaled integers make every feature except
+# VWAP bit-exact between CPU and GPU, and keep the VWAP numerator exact too,
+# so VWAP's only floating-point operation is its final division.
+#
+# Chosen against real BTCUSDT 2025-01-02 (1,299,165 aggregate-trade records),
+# where price uses 2 significant decimals and quantity 5:
+#
+#   worst single row  price_ticks * qty_ticks        = 1.824e13
+#   worst bucket sum  sum over the busiest second    = 9.5214e13
+#   int64 max                                        = 9.223e18   -> 96,869x
+#
+# The rejected 1e8/1e8 default overflowed int64 on a *single* row by ~2,000x.
+#
+# SYMBOL CONSTRAINT: these scales are exact for BTCUSDT-like instruments.
+# A low-priced symbol (SHIBUSDT prices carry 8 decimals) cannot be
+# represented, and ``ingest.decimal_strings_to_ticks`` raises rather than
+# truncating -- the limitation fails loudly instead of corrupting features.
+# Per-symbol scales from the exchange tick/step size are the documented next
+# step if another symbol is ever needed.
+PRICE_SCALE: Final[int] = 100          # 2 decimals: BTCUSDT tick size 0.01
+QUANTITY_SCALE: Final[int] = 100_000   # 5 decimals: BTCUSDT step size 0.00001
+
+# Exact worst-case bucket numerator measured on the canonical day, pinned by a
+# test so a future scale change cannot silently reintroduce the overflow.
+# Recompute with:
+#   num = trades["price"] * trades["quantity"]
+#   np.add.reduceat(num, build_offsets(...)[:-1]).max()
+MEASURED_MAX_BUCKET_NUMERATOR: Final[int] = 95_214_009_975_192
 
 # --- Taker-side sign convention ------------------------------------------
 # DECISION (PRD section 3): derive the taker side from ``buyer_is_maker``.
