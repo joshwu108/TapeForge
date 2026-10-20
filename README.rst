@@ -18,24 +18,42 @@ throughput project, measured as such.
 Status
 ======
 
-Week 0 complete: project scaffold, data contract, test and benchmark
-harnesses, commit tooling. Feature and kernel implementation is in progress;
-no performance numbers are published yet. Any number that appears in
-``benchmarks/results.json`` was produced by the committed benchmark scripts
-on the hardware recorded in the same entry.
+Weeks 0-2 complete: project scaffold and data contract, seeded trade
+generator, public ``aggTrades`` ingest, the no-padding window index, and the
+CPU reference features with their test suite. The GPU engine is not written
+yet, so **no speedup figures are published**. Any number that appears in
+``benchmarks/results.json`` was produced by the committed benchmark scripts on
+the hardware recorded in the same entry.
+
+Measured so far, on BTCUSDT 2025-01-02 (1,299,165 aggregate-trade records):
+
+============================================  =============================
+measurement                                   result
+============================================  =============================
+window index, 1.3M records to 86,400 buckets  3.2 ms
+CPU reference features, same input            7 ms (~185M records/s)
+padded ``[n_buckets, max_len]`` equivalent    2.78 GB vs 31 MB packed (89x)
+busiest second                                1,343 records
+============================================  =============================
+
+The 89x figure is the design argument for the offsets index, and it holds on
+real data with only a mild tail. The 7 ms figure is the honest baseline a GPU
+kernel has to beat, before host-to-device transfer is even counted.
 
 Features
 ========
 
 For every fixed-width time bucket (1 second by default):
 
-==================  ==========================================================
-``event_count``     number of aggregate-trade records in the bucket (exact)
-``total_quantity``  sum of traded quantity (exact, scaled integer)
-``signed_quantity`` buy-initiated minus sell-initiated quantity (exact)
-``vwap``            quantity-weighted average price (float, documented tolerance)
-``valid``           false when the bucket contained no records
-==================  ==========================================================
+===================  =============================================================
+feature              plain-English definition
+===================  =============================================================
+``event_count``      number of aggregate-trade records in the bucket (exact)
+``total_quantity``   sum of traded quantity (exact, quantity ticks)
+``signed_quantity``  buy-initiated minus sell-initiated quantity (exact)
+``vwap``             quantity-weighted average price (float, documented tolerance)
+``valid``            false when the bucket contained no records
+===================  =============================================================
 
 A row of the input is an *aggregate* trade record, not an individual fill.
 Record counts in this project always mean aggregate-trade records. The input
@@ -44,6 +62,19 @@ carries no order book, so none of these are order-book imbalance features.
 Units, the taker-side sign convention derived from ``buyer_is_maker``, the
 price/quantity integer scaling, the overflow bound and the VWAP tolerance are
 all defined in one place: ``src/tapeforge/contract.py``.
+
+Price and quantity are scaled integers at 1e2 and 1e5, chosen by measuring the
+canonical day rather than by guessing: BTCUSDT uses exactly 2 and 5
+significant decimals, and those scales leave the VWAP numerator
+``sum(price_ticks * quantity_ticks)`` 96,869x inside int64 on the busiest
+second. Counts, total quantity and signed quantity are therefore exact, and
+VWAP's only floating-point operation is its final division.
+
+These scales are exact for BTCUSDT-like instruments and cannot represent a
+low-priced symbol such as SHIBUSDT, whose prices carry 8 decimals. Ingest
+raises in that case rather than truncating, so the limitation fails loudly;
+per-symbol scales from the exchange tick and step size are the documented next
+step.
 
 Install
 =======
@@ -116,7 +147,8 @@ Layout
      generate.py    seeded synthetic trades (sparse / uniform / burst)
      ingest.py      public aggTrades loading, normalization, provenance
      windows.py     bucket boundary offsets -- the no-padding window index
-     reference.py   readable NumPy reference features (the oracle)
+     reference.py   NumPy reference features: vectorized, plus a naive
+                    plain-loop oracle that validates it
      kernels.py     Triton kernels
      ops.py         PyTorch-facing API
      model.py       small volatility-regime classifier
