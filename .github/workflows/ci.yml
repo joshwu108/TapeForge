@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  cpu:
+    name: cpu tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+      - name: lint
+        run: ruff check src tests benchmarks tools
+      - name: test
+        run: pytest -q --cov=tapeforge --cov-report=term-missing
+      - name: policy check (no tracked markdown or planning files)
+        run: python tools/bootstrap_commit_skill.py --check || test $? -eq 2

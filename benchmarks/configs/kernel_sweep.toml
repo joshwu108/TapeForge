@@ -1,0 +1,15 @@
+# Kernel-only benchmark sweep (scope 1). Versioned, non-Markdown, per PRD 6.
+name = "kernel_sweep"
+scope = "kernel"
+
+# Aggregate-trade record counts. 48M only if it fits in device memory.
+sizes = [100_000, 1_000_000, 10_000_000]
+profiles = ["sparse", "uniform", "burst"]
+seeds = [1, 2, 3]
+bucket_width_us = 1_000_000
+
+warmup = 25
+repeats = 200
+synchronize = true
+
+baselines = ["tapeforge_triton", "torch_eager", "torch_compile"]

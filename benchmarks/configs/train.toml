@@ -1,0 +1,11 @@
+name = "train"
+scope = "train"
+feature_paths = ["reference_cpu", "tapeforge_gpu"]
+epochs = 5
+batch_size = 256
+sequence_length = 64
+# Chronological split fractions, chosen before any hyperparameter tuning.
+split = { train = 0.7, val = 0.15, test = 0.15 }
+label_horizon_buckets = 30
+n_regimes = 3
+seed = 7

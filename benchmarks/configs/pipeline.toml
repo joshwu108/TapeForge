@@ -1,0 +1,8 @@
+name = "pipeline"
+scope = "pipeline"
+sizes = [1_000_000, 10_000_000]
+profiles = ["uniform", "burst"]
+bucket_width_us = 1_000_000
+warmup = 5
+repeats = 20
+variants = ["pageable_sync", "pinned_sync", "pinned_streams"]
