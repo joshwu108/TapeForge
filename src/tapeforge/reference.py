@@ -1,18 +1,3 @@
-"""Readable NumPy/CPU reference features: the correctness oracle.
-
-Two implementations are provided on purpose:
-
-  ``aggregate_reference``        vectorized, used by the parity tests and the
-                                CPU side of the benchmarks;
-  ``aggregate_reference_naive`` a plain Python loop, used to validate the
-                                vectorized one in the test suite.
-
-Keeping both is not redundancy. ``np.add.reduceat`` has a genuine trap -- for
-an empty segment (a repeated offset, which is exactly how this project
-represents an empty bucket) it returns the element *at* the offset rather
-than zero. The naive loop is what proves the vectorized version handles it.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
