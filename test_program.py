@@ -1,17 +1,25 @@
-from tapeforge  import contract, generate, reference, windows
+import torch
+from tapeforge.kernels import launch_aggregate
 
-trades = generate.generate_trades(seed=7, n_buckets=5, profile="sparse")
+trades = {
+    "price": torch.tensor([10000, 10200], dtype=torch.int64, device="cuda"),
+    "quantity": torch.tensor([200000, 100000], dtype=torch.int64, device="cuda"),
+    "buyer_is_maker": torch.tensor([False, True], device="cuda"),
+}
+offsets = torch.tensor([0, 2, 2], dtype=torch.int64, device="cuda")
 
-offsets = windows.build_offsets(
-    trades["timestamp"],
-    start_us=0,
-    n_buckets=5,
-    width_us=contract.DEFAULT_BUCKET_WIDTH_US
-)
+got = launch_aggregate(trades, offsets)
 
-features = reference.aggregate_reference(trades, offsets)
+expected = {
+    "event_count": [2, 0],
+    "total_quantity": [300000, 0],
+    "signed_quantity": [100000, 0],
+    "vwap": [(100 * 2 + 102) / 3, 0.0],
+    "valid": [True, False],
+}
 
-print(offsets)
-print(features.event_count)
-print(features.total_quantity / contract.QUANTITY_SCALE)
-print(features.vwap)
+for name, values in expected.items():
+    target = torch.tensor(values, dtype=got[name].dtype, device="cuda")
+    torch.testing.assert_close(got[name], target, rtol=1e-9, atol=1e-12)
+
+print("Toy example passed")
