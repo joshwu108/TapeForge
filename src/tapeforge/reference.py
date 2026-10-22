@@ -1,4 +1,4 @@
-"""Readable NumPy/CPU reference features: the correctness oracle (TF-03).
+"""Readable NumPy/CPU reference features: the correctness oracle.
 
 Every GPU result is judged against this module, so clarity beats speed here.
 
@@ -13,23 +13,6 @@ Keeping both is not redundancy. ``np.add.reduceat`` has a genuine trap -- for
 an empty segment (a repeated offset, which is exactly how this project
 represents an empty bucket) it returns the element *at* the offset rather
 than zero. The naive loop is what proves the vectorized version handles it.
-
-Units (``tapeforge.contract``)
-------------------------------
-``event_count``      exact int64 record count
-``total_quantity``   exact int64 **quantity ticks**
-``signed_quantity``  exact int64 **quantity ticks**, may be negative
-``vwap``             float64 in **real price units**, e.g. 100.67 -- the one
-                     tolerance-based feature (PRD section 3)
-``valid``            bool, False for an empty bucket
-
-Why the VWAP numerator stays exact (D-003)
-------------------------------------------
-``sum(price_ticks * quantity_ticks)`` fits in int64 with 96,869x headroom at
-the accepted scales, so VWAP's only floating-point operation is its final
-division. Note that a *global* cumulative sum of that product would overflow
-at around 20M records even though no single bucket does, which is why this
-module reduces per segment and never accumulates across buckets.
 """
 
 from __future__ import annotations

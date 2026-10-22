@@ -4,21 +4,8 @@ Loads one symbol-day of Binance spot ``aggTrades`` from the public archive,
 normalizes timestamps to ``contract.TIME_UNIT``, converts price and quantity
 to exactly scaled integers, and records dataset provenance.
 
-Never trust the archive. Two layouts have shipped:
-
-  * 2025 onward: a header row, ``transact_time`` in **microseconds**;
-  * earlier:     no header row, ``transact_time`` in **milliseconds**.
-
-Both are detected from the file itself rather than from the filename, since a
-filename can be renamed and a unit cannot. Column count, value signs, decimal
-precision, timestamp plausibility and sort order are all checked before any
-feature code sees the rows.
-
 A row is an *aggregate* trade record, not an individual fill. Record counts
-in this project always mean aggregate-trade records (PRD section 3).
-
-Downloaded archives land in ``data/`` and are git-ignored (PRD section 10:
-do not commit large downloaded files).
+in this project always mean aggregate-trade records
 
 CLI:
     python -m tapeforge.ingest --symbol BTCUSDT --date 2025-01-02
@@ -46,7 +33,6 @@ from tapeforge.contract import (
 
 BASE_URL: Final[str] = "https://data.binance.vision/data/spot/daily/aggTrades"
 
-# Column layout. Spot ships 8 columns; some mirrors drop is_best_match.
 EXPECTED_COLUMNS: Final[tuple[int, ...]] = (7, 8)
 COL_AGG_TRADE_ID: Final[int] = 0
 COL_PRICE: Final[int] = 1
@@ -54,8 +40,6 @@ COL_QUANTITY: Final[int] = 2
 COL_TRANSACT_TIME: Final[int] = 5
 COL_IS_BUYER_MAKER: Final[int] = 6
 
-# Timestamp unit detection. A microsecond timestamp for any plausible date is
-# ~1e15; a millisecond one is ~1e12. Anything above this threshold is us.
 US_DETECTION_THRESHOLD: Final[int] = 10**14
 
 # Plausibility window for a normalized timestamp, in microseconds:
@@ -70,7 +54,6 @@ FALSE_STRINGS: Final[frozenset[str]] = frozenset({"false", "False", "FALSE", "0"
 @dataclass(frozen=True)
 class Provenance:
     """Where a dataset came from, recorded next to every benchmark result."""
-
     symbol: str
     date: str          # YYYY-MM-DD
     url: str
@@ -95,11 +78,6 @@ def _scale_digits(scale: int) -> int:
 
 def decimal_strings_to_ticks(values: np.ndarray, scale: int) -> np.ndarray:
     """Convert decimal strings to exactly scaled int64 ticks.
-
-    Integer string arithmetic, not a float round-trip: ``"100.12345678"`` at
-    scale 1e8 must come out as exactly ``10012345678``, and a value carrying
-    more precision than the scale can hold is an error rather than a silent
-    truncation.
 
     Raises:
         ValueError: on a negative value, scientific notation, more than one
@@ -160,12 +138,8 @@ def _read_rows(path: Path) -> tuple[list[list[str]], bytes]:
     """Return the CSV rows (header dropped) and the raw bytes for checksumming.
 
     Accepts a ZIP exactly as the archive ships it, or a bare CSV.
-
-    TODO(week 6, if profiling says ingest matters): this parses with the csv
-    module, which costs roughly a microsecond per row and holds the rows as
-    Python strings. Fine at 1M records; revisit with chunked parsing only if a
-    trace shows this stage is the bottleneck (PRD section 10, overengineering).
     """
+
     raw = path.read_bytes()
     if zipfile.is_zipfile(io.BytesIO(raw)):
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
@@ -209,6 +183,7 @@ def load_agg_trades(path: str | Path) -> tuple[np.ndarray, Provenance]:
     rows, raw = _read_rows(path)
     columns = list(zip(*rows, strict=False))
 
+    # detect the time in the trade record
     raw_time = np.array(columns[COL_TRANSACT_TIME], dtype=np.int64)
     unit = detect_timestamp_unit(raw_time)
     timestamps = raw_time if unit == "us" else raw_time * 1_000
@@ -219,6 +194,7 @@ def load_agg_trades(path: str | Path) -> tuple[np.ndarray, Provenance]:
             f"after assuming {unit}; the unit detection is wrong for {path.name}"
         )
 
+    # set column quantities extracted from the csv
     trades = np.zeros(len(rows), dtype=TRADE_DTYPE)
     trades["timestamp"] = timestamps
     trades["price"] = decimal_strings_to_ticks(np.array(columns[COL_PRICE]), PRICE_SCALE)
@@ -250,7 +226,7 @@ def download(symbol: str, date: str, out_dir: str | Path = "data") -> Path:
     Network access lives here and nowhere else, so the test suite stays
     offline and reproducible.
     """
-    from urllib.request import urlopen  # local import: keeps the module import-light
+    from urllib.request import urlopen
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

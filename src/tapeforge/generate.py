@@ -1,4 +1,4 @@
-"""Seeded synthetic trade generation (TF-01).
+"""Seeded synthetic trade generation
 
 Deterministic fixtures: the same seed always reproduces byte-identical
 records. Covers the shapes that break naive implementations -- empty
@@ -41,9 +41,6 @@ from tapeforge.contract import (
 )
 
 Profile = Literal["sparse", "uniform", "burst"]
-
-# DECISION (student): the three published stress distributions of PRD section 7.
-# Values are mean records per bucket; "burst" is heavy-tailed on purpose.
 PROFILE_RATES: Final[dict[str, float]] = {
     "sparse": 0.5,
     "uniform": 50.0,

@@ -1,18 +1,8 @@
-"""Small volatility-regime classifier over TapeForge features (TF-10).
+"""Small volatility-regime classifier over TapeForge features
 
 A deliberately small temporal CNN. It exists to answer one systems
 question -- does a faster feature path change training throughput? -- not
 to predict returns.
-
-Leakage rules (PRD section 6), enforced in code, not comments:
-
-  - labels may use later prices only for labeling;
-  - train / validation / test are contiguous chronological intervals, split
-    *before* any hyperparameter is chosen;
-  - no normalization statistic is fitted on anything past the train interval.
-
-Reported metrics are training examples/s, GPU wait and peak VRAM. Accuracy
-is reported for honesty, never as a trading claim.
 """
 
 from __future__ import annotations
