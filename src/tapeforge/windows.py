@@ -11,20 +11,6 @@ nothing is padded to the longest bucket.
       bucket 1 -> empty
       bucket 2 -> records 2..6
 
-Two properties that matter downstream:
-
-  * **These are indices into the caller's array, not a copy.** Nothing is
-    gathered, scattered or reordered. A GPU program for bucket ``b`` reads
-    exactly its own slice, which is the whole point of the design: a
-    ``[n_buckets, max_len]`` padded tensor for the burst profile would be
-    mostly zeros, and would allocate for the worst bucket on every bucket.
-
-  * **Records outside the window are excluded by being unreachable.**
-    ``offsets[0]`` is the index of the first record at or after ``start_us``,
-    so earlier records sit below it; records past the final edge sit at or
-    above ``offsets[-1]``. Neither is ever visited, and neither is copied
-    away. ``offsets[0]`` is therefore not always zero.
-
 Cost is one ``np.searchsorted`` of the ``n_buckets + 1`` edges into the
 timestamp column: O((n_buckets + 1) log n), no per-record Python work.
 """
@@ -36,7 +22,6 @@ import numpy as np
 
 def bucket_edges(start_us: int, n_buckets: int, width_us: int) -> np.ndarray:
     """Return the ``n_buckets + 1`` bucket boundary timestamps (int64).
-
     Raises:
         ValueError: on a non-positive bucket count or width.
     """

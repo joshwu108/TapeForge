@@ -1,7 +1,5 @@
 """Readable NumPy/CPU reference features: the correctness oracle.
 
-Every GPU result is judged against this module, so clarity beats speed here.
-
 Two implementations are provided on purpose:
 
   ``aggregate_reference``        vectorized, used by the parity tests and the
@@ -28,14 +26,6 @@ from tapeforge.contract import (
     TRADE_DTYPE,
 )
 
-# DECISION D-009 (proposed): VWAP of a bucket whose total quantity is zero.
-# A bucket can hold records that all have zero quantity, which leaves the
-# weighted average undefined. This returns 0.0 rather than NaN, so CPU/GPU
-# comparison needs no NaN handling, and ``valid`` stays True because the
-# bucket did contain records. Read ``total_quantity`` before trusting
-# ``vwap``. The alternative -- fall back to the unweighted mean price -- would
-# invent a number the data does not support. Does not arise on BTCUSDT, whose
-# minimum observed quantity is one tick.
 VWAP_WHEN_NO_QUANTITY: float = 0.0
 
 
@@ -55,9 +45,6 @@ class Features:
 
 def taker_sign(buyer_is_maker: np.ndarray) -> np.ndarray:
     """Map ``buyer_is_maker`` to +1 buy-initiated / -1 sell-initiated.
-
-    D-002 (accepted): ``buyer_is_maker`` True means the buyer rested on the
-    book, so the seller was the aggressor -- a sell-initiated trade.
     """
     flags = np.asarray(buyer_is_maker)
     if flags.dtype != np.bool_:
@@ -86,23 +73,13 @@ def _segment_sums(values: np.ndarray, offsets: np.ndarray, lengths: np.ndarray) 
     each segment is bounded by the next index, and only the final segment runs
     to the end of the array. Passing one offset per boundary and discarding
     that final segment is what keeps every bucket's end boundary intact.
-
-    Two traps are handled here:
-
-      * an empty segment (a repeated offset -- how this project represents an
-        empty bucket) makes reduceat return ``values[offset]`` rather than
-        zero, so empty buckets are masked back to zero afterwards;
-      * ``offsets[-1]`` may equal ``values.size``, which reduceat rejects as
-        out of range, so a single sentinel element is appended in that case.
-
-    Reducing per segment also means nothing is accumulated across buckets,
-    which is what keeps the int64 bound of D-003 a *per-bucket* bound. A
-    global ``cumsum`` of the VWAP numerator would overflow at roughly 20M
-    records even though no individual bucket comes close.
     """
+    # empty bucket, returns 0s
     if values.size == 0:
         return np.zeros(lengths.size, dtype=np.int64)
     padded = np.append(values, 0) if int(offsets[-1]) == values.size else values
+
+    # returns sum(a[idx[i]: idx[i+1]]) for each i and drops [:-1] which is the sum of trades after the window
     sums = np.add.reduceat(padded, offsets)[:-1]
     return np.where(lengths > 0, sums, 0).astype(np.int64)
 
@@ -113,14 +90,17 @@ def aggregate_reference(trades: np.ndarray, offsets: np.ndarray) -> Features:
     ``trades`` is a structured array of ``contract.TRADE_DTYPE``; ``offsets``
     comes from ``tapeforge.windows.build_offsets``.
     """
+    # check if valid inputs
     _validate(trades, offsets)
     lengths = np.diff(offsets).astype(np.int64)
     valid = lengths > 0
 
+    # calculate quantities
     quantity = trades["quantity"].astype(np.int64)
     signed = quantity * taker_sign(trades["buyer_is_maker"])
     numerator = trades["price"].astype(np.int64) * quantity
 
+    # calculate segment sums
     total_quantity = _segment_sums(quantity, offsets, lengths)
     signed_quantity = _segment_sums(signed, offsets, lengths)
     numerator_sum = _segment_sums(numerator, offsets, lengths)
