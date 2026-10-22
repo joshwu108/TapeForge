@@ -21,6 +21,9 @@ jobs:
       - name: install
         run: |
           python -m pip install --upgrade pip
+          # CPU wheel so the torch-facing tests (ops, validation, baselines) run
+          # here instead of skipping; the GPU suite still skips (no CUDA runner).
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
           pip install -e '.[dev]'
       - name: lint
         run: ruff check src tests benchmarks tools

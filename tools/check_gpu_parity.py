@@ -12,7 +12,12 @@ if not torch.cuda.is_available():
     raise SystemExit("CUDA is unavailable; run this script in a GPU runtime.")
 
 from tapeforge import contract, generate, reference, windows  # noqa: E402
-from tapeforge.kernels import BucketTooLargeError, launch_aggregate  # noqa: E402
+from tapeforge.kernels import (  # noqa: E402
+    MAX_ONE_PASS_BUCKET,
+    BucketTooLargeError,
+    launch_aggregate,
+    select_block_size,
+)
 
 
 def check(profile, seed):
@@ -26,16 +31,21 @@ def check(profile, seed):
         for name in ("price", "quantity", "buyer_is_maker")
     }
     gpu_offsets = torch.as_tensor(offsets, device="cuda")
+    # Same dispatch as ops.aggregate: the block size follows the longest bucket,
+    # and anything past the one-pass limit must raise rather than be truncated.
     maximum = int(np.diff(offsets).max())
-    if maximum > 1024:
+    if maximum > MAX_ONE_PASS_BUCKET:
         try:
-            launch_aggregate(columns, gpu_offsets, block_size=1024)
+            launch_aggregate(columns, gpu_offsets)
         except BucketTooLargeError:
-            print(f"PASS {profile=} {seed=}: oversized bucket rejected ({maximum})")
+            print(
+                f"PASS {profile=} {seed=}: oversized bucket rejected "
+                f"({maximum} > {MAX_ONE_PASS_BUCKET}); two-pass not implemented"
+            )
             return
         raise AssertionError("Oversized bucket was silently accepted")
 
-    got = launch_aggregate(columns, gpu_offsets, block_size=1024)
+    got = launch_aggregate(columns, gpu_offsets)
     for name in contract.FEATURE_NAMES:
         actual = got[name].cpu().numpy()
         target = getattr(expected, name)
@@ -46,7 +56,10 @@ def check(profile, seed):
             )
         else:
             np.testing.assert_array_equal(actual, target)
-    print(f"PASS {profile=} {seed=}: all five outputs match CPU")
+    print(
+        f"PASS {profile=} {seed=}: all five outputs match CPU "
+        f"(longest bucket {maximum}, block_size {select_block_size(maximum)})"
+    )
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     import torch
 
 TRITON_AVAILABLE: bool
-try:  
+try:
     import triton
     import triton.language as tl
 

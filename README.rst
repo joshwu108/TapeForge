@@ -25,23 +25,29 @@ and volume-weighted average price (VWAP).
        -> per-bucket PyTorch feature tensors
 
 The project investigates how workload skew, memory layout, validation, and
-host/device transfers affect feature-generation throughput. Planned extensions
-include a two-pass reduction for large buckets and an end-to-end training
-throughput experiment. The classifier and training benchmark remain stubs.
-The input contains trades rather than order-book data.
+host/device transfers affect feature-generation throughput. A streaming CPU
+aggregator computes the same features one chunk at a time, bitwise equal to
+the batch result, as the live-path counterpart of the batch engine. Planned
+extensions include a two-pass reduction for large buckets and an end-to-end
+training throughput experiment. The classifier and training benchmark remain
+stubs. The input contains trades rather than order-book data.
 
 Implementation status
 =====================
 
 Ingestion, deterministic generation, window indexing, CPU reference features,
-and CPU/CUDA API dispatch are implemented. The one-pass Triton kernel assigns
-one program per bucket and supports up to 4,096 records per bucket. Larger
-buckets raise ``BucketTooLargeError`` until the two-pass reduction exists.
+the streaming CPU aggregator, and CPU/CUDA API dispatch are implemented. The
+one-pass Triton kernel assigns one program per bucket and supports up to
+4,096 records per bucket. Larger buckets raise ``BucketTooLargeError`` until
+the two-pass reduction exists; the parity tests that reduction must pass are
+already in ``tests/test_two_pass.py`` as strict expected failures.
 
 The GPU parity suite exercises the real code path but has **not yet been run
 on a CUDA GPU**, and CI has no GPU. GPU correctness and performance remain
 unverified. **No speedup figures are published.** Results belong in
-``benchmarks/results.json`` with hardware and software provenance.
+``benchmarks/results.json`` with hardware and software provenance. The
+streaming aggregator is verified on the CPU only, which is the only place it
+runs.
 
 Preliminary dataset observations
 ================================
@@ -120,6 +126,12 @@ Verify a checkout
    $ python -m pytest -q -m gpu             # GPU parity suite, needs CUDA + Triton
    $ python -m pytest -q -m slow            # stress suite (GPU cases skip without CUDA)
    $ python tools/bootstrap_commit_skill.py --check
+   $ python tools/verify_snapshot.py run --artifacts verification   # all of the above, with artifacts
+
+The last command runs lint, the test suites, the parity script and the quick
+kernel benchmark as subprocesses and writes a manifest, logs, JUnit reports
+and the captured environment under ``verification/``. Steps that need CUDA
+are recorded as skipped, with the reason, on a machine without a GPU.
 
 Usage
 =====
@@ -164,6 +176,73 @@ Command line:
    $ python -m tapeforge.ingest --symbol BTCUSDT --date 2025-01-02
 
 Downloaded archives land in ``data/`` and are never committed.
+
+Streaming
+=========
+
+``tapeforge.streaming`` computes the same features from timestamp-ordered
+chunks, the way a live system receives them, without torch or CUDA. A chunk
+may be one record or a whole day. Buckets are emitted as they close, and
+``finalize`` returns the rest at end of stream:
+
+.. code-block:: python
+
+   import numpy as np
+   from tapeforge import generate, reference, windows
+   from tapeforge.contract import DEFAULT_BUCKET_WIDTH_US
+   from tapeforge.streaming import StreamingAggregator, concat_features
+
+   trades = generate.generate_trades(seed=7, n_buckets=100, profile="burst")
+   live = StreamingAggregator(start_us=0, n_buckets=100, width_us=DEFAULT_BUCKET_WIDTH_US)
+   parts = [live.push(chunk) for chunk in np.array_split(trades, 13)]
+   parts.append(live.finalize())
+   streamed = concat_features(parts)
+
+   offsets = windows.build_offsets(trades["timestamp"], 0, 100, DEFAULT_BUCKET_WIDTH_US)
+   batch = reference.aggregate_reference(trades, offsets)
+   assert np.array_equal(streamed.vwap, batch.vwap)   # bitwise, not approximately
+
+Semantics match the batch path exactly: half-open buckets, records outside
+the window ignored, empty buckets invalid and zeroed, int64 partial sums
+carried across chunk boundaries and divided once per bucket. Chunks must
+arrive in timestamp order; an out-of-order chunk raises ``OutOfOrderError``
+and leaves the aggregator untouched rather than being re-sorted. The int64
+accumulation bound is checked before every chunk is absorbed, so partial sums
+never wrap. Property-based tests split generated days and arbitrary ordered
+records at random cut points and assert bitwise equality with the batch
+reference; the slow suite runs 1,000 such chunkings.
+
+Reproducible GPU verification
+=============================
+
+The GPU work is verified on a separate CUDA machine (a Colab GPU runtime, for
+example) against the exact working tree, uncommitted edits included, so that
+the tested code and the reported code are the same thing:
+
+.. code-block:: console
+
+   $ python tools/verify_snapshot.py pack --out /tmp/tapeforge-snapshot.tgz
+
+The archive holds every file Git tracks or would track and a
+``snapshot.json`` with the commit, a dirty flag and a digest over the packed
+files; ignored material never leaves the machine. On the GPU machine, after
+uploading the archive:
+
+.. code-block:: console
+
+   $ tar xzf tapeforge-snapshot.tgz && cd TapeForge
+   $ pip install -e '.[dev]'                       # keep the runtime's torch and triton
+   $ python tools/verify_snapshot.py run --artifacts verification --record --zip
+
+That runs, in order: lint, the full test suite, the GPU parity suite, the
+stress suite, ``tools/check_gpu_parity.py``, the toy program, the quick
+kernel check, and with ``--record`` the kernel sweep and the pipeline
+benchmark, which append to ``benchmarks/results.json``. Every step is a
+subprocess with its own log, pytest steps also write JUnit XML, and
+``manifest.json`` lists each step's status, exit code and duration next to
+``environment.json`` (GPU, driver, CUDA, torch, Triton, NumPy, commit, dirty
+flag, snapshot digest). Download ``verification.zip`` and the updated
+``results.json``; a claim in this file must cite an entry recorded that way.
 
 Benchmarks
 ==========
@@ -213,13 +292,15 @@ Layout
      windows.py     bucket boundary offsets -- the no-padding window index
      reference.py   NumPy reference features: vectorized, plus a naive
                     plain-loop oracle that validates it
+     streaming.py   chunk-at-a-time CPU aggregator, bitwise equal to the batch path
      kernels.py     Triton kernels: one-pass bucket reduction and its launcher
      validation.py  tensor input checks shared by ops and the kernel launcher
      ops.py         PyTorch-facing API: CUDA -> Triton, CPU -> reference
      model.py       small volatility-regime classifier
-   tests/           parity, edge-case and stress suites
+   tests/           parity, edge-case, streaming, two-pass and stress suites
    benchmarks/      harness, three timed scopes, versioned configs, results
-   tools/           commit skill bootstrap and safe local commit helper
+   tools/           commit skill bootstrap, safe local commit helper,
+                    GPU parity script, snapshot packer + verification runner
 
 Development guidelines
 ======================

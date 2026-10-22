@@ -9,7 +9,8 @@ Skips only for genuine hardware/software absence (no torch, no CUDA device,
 no Triton), via the ``gpu_ready`` fixture. Missing functionality is not
 skipped: buckets beyond the one-pass limit are asserted to raise, and the
 two-pass parity tests are strict xfails that start failing (XPASS) the day the
-two-pass path lands, so their markers must then be removed.
+two-pass path lands, so their markers must then be removed. The full set of
+tests waiting for the two-pass reduction is in test_two_pass.py.
 
 Parity rule (PRD section 6): counts and quantity sums exactly; VWAP within
 contract.VWAP_RTOL / VWAP_ATOL; identical dtypes.
@@ -17,12 +18,11 @@ contract.VWAP_RTOL / VWAP_ATOL; identical dtypes.
 
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 import pytest
+from conftest import TWO_PASS_MISSING, assert_gpu_parity, cuda_inputs
 
-from tapeforge import contract, generate, kernels, ops, reference, windows
+from tapeforge import contract, generate, kernels, ops, windows
 
 pytestmark = pytest.mark.gpu
 
@@ -31,35 +31,9 @@ P = contract.PRICE_SCALE
 Q = contract.QUANTITY_SCALE
 LIMIT = kernels.MAX_ONE_PASS_BUCKET
 
-TWO_PASS_MISSING = pytest.mark.xfail(
-    raises=kernels.BucketTooLargeError,
-    strict=True,
-    reason="two-pass reduction for buckets beyond the one-pass limit is not implemented yet",
-)
-
-
-def _cuda(trades: np.ndarray, offsets: np.ndarray) -> tuple[dict[str, Any], Any]:
-    import torch
-
-    columns = {name: torch.as_tensor(trades[name].copy()).cuda() for name in trades.dtype.names}
-    return columns, torch.as_tensor(offsets).cuda()
-
-
-def _assert_parity(got: dict[str, Any], trades: np.ndarray, offsets: np.ndarray) -> None:
-    expected = reference.aggregate_reference_naive(trades, offsets)
-    assert tuple(got) == contract.FEATURE_NAMES
-    for name in contract.FEATURE_NAMES:
-        actual = got[name]
-        assert actual.is_cuda, name
-        actual = actual.cpu().numpy()
-        target = getattr(expected, name)
-        assert actual.dtype == target.dtype, (name, actual.dtype, target.dtype)
-        if name == "vwap":
-            np.testing.assert_allclose(
-                actual, target, rtol=contract.VWAP_RTOL, atol=contract.VWAP_ATOL, err_msg=name
-            )
-        else:
-            np.testing.assert_array_equal(actual, target, err_msg=name)
+# Helpers shared with test_two_pass.py live in conftest.py.
+_cuda = cuda_inputs
+_assert_parity = assert_gpu_parity
 
 
 def _workload(profile: str, seed: int, n_buckets: int) -> tuple[np.ndarray, np.ndarray]:

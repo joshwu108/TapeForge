@@ -38,3 +38,53 @@ TOY_EXPECTED = {
     "vwap": (100 * 2 + 102 * 1) / 3,
     "valid": True,
 }
+
+
+# --- shared GPU parity helpers --------------------------------------------
+#
+# Used by test_gpu_parity.py (one-pass path) and test_two_pass.py (buckets
+# beyond the one-pass tile). Both compare the real CUDA code path against
+# reference.aggregate_reference_naive, the plain-loop oracle, so the GPU is
+# never checked against code that shares its vectorization tricks.
+#
+# Parity rule: counts and quantity sums exactly; VWAP within
+# contract.VWAP_RTOL / VWAP_ATOL; identical dtypes; outputs on the GPU.
+
+from typing import Any  # noqa: E402
+
+import numpy as np  # noqa: E402
+
+from tapeforge import contract, kernels, reference  # noqa: E402
+
+# Strict: the day the two-pass reduction lands these tests XPASS and fail
+# loudly, and the marker must be removed from them.
+TWO_PASS_MISSING = pytest.mark.xfail(
+    raises=kernels.BucketTooLargeError,
+    strict=True,
+    reason="two-pass reduction for buckets beyond the one-pass limit is not implemented yet",
+)
+
+
+def cuda_inputs(trades: np.ndarray, offsets: np.ndarray) -> tuple[dict[str, Any], Any]:
+    """Column tensors and offsets on the current CUDA device."""
+    import torch
+
+    columns = {name: torch.as_tensor(trades[name].copy()).cuda() for name in trades.dtype.names}
+    return columns, torch.as_tensor(offsets).cuda()
+
+
+def assert_gpu_parity(got: dict[str, Any], trades: np.ndarray, offsets: np.ndarray) -> None:
+    expected = reference.aggregate_reference_naive(trades, offsets)
+    assert tuple(got) == contract.FEATURE_NAMES
+    for name in contract.FEATURE_NAMES:
+        actual = got[name]
+        assert actual.is_cuda, name
+        actual = actual.cpu().numpy()
+        target = getattr(expected, name)
+        assert actual.dtype == target.dtype, (name, actual.dtype, target.dtype)
+        if name == "vwap":
+            np.testing.assert_allclose(
+                actual, target, rtol=contract.VWAP_RTOL, atol=contract.VWAP_ATOL, err_msg=name
+            )
+        else:
+            np.testing.assert_array_equal(actual, target, err_msg=name)
