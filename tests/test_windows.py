@@ -1,4 +1,4 @@
-"""Week 2: the no-padding window index."""
+"""Packed window indexing and bucket boundaries."""
 
 from __future__ import annotations
 

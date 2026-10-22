@@ -1,9 +1,4 @@
-"""Week 2: CPU reference features against hand-calculated values.
-
-Every test here is written before the implementation. They currently xfail
-with NotImplementedError. When you start week 2, delete the
-``pytestmark`` line, watch them fail for real (RED), then implement.
-"""
+"""CPU reference features checked against hand calculations and an independent loop."""
 
 from __future__ import annotations
 

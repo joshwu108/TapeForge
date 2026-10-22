@@ -64,7 +64,8 @@ def _segment_sums(values: np.ndarray, offsets: np.ndarray, lengths: np.ndarray) 
         return np.zeros(lengths.size, dtype=np.int64)
     padded = np.append(values, 0) if int(offsets[-1]) == values.size else values
 
-    # returns sum(a[idx[i]: idx[i+1]]) for each i and drops [:-1] which is the sum of trades after the window
+    # returns sum(a[idx[i]: idx[i+1]]) for each i and drops [:-1],
+    # which is the sum of trades after the window
     sums = np.add.reduceat(padded, offsets)[:-1]
     return np.where(lengths > 0, sums, 0).astype(np.int64)
 

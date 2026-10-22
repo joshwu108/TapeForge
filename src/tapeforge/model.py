@@ -25,4 +25,4 @@ def make_labels(vwap, horizon: int, n_regimes: int = 3):  # noqa: ANN001, ANN201
     Uses only prices strictly after the bucket, and only train-interval
     quantiles for the regime thresholds.
     """
-    raise NotImplementedError("week 7: implement after tests/test_model.py is RED")
+    raise NotImplementedError("Volatility-regime label generation is not implemented")

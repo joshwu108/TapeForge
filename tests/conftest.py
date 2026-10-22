@@ -15,9 +15,7 @@ def _cuda_triton_ready() -> tuple[bool, str]:
     from tapeforge import kernels
 
     if not kernels.TRITON_AVAILABLE:
-        return False, "triton is not installed"
-    if not hasattr(kernels, "agg_kernel_one_pass"):
-        return False, "student's Triton kernel is not implemented yet (week 3)"
+        return False, "CUDA is available but triton is not installed (pip install -e '.[gpu]')"
     return True, ""
 
 

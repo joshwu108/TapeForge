@@ -1,109 +1,218 @@
-"""Triton GPU kernels"""
+"""Triton GPU kernels."""
+
 from __future__ import annotations
-import torch
-import triton
-import triton.language as tl
-from triton.runtime import driver
-from tapeforge.contract import (
-    PRICE_SCALE,
-    SIGN_BUY_INITIATED,
-    SIGN_SELL_INITIATED,
-    TRADE_DTYPE,
-)
 
-DEVICE = driver.active.get_active_torch_device()
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Final
 
-@triton.jit
-def segment_sums(values_ptr, offsets_ptr, output_ptr, BLOCK_SIZE: tl.constexpr):
-    # Load Segment Boundaries
-    pid = tl.program_id(axis = 0)
-    start, end = tl.load(offsets_ptr + pid), tl.load(offsets_ptr + pid + 1)
+from tapeforge.contract import PRICE_SCALE, SIGN_BUY_INITIATED, SIGN_SELL_INITIATED
 
-    #load values
-    indices = start + tl.arange(0, BLOCK_SIZE)
-    values = tl.load(values_ptr + indices, mask=indices < end, other=0)
+if TYPE_CHECKING:
+    import torch
 
-    sums = tl.sum(values, axis = 0)
-    tl.store(output_ptr + pid, sums)
+TRITON_AVAILABLE: bool
+try:  
+    import triton
+    import triton.language as tl
 
-@triton.jit
-def aggregate_features(price_ptr, quantity_ptr, buyer_is_maker_ptr, offsets_ptr, total_quantity_ptr, event_count_ptr, signed_quantity_ptr, vwap_ptr, valid_ptr, BLOCK_SIZE: tl.constexpr, PRICE_SCALE: tl.constexpr):
-    pid = tl.program_id(axis = 0)
-    start, end = tl.load(offsets_ptr + pid), tl.load(offsets_ptr + pid + 1)
-    length = end - start
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
 
-    # calculate quantity sums
-    indices = start + tl.arange(0, BLOCK_SIZE)
-    quantities = tl.load(quantity_ptr + indices, mask=indices < end, other = 0)
-    total_quantity = tl.sum(quantities, axis = 0)
-    tl.store(total_quantity_ptr + pid, total_quantity)
 
-    # calculate quantity sums
-    buyer_is_maker = tl.load(buyer_is_maker_ptr + indices, mask = indices < end, other = False)
-    signed = tl.where(buyer_is_maker, -1, 1)
-    signed_quantity = tl.sum(quantities * signed, axis = 0)
+MAX_ONE_PASS_BUCKET: Final[int] = 4096
+MIN_BLOCK_SIZE: Final[int] = 16
 
-    #calculate aggregate numerator sums
-    prices = tl.load(price_ptr + indices, mask = indices < end, other = 0) 
-    numerators = prices * quantities
-    numerator_sum = tl.sum(numerators, axis = 0)
 
-    #calculate vwap
-    has_quantity = total_quantity > 0
-    denominator = tl.where(has_quantity, total_quantity, 1).to(tl.float64)
-    vwap = numerator_sum.to(tl.float64) / denominator /PRICE_SCALE
-    vwap = tl.where(has_quantity, vwap, 0.0)
+class BucketTooLargeError(ValueError):
+    """A bucket has more records than the one-pass kernel can reduce."""
 
-    # store calculated outputs
-    tl.store(event_count_ptr + pid, length)
-    tl.store(total_quantity_ptr + pid, total_quantity)
-    tl.store(signed_quantity_ptr + pid, signed_quantity)
-    tl.store(vwap_ptr + pid, vwap)
-    tl.store(valid_ptr + pid, length > 0)
 
-def launch_aggregate(trades, offsets, block_size=1024):
-    n_buckets = offsets.numel() - 1
-    device = offsets.device
+def select_block_size(max_bucket_len: int, block_size: int | None = None) -> int:
+    """Return the tile size for the one-pass kernel, or raise error
+    Raises:
+        ValueError: on an invalid explicit ``block_size``.
+        BucketTooLargeError: if the longest bucket does not fit in one tile.
+    """
+    if block_size is not None:
+        if block_size <= 0 or block_size & (block_size - 1):
+            raise ValueError(f"block_size must be a positive power of two, got {block_size}")
+        if block_size > MAX_ONE_PASS_BUCKET:
+            raise ValueError(
+                f"block_size {block_size} exceeds the one-pass limit {MAX_ONE_PASS_BUCKET}"
+            )
+        limit = block_size
+    else:
+        limit = MAX_ONE_PASS_BUCKET
+    if max_bucket_len > limit:
+        raise BucketTooLargeError(
+            f"a bucket has {max_bucket_len} records but the one-pass kernel handles at most "
+            f"{limit}; the two-pass reduction for oversized buckets is not implemented"
+        )
+    if block_size is not None:
+        return block_size
+    return max(MIN_BLOCK_SIZE, 1 << max(0, max_bucket_len - 1).bit_length())
 
-    # input checking
-    if offsets.ndim != 1 or offsets.numel() < 2:
-        raise ValueError("offsets must be 1-D with at least two entries")
-    if not offsets.is_cuda:
-        raise ValueError("offsets must be on a CUDA device")
-    if block_size <= 0 or block_size & (block_size - 1):
-        raise ValueError("block_size must be a positive power of two")
 
-    lengths = offsets[1:] - offsets[:-1]
-    if (lengths < 0).any().item():
-        raise ValueError("offsets must be non-decreasing")
-    if lengths.max().item() > block_size:
-        raise ValueError("a bucket exceeds block_size")
+def _num_warps(block_size: int) -> int:
+    # Keep each thread's slice of the tile small as the
+    # tile grows (4 warps up to 1024 lanes, 16 warps at 4096).
+    return min(16, max(4, block_size // 256))
 
-    # allocate empty tensors
-    event_count = torch.empty(n_buckets, dtype=torch.int64,device=device)
-    total_quantity = torch.empty(n_buckets, dtype=torch.int64, device = device)
-    signed_quantity = torch.empty(n_buckets, dtype=torch.int64, device=device)
-    vwap = torch.empty(n_buckets, dtype=torch.float64, device=device)
-    valid = torch.empty(n_buckets, dtype=torch.bool, device=device)
 
-    aggregate_features[(n_buckets,)](
-        trades["price"],
-        trades["quantity"],
-        trades["buyer_is_maker"],
-        offsets,
-        total_quantity,
-        event_count,
-        signed_quantity,
-        vwap, 
-        valid, 
-        BLOCK_SIZE=block_size,
-        PRICE_SCALE=PRICE_SCALE
-    )
+if TRITON_AVAILABLE:
+
+    @triton.jit  # type: ignore[untyped-decorator]
+    def segment_sums(  # type: ignore[no-untyped-def]
+        values_ptr, offsets_ptr, output_ptr, BLOCK_SIZE: tl.constexpr
+    ):
+        # Load Segment Boundaries
+        pid = tl.program_id(axis=0)
+        start, end = tl.load(offsets_ptr + pid), tl.load(offsets_ptr + pid + 1)
+
+        # load values
+        indices = start + tl.arange(0, BLOCK_SIZE)
+        values = tl.load(values_ptr + indices, mask=indices < end, other=0)
+
+        sums = tl.sum(values, axis=0)
+        tl.store(output_ptr + pid, sums)
+
+    @triton.jit  # type: ignore[untyped-decorator]
+    def aggregate_features(  # type: ignore[no-untyped-def]
+        price_ptr,
+        quantity_ptr,
+        buyer_is_maker_ptr,
+        offsets_ptr,
+        total_quantity_ptr,
+        event_count_ptr,
+        signed_quantity_ptr,
+        vwap_ptr,
+        valid_ptr,
+        BLOCK_SIZE: tl.constexpr,
+        PRICE_SCALE: tl.constexpr,
+        SIGN_BUY: tl.constexpr,
+        SIGN_SELL: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        start, end = tl.load(offsets_ptr + pid), tl.load(offsets_ptr + pid + 1)
+        length = end - start
+
+        # the launcher guarantees length <= BLOCK_SIZE, so one tile covers the bucket
+        indices = start + tl.arange(0, BLOCK_SIZE)
+        in_bucket = indices < end
+
+        # calculate quantity sums (int64, exact)
+        quantities = tl.load(quantity_ptr + indices, mask=in_bucket, other=0)
+        total_quantity = tl.sum(quantities, axis=0)
+
+        # signed quantity: buyer_is_maker means the seller was the aggressor
+        buyer_is_maker = tl.load(buyer_is_maker_ptr + indices, mask=in_bucket, other=False)
+        signed = tl.where(buyer_is_maker, SIGN_SELL, SIGN_BUY)
+        signed_quantity = tl.sum(quantities * signed, axis=0)
+
+        # calculate aggregate numerator sums (int64, exact within the contract bound)
+        prices = tl.load(price_ptr + indices, mask=in_bucket, other=0)
+        numerator_sum = tl.sum(prices * quantities, axis=0)
+
+        # calculate vwap
+        has_quantity = total_quantity > 0
+        denominator = tl.where(has_quantity, total_quantity, 1).to(tl.float64)
+        vwap = numerator_sum.to(tl.float64) / denominator / PRICE_SCALE
+        vwap = tl.where(has_quantity, vwap, 0.0)
+
+        # store calculated outputs
+        tl.store(event_count_ptr + pid, length)
+        tl.store(total_quantity_ptr + pid, total_quantity)
+        tl.store(signed_quantity_ptr + pid, signed_quantity)
+        tl.store(vwap_ptr + pid, vwap)
+        tl.store(valid_ptr + pid, length > 0)
+
+
+def launch_aggregate(
+    trades: Mapping[str, torch.Tensor],
+    offsets: torch.Tensor,
+    block_size: int | None = None,
+) -> dict[str, Any]:
+    """Run the one-pass kernel on CUDA tensors and return the five features.
+
+    Input format and validation: ``tapeforge.validation.validate_columns``.
+
+    Raises:
+        RuntimeError: Triton is not installed.
+        TypeError: offsets is not a tensor, or a column is not a tensor.
+        ValueError: inputs are not on CUDA or fail validation.
+        BucketTooLargeError: a bucket exceeds the one-pass limit.
+        OverflowError: int64 sums could wrap around.
+    """
+    if not TRITON_AVAILABLE:
+        raise RuntimeError(
+            "Triton is not installed; the GPU path needs Linux, an NVIDIA GPU and "
+            "pip install -e '.[gpu]'. Use tapeforge.ops.aggregate with CPU tensors instead."
+        )
+    import torch
+
+    from tapeforge.validation import validate_columns
+
+    if not isinstance(offsets, torch.Tensor):
+        raise TypeError(f"offsets must be a torch.Tensor, got {type(offsets).__name__}")
+    if offsets.device.type != "cuda":
+        raise ValueError("launch_aggregate needs CUDA tensors; use ops.aggregate for CPU inputs")
+    summary = validate_columns(trades, offsets)
+    try:
+        block = select_block_size(summary.max_bucket_len, block_size)
+    except BucketTooLargeError as exc:
+        raise BucketTooLargeError(f"bucket {summary.longest_bucket}: {exc}") from None
+
+    features = empty_features(summary.n_buckets, offsets.device)
+    if summary.n_records == 0:
+        # Every bucket is empty and the zero-filled outputs are already the
+        # answer; skipping the launch avoids handing Triton zero-size buffers.
+        return features
+    launch_one_pass_unchecked(trades, offsets, features, block)
+    return features
+
+
+def empty_features(n_buckets: int, device: torch.device) -> dict[str, torch.Tensor]:
+    """Zero-filled output tensors: the correct answer for empty buckets."""
+    import torch
 
     return {
-        "event_count": event_count,
-        "total_quantity": total_quantity,
-        "signed_quantity": signed_quantity,
-        "vwap": vwap,
-        "valid": valid,
+        "event_count": torch.zeros(n_buckets, dtype=torch.int64, device=device),
+        "total_quantity": torch.zeros(n_buckets, dtype=torch.int64, device=device),
+        "signed_quantity": torch.zeros(n_buckets, dtype=torch.int64, device=device),
+        "vwap": torch.zeros(n_buckets, dtype=torch.float64, device=device),
+        "valid": torch.zeros(n_buckets, dtype=torch.bool, device=device),
     }
+
+
+def launch_one_pass_unchecked(
+    trades: Mapping[str, torch.Tensor],
+    offsets: torch.Tensor,
+    features: Mapping[str, torch.Tensor],
+    block_size: int,
+) -> None:
+    """Launch the kernel into preallocated outputs. NO validation.
+
+    Only for callers that have already run ``validate_columns`` and
+    ``select_block_size`` on these exact tensors -- the kernel-only benchmark,
+    which must not time validation. Invalid input here reads out of bounds.
+    """
+    import torch
+
+    with torch.cuda.device(offsets.device):
+        aggregate_features[(offsets.numel() - 1,)](
+            trades["price"],
+            trades["quantity"],
+            trades["buyer_is_maker"],
+            offsets,
+            features["total_quantity"],
+            features["event_count"],
+            features["signed_quantity"],
+            features["vwap"],
+            features["valid"],
+            BLOCK_SIZE=block_size,
+            PRICE_SCALE=PRICE_SCALE,
+            SIGN_BUY=SIGN_BUY_INITIATED,
+            SIGN_SELL=SIGN_SELL_INITIATED,
+            num_warps=_num_warps(block_size),
+        )

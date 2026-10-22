@@ -1,4 +1,4 @@
-"""Week 1: the seeded generator (TF-01)."""
+"""Deterministic synthetic trade generation (TF-01)."""
 
 from __future__ import annotations
 
@@ -117,7 +117,7 @@ def test_all_empty_output_still_has_the_right_dtype() -> None:
 
 
 def test_cli_writes_a_loadable_reproducible_sample(tmp_path, capsys) -> None:
-    """Week 1 milestone DoD: the documented command produces a sample."""
+    """CLI behavior: the documented command produces a sample."""
     out = tmp_path / "sample.npy"
     assert generate.main(["--seed", "7", "--seconds", "10", "--profile", "burst",
                           "--out", str(out)]) == 0

@@ -15,7 +15,7 @@ Timing rules enforced here (PRD section 6, fair comparisons):
 from __future__ import annotations
 
 import json
-import platform
+import platform as platform_module
 import statistics
 import subprocess
 import sys
@@ -33,18 +33,23 @@ class Environment:
     """Captured once per run; pinned in every result record."""
 
     python: str = field(default_factory=lambda: sys.version.split()[0])
-    platform: str = field(default_factory=platform.platform)
-    processor: str = field(default_factory=platform.processor)
+    platform: str = field(default_factory=platform_module.platform)
+    processor: str = field(default_factory=platform_module.processor)
+    numpy: str | None = None
     torch: str | None = None
     triton: str | None = None
     cuda: str | None = None
     gpu_name: str | None = None
+    gpu_capability: str | None = None
     git_commit: str | None = None
+    git_dirty: bool | None = None  # True: uncommitted or untracked files; commit won't reproduce
 
 
 def capture_environment() -> Environment:
     """Collect versions and hardware identity. Missing pieces stay None."""
-    torch_v = triton_v = cuda_v = gpu = None
+    torch_v = triton_v = cuda_v = gpu = capability = None
+    import numpy
+
     try:
         import torch
 
@@ -52,6 +57,7 @@ def capture_environment() -> Environment:
         cuda_v = torch.version.cuda
         if torch.cuda.is_available():
             gpu = torch.cuda.get_device_name(0)
+            capability = "{}.{}".format(*torch.cuda.get_device_capability(0))
     except ImportError:
         pass
     try:
@@ -68,11 +74,34 @@ def capture_environment() -> Environment:
             check=True,
             cwd=Path(__file__).parent,
         ).stdout.strip()
+        dirty: bool | None = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=Path(__file__).parent,
+            ).stdout.strip()
+        )
     except (subprocess.CalledProcessError, FileNotFoundError):
         commit = None
+        dirty = None
     return Environment(
-        torch=torch_v, triton=triton_v, cuda=cuda_v, gpu_name=gpu, git_commit=commit
+        numpy=numpy.__version__,
+        torch=torch_v,
+        triton=triton_v,
+        cuda=cuda_v,
+        gpu_name=gpu,
+        gpu_capability=capability,
+        git_commit=commit,
+        git_dirty=dirty,
     )
+
+
+TIMING_METHOD = (
+    "wall clock (time.perf_counter) around each call; with synchronize=True, "
+    "torch.cuda.synchronize() before and after every call; warm-up calls untimed"
+)
 
 
 def time_callable(

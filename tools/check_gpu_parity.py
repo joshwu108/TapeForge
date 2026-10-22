@@ -1,18 +1,18 @@
 """Run with: python tools/check_gpu_parity.py (requires CUDA and Triton)."""
 
-from pathlib import Path
 import sys
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import numpy as np
-import torch
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
 
 if not torch.cuda.is_available():
     raise SystemExit("CUDA is unavailable; run this script in a GPU runtime.")
 
-from tapeforge import contract, generate, reference, windows
-from tapeforge.kernels import launch_aggregate
+from tapeforge import contract, generate, reference, windows  # noqa: E402
+from tapeforge.kernels import BucketTooLargeError, launch_aggregate  # noqa: E402
 
 
 def check(profile, seed):
@@ -30,9 +30,7 @@ def check(profile, seed):
     if maximum > 1024:
         try:
             launch_aggregate(columns, gpu_offsets, block_size=1024)
-        except ValueError as exc:
-            if str(exc) != "a bucket exceeds block_size":
-                raise
+        except BucketTooLargeError:
             print(f"PASS {profile=} {seed=}: oversized bucket rejected ({maximum})")
             return
         raise AssertionError("Oversized bucket was silently accepted")

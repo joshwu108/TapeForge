@@ -1,4 +1,4 @@
-"""Week 0: the repository itself is wired correctly."""
+"""Package imports and data contract checks."""
 
 from __future__ import annotations
 
@@ -73,3 +73,19 @@ def test_scales_match_the_precision_the_canonical_day_actually_uses() -> None:
     """BTCUSDT: 2 price decimals, 5 quantity decimals (measured)."""
     assert contract.PRICE_SCALE == 10**2
     assert contract.QUANTITY_SCALE == 10**5
+
+
+def test_package_imports_without_torch_or_triton() -> None:
+    """CI installs no torch; every module must still import (GPU code is guarded)."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "sys.modules['torch'] = None\n"
+        "sys.modules['triton'] = None\n"
+        "import tapeforge.kernels as k, tapeforge.ops, tapeforge.reference, tapeforge.windows\n"
+        "assert k.TRITON_AVAILABLE is False\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

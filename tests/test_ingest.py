@@ -1,4 +1,4 @@
-"""Week 1: public aggTrades loading, normalization and validation (TF-02).
+"""Public aggTrades loading, normalization and validation (TF-02).
 
 No network access: every case runs against the committed fixtures in
 tests/fixtures/, which are 5-row excerpts in the two layouts the archive has

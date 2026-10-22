@@ -71,7 +71,7 @@ def bucket_lengths(offsets: np.ndarray) -> np.ndarray:
     """Records per bucket, shape ``(n_buckets,)``. Zero for empty buckets.
 
     The distribution of this array is what decides the one-pass vs two-pass
-    kernel threshold in week 4, so it is a first-class output rather than
+    kernel dispatch threshold, so it is a first-class output rather than
     something each caller recomputes.
     """
     if offsets.ndim != 1 or offsets.size < 2:

@@ -12,4 +12,4 @@ warmup = 25
 repeats = 200
 synchronize = true
 
-baselines = ["tapeforge_triton", "torch_eager", "torch_compile"]
+baselines = ["tapeforge_triton", "tapeforge_triton_kernel_only", "torch_eager", "torch_compile", "numpy_reference"]

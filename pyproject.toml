@@ -15,11 +15,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# CPU development (weeks 1-2) and the PyTorch-facing API.
+# CPU development and the PyTorch-facing API.
 torch = ["torch>=2.4"]
-# GPU engine (weeks 3-6). Linux + NVIDIA only; Triton has no macOS wheels.
+# GPU engine. Linux + NVIDIA only; Triton has no macOS wheels.
 gpu = ["torch>=2.4", "triton>=3.0"]
-# Model + reporting (week 7-8)
+# Model + reporting
 ml = ["torch>=2.4", "scikit-learn>=1.4", "matplotlib>=3.8"]
 dev = [
     "pytest>=8.0",
@@ -63,3 +63,8 @@ packages = ["tapeforge"]
 mypy_path = "src"
 strict = true
 warn_unreachable = true
+
+[[tool.mypy.overrides]]
+# Triton ships no type information and has no macOS wheels.
+module = ["triton", "triton.*"]
+ignore_missing_imports = true
