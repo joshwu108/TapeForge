@@ -106,6 +106,21 @@ def aggregate_reference(trades: np.ndarray, offsets: np.ndarray) -> Features:
     )
 
 
+def vwap_numerators(trades: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+    """Exact int64 ``sum(price_ticks * quantity_ticks)`` per bucket, shape ``(n_buckets,)``.
+
+    This is the VWAP numerator before the engine's single floating-point
+    division. Consumers that need a VWAP on the integer price grid (the
+    execution simulator's fill price) round this exactly instead of rounding
+    the float ``Features.vwap``. Same validation as ``aggregate_reference``;
+    the caller is responsible for the int64 accumulation bound.
+    """
+    _validate(trades, offsets)
+    lengths = np.diff(offsets).astype(np.int64)
+    numerator = trades["price"].astype(np.int64) * trades["quantity"].astype(np.int64)
+    return _segment_sums(numerator, offsets, lengths)
+
+
 def aggregate_reference_naive(trades: np.ndarray, offsets: np.ndarray) -> Features:
     """The same features, computed with a plain Python loop.
 
