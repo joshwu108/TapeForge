@@ -44,6 +44,13 @@ def _assert_matches(got: dict[str, torch.Tensor], expected: reference.Features) 
 
 
 def check(profile: str, seed: int) -> None:
+    """Aggregate one workload through both entry points and assert parity; print the path.
+
+    Raises:
+        AssertionError: a feature differs from the NumPy reference beyond the
+            contract tolerance, or the prepared path chose another dispatch
+            than ``plan_dispatch`` predicts.
+    """
     trades = generate.generate_trades(seed=seed, n_buckets=N_BUCKETS, profile=profile)
     offsets = windows.build_offsets(
         trades["timestamp"], 0, N_BUCKETS, contract.DEFAULT_BUCKET_WIDTH_US

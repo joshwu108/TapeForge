@@ -1,4 +1,4 @@
-"""Scope 2: host-to-device transfer plus features (TF-09).
+"""Scope 2: host-to-device transfer plus features.
 
 Starts from host-resident column tensors (the column extraction from the
 structured array is done once, untimed) and times, per variant:
@@ -99,6 +99,7 @@ def _measure_variant(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Time every configured variant on every workload; exit 2 without CUDA."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="benchmarks/configs/pipeline.toml")
     parser.add_argument("--sizes", type=int, nargs="+", help="override config record counts")

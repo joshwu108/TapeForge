@@ -1,9 +1,10 @@
-"""Scope 3: the whole training loop (TF-10, ML impact).
+"""Scope 3: the whole training loop. Not implemented; the entry point raises.
 
-Reports training examples/s, GPU wait time and peak VRAM, with the feature
-path swapped between the reference and the GPU engine. This is the figure
-that shows whether a kernel speedup actually moves training throughput --
-keep it even when it shows that it does not.
+Intended to report training examples/s, GPU wait time and peak VRAM, with
+the feature path swapped between the reference and the GPU engine. This is
+the figure that shows whether a kernel speedup actually moves training
+throughput -- keep it even when it shows that it does not. It is blocked on
+the model and label specification (``tapeforge.model`` is a stub).
 
     python benchmarks/train.py --config benchmarks/configs/train.toml
 """
@@ -18,6 +19,7 @@ from harness import record  # noqa: F401
 
 
 def main() -> int:
+    """Parse the config, then raise ``NotImplementedError`` (see the module docstring)."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="benchmarks/configs/train.toml")
     args = parser.parse_args()

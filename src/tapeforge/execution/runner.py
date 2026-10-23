@@ -124,10 +124,17 @@ class Trajectory:
 
     @property
     def final_state(self) -> State:
+        """The state after the last decision (the reset state if none was taken)."""
         return self.states[-1]
 
     @property
     def last_result(self) -> StepResult:
+        """The step that ended the episode; its flags say whether it terminated or truncated.
+
+        Raises:
+            IndexError: the trajectory holds no step, which ``run_episode``
+                never produces (a fresh episode always takes at least one).
+        """
         return self.results[-1]
 
 
@@ -193,6 +200,7 @@ class EpisodeSummary:
     n_capped_steps: int
 
     def to_json(self) -> dict[str, Any]:
+        """Plain dict of built-in types; integers stay exact under ``json.dumps``."""
         return asdict(self)
 
 
@@ -267,6 +275,7 @@ class SetSummary:
     mean_capped_steps: float
 
     def to_json(self) -> dict[str, Any]:
+        """Plain dict of built-in types for the run record."""
         return asdict(self)
 
 

@@ -1,4 +1,5 @@
-# Kernel-only benchmark sweep (scope 1). Versioned, non-Markdown, per PRD 6.
+# Kernel-only benchmark sweep (scope 1). Versioned so a results.json entry can
+# name the configuration that produced it.
 name = "kernel_sweep"
 scope = "kernel"
 

@@ -89,6 +89,8 @@ STEP_NAMES = tuple(step.name for step in STEPS)
 
 @dataclass
 class StepResult:
+    """One row of ``manifest.json``; ``reason`` is set only for skipped steps."""
+
     name: str
     argv: list[str]
     status: str  # "ok" | "failed" | "skipped"
@@ -137,6 +139,7 @@ def tree_digest(files: list[Path]) -> str:
 
 
 def snapshot_metadata(files: list[Path]) -> dict[str, Any]:
+    """The ``snapshot.json`` payload: commit, dirty flag, file count, tree digest, pack time."""
     commit = _git("rev-parse", "HEAD")
     status = _git("status", "--porcelain")
     return {
@@ -158,6 +161,7 @@ def capture_environment() -> dict[str, Any]:
 
 
 def nvidia_smi() -> str | None:
+    """The GPU query as CSV text, or ``None`` when the tool is absent or fails."""
     try:
         return subprocess.run(
             [
@@ -193,6 +197,11 @@ def cuda_status() -> tuple[bool, str]:
 
 
 def pack(out: Path) -> dict[str, Any]:
+    """Write the tarball and return its metadata plus the archive path and sha256.
+
+    Raises:
+        RuntimeError: not a Git checkout (``tree_files``).
+    """
     files = tree_files()
     meta = snapshot_metadata(files)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -231,6 +240,7 @@ def plan(
 
 
 def run_step(step: Step, artifacts: Path) -> StepResult:
+    """Execute one step as a subprocess, logging to ``<name>.log``; never raises on failure."""
     argv = list(step.argv)
     log = artifacts / f"{step.name}.log"
     junit = None
@@ -260,6 +270,11 @@ def _results_entries() -> int:
 
 
 def run(artifacts: Path, only: list[str] | None, record: bool, make_zip: bool) -> int:
+    """Run the planned steps, write the artifacts, return 1 if any executed step failed.
+
+    Raises:
+        ValueError: ``only`` names an unknown step.
+    """
     artifacts.mkdir(parents=True, exist_ok=True)
     cuda, cuda_reason = cuda_status()
     snapshot_path = REPO / SNAPSHOT_FILE
@@ -316,6 +331,7 @@ def run(artifacts: Path, only: list[str] | None, record: bool, make_zip: bool) -
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI: ``pack --out PATH`` or ``run [--artifacts DIR] [--steps ...] [--record] [--zip]``."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
 

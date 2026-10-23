@@ -1,5 +1,5 @@
 # --- TapeForge .gitignore -------------------------------------------------
-# Policy source: PRD section 12.3. All Markdown and all planning documents
+# Documentation policy (README.rst): all Markdown and all planning documents
 # stay out of Git. Public docs live in README.rst; shared results are
 # .json / .csv / .rst.
 
@@ -52,7 +52,7 @@ env/
 htmlcov/
 coverage.xml
 
-# Datasets: never commit downloaded market data archives (PRD section 10)
+# Datasets: never commit downloaded market data archives (licence and size)
 data/
 *.zip
 *.csv.gz

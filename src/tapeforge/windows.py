@@ -1,4 +1,4 @@
-"""Bucket window index: boundary offsets, no padding (TF-04).
+"""Bucket window index: boundary offsets, no padding.
 
 For ``n_buckets`` fixed-width time buckets over a timestamp-sorted trade
 array, ``build_offsets`` returns an ``offsets`` array of length
@@ -21,7 +21,12 @@ import numpy as np
 
 
 def bucket_edges(start_us: int, n_buckets: int, width_us: int) -> np.ndarray:
-    """Return the ``n_buckets + 1`` bucket boundary timestamps (int64).
+    """Return the ``n_buckets + 1`` bucket boundary timestamps (int64 microseconds).
+
+    Edge ``b`` opens bucket ``b``; the last edge closes the window. Buckets
+    are half-open: a record exactly on an edge belongs to the bucket the edge
+    opens.
+
     Raises:
         ValueError: on a non-positive bucket count or width.
     """

@@ -1,3 +1,24 @@
+"""NumPy reference features: the correctness oracle every other path is held to.
+
+``aggregate_reference`` computes the five per-bucket features of the data
+contract from a timestamp-sorted ``TRADE_DTYPE`` array and the bucket
+offsets of ``windows.build_offsets``; ``aggregate_reference_naive`` computes
+the same features with a plain Python loop and exists only to validate the
+vectorised version. ``vwap_numerators`` exposes the exact int64 VWAP
+numerator for consumers that must round on the integer price grid.
+
+Data contract: ``event_count``, ``total_quantity`` and ``signed_quantity``
+are exact int64 (quantity ticks, taker-signed for the last); ``vwap`` is a
+float64 in quote units whose only floating-point operation is the final
+division by the bucket's quantity; ``valid`` is ``event_count > 0``. A
+bucket with records but no quantity is valid with ``vwap == 0.0``. Callers
+are responsible for the int64 accumulation bound
+(``contract.check_exact_accumulation_bound``); this module does not check
+it, so it stays usable as an oracle on inputs the engine would reject.
+
+Torch-free. Nothing here is tuned for speed beyond staying vectorised.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,6 +32,8 @@ from tapeforge.contract import (
     TRADE_DTYPE,
 )
 
+# The engine's convention for a bucket whose records carry no quantity; the
+# GPU kernels and the streaming aggregator emit the same value.
 VWAP_WHEN_NO_QUANTITY: float = 0.0
 
 
@@ -29,7 +52,15 @@ class Features:
 
 
 def taker_sign(buyer_is_maker: np.ndarray) -> np.ndarray:
-    """Map ``buyer_is_maker`` to +1 buy-initiated / -1 sell-initiated.
+    """Map the exchange's ``buyer_is_maker`` flag to the taker sign, as int64.
+
+    ``buyer_is_maker == True`` means the seller was the aggressor, so the
+    record counts as sell-initiated (``SIGN_SELL_INITIATED``); otherwise it
+    is buy-initiated. The flag is kept raw in ``TRADE_DTYPE`` and converted
+    here, in one place, so every implementation shares the convention.
+
+    Raises:
+        ValueError: the column is not a bool array.
     """
     flags = np.asarray(buyer_is_maker)
     if flags.dtype != np.bool_:
@@ -59,13 +90,17 @@ def _segment_sums(values: np.ndarray, offsets: np.ndarray, lengths: np.ndarray) 
     to the end of the array. Passing one offset per boundary and discarding
     that final segment is what keeps every bucket's end boundary intact.
     """
-    # empty bucket, returns 0s
     if values.size == 0:
         return np.zeros(lengths.size, dtype=np.int64)
+    # reduceat rejects an index equal to the array length, which is exactly
+    # where the last boundary sits when the window ends at the final record;
+    # a trailing zero gives that boundary a valid (empty) segment to start.
     padded = np.append(values, 0) if int(offsets[-1]) == values.size else values
 
-    # returns sum(a[idx[i]: idx[i+1]]) for each i and drops [:-1],
-    # which is the sum of trades after the window
+    # Segment i is sum(padded[offsets[i]:offsets[i + 1]]); the final segment
+    # (from offsets[-1] to the end) is the tail after the window and is dropped.
+    # reduceat returns the single element, not zero, for an empty segment, so
+    # empty buckets are zeroed explicitly from the lengths.
     sums = np.add.reduceat(padded, offsets)[:-1]
     return np.where(lengths > 0, sums, 0).astype(np.int64)
 
@@ -74,23 +109,30 @@ def aggregate_reference(trades: np.ndarray, offsets: np.ndarray) -> Features:
     """Compute per-bucket features from a sorted trade array and window offsets.
 
     ``trades`` is a structured array of ``contract.TRADE_DTYPE``; ``offsets``
-    comes from ``tapeforge.windows.build_offsets``.
+    comes from ``tapeforge.windows.build_offsets``. Records outside
+    ``[offsets[0], offsets[-1])`` are never read.
+
+    Raises:
+        ValueError: wrong dtype, offsets not 1-D / decreasing / outside the
+            record range.
     """
-    # check if valid inputs
     _validate(trades, offsets)
     lengths = np.diff(offsets).astype(np.int64)
     valid = lengths > 0
 
-    # calculate quantities
+    # Per-record products in int64 before any reduction, so the sums are exact
+    # within the contract bound and the sign never passes through a float.
     quantity = trades["quantity"].astype(np.int64)
     signed = quantity * taker_sign(trades["buyer_is_maker"])
     numerator = trades["price"].astype(np.int64) * quantity
 
-    # calculate segment sums
     total_quantity = _segment_sums(quantity, offsets, lengths)
     signed_quantity = _segment_sums(signed, offsets, lengths)
     numerator_sum = _segment_sums(numerator, offsets, lengths)
 
+    # The one floating-point step: numerator / quantity / PRICE_SCALE, in this
+    # order, once per bucket. The kernels and the streaming aggregator use the
+    # same order so results agree within the contract tolerance.
     vwap = np.full(lengths.size, VWAP_WHEN_NO_QUANTITY, dtype=np.float64)
     weighted = total_quantity > 0
     vwap[weighted] = (

@@ -91,6 +91,7 @@ class SplitDates:
                 seen[day] = role
 
     def role_of(self, day: str) -> str | None:
+        """The role a date is assigned to, or ``None`` when it is not listed."""
         for role in ROLES:
             if day in getattr(self, role):
                 return role
@@ -132,6 +133,7 @@ class Segment:
 
     @property
     def n_starts(self) -> int:
+        """Admissible episode starts in this segment (0 when it is too short)."""
         return self.end_start - self.first_start
 
     def date_at(self, bucket: int) -> str:
@@ -167,6 +169,11 @@ class SplitRecord:
     segments: tuple[Segment, ...]
 
     def segments_for(self, role: str) -> tuple[Segment, ...]:
+        """The role's segments in chronological order.
+
+        Raises:
+            ValueError: unknown role.
+        """
         _check_role(role)
         return tuple(s for s in self.segments if s.role == role)
 
@@ -194,6 +201,7 @@ class SplitRecord:
         raise IndexError(f"position {position} >= {self.n_starts(role)} starts of role {role!r}")
 
     def dates_for(self, role: str) -> tuple[str, ...]:
+        """Calendar dates assigned to a role, in order (empty for an unused role)."""
         return tuple(d.date for d in self.days if d.role == role)
 
     def matches(self, spec: EpisodeSpec) -> bool:

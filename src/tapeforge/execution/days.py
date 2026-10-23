@@ -107,6 +107,7 @@ class DayTape:
 
     @property
     def n_buckets(self) -> int:
+        """Buckets in the day (86,400 for a full day at the default width)."""
         return self.tape.n_buckets
 
     @property

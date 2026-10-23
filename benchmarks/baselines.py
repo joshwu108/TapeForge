@@ -21,6 +21,11 @@ from tapeforge import contract
 
 
 def torch_index_add(columns: dict[str, Any], offsets: Any) -> dict[str, Any]:
+    """The five features from stock PyTorch ops, on whichever device the inputs live.
+
+    No validation and no host synchronisation, so the timed region is the
+    tensor work alone. The caller is responsible for the int64 bound.
+    """
     import torch
 
     price, quantity = columns["price"], columns["quantity"]

@@ -55,12 +55,12 @@ BPS_DENOMINATOR: Final[int] = 10_000
 # BTCUSDT). Notionals are ``price_ticks * quantity_ticks`` with no rounding.
 CASH_SCALE: Final[int] = PRICE_SCALE * QUANTITY_SCALE
 
-# The accepted first configuration. Coefficients that the owner left as sweeps
-# (risk lambda, residual mu) have no accepted value and default to zero, which
-# switches the corresponding term off.
+# The accepted first configuration. Coefficients that are experiment sweeps
+# rather than fixed assumptions (risk lambda, residual mu) have no accepted
+# value and default to zero, which switches the corresponding term off.
 ACCEPTED_HORIZON_BUCKETS: Final[int] = 300
 ACCEPTED_PARTICIPATION_CAP_BPS: Final[int] = 1_000   # 10 % of a bucket's total quantity
-ACCEPTED_FEE_BPS: Final[int] = 10                    # taker fee, pending tier confirmation
+ACCEPTED_FEE_BPS: Final[int] = 10   # taker fee; an assumed tier, not read from the exchange
 ACCEPTED_TARGET_FRACTIONS_BPS: Final[tuple[int, ...]] = (200, 500, 1_000)  # rho
 
 # Fill rules are named strings, not a plugin registry. A second rule (for

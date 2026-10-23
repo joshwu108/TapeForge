@@ -27,6 +27,8 @@ RECORDS_PER_BUCKET = {"sparse": 0.5, "uniform": 50.0, "burst": 100.0}
 
 @dataclass(frozen=True)
 class WorkloadInfo:
+    """Everything a result record needs to name the workload and its dispatch."""
+
     profile: str
     seed: int
     requested_records: int
@@ -46,6 +48,7 @@ class WorkloadInfo:
     two_pass_n_chunks: int  # pass-1 programs the two-pass path would launch
 
     def as_dict(self) -> dict[str, Any]:
+        """Plain dict for the ``config.workload`` field of a result record."""
         return asdict(self)
 
 
@@ -74,6 +77,15 @@ def describe_offsets(offsets: np.ndarray) -> dict[str, Any]:
 def make_workload(
     n_records: int, profile: str, seed: int, width_us: int = contract.DEFAULT_BUCKET_WIDTH_US
 ) -> tuple[np.ndarray, np.ndarray, WorkloadInfo]:
+    """Seeded trades, their offsets and the workload description for about ``n_records``.
+
+    The bucket count is chosen from the profile's mean rate, so the actual
+    record count differs from the request and is recorded in ``info``.
+
+    Raises:
+        KeyError: unknown profile.
+        ValueError: whatever ``generate_trades`` rejects.
+    """
     n_buckets = max(1, round(n_records / RECORDS_PER_BUCKET[profile]))
     trades = generate.generate_trades(
         seed=seed, n_buckets=n_buckets, profile=profile, width_us=width_us  # type: ignore[arg-type]
@@ -119,4 +131,5 @@ def check_features(got: dict[str, Any], expected: reference.Features) -> None:
 
 
 def features_dict(features: reference.Features) -> dict[str, np.ndarray]:
+    """The reference ``Features`` as the dict shape ``ops.aggregate`` returns."""
     return {name: getattr(features, name) for name in contract.FEATURE_NAMES}

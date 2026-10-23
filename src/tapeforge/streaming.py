@@ -61,6 +61,7 @@ class StreamingAggregator:
 
     @property
     def n_buckets(self) -> int:
+        """Buckets in the window; the total number of rows emitted over the stream."""
         return self._n_buckets
 
     @property
@@ -80,6 +81,7 @@ class StreamingAggregator:
 
     @property
     def is_finished(self) -> bool:
+        """True after ``finalize``; further ``push`` calls raise."""
         return self._finished
 
     # --- the stream ---------------------------------------------------------

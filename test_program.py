@@ -1,3 +1,12 @@
+"""Toy end-to-end check of the CUDA launcher on the hand-calculated example.
+
+Two records in bucket 0 (buy-initiated 100.00 x 2, sell-initiated 102.00 x 1)
+and an empty bucket 1: counts 2 / 0, total 3 / 0, signed +1 / 0, VWAP
+100.666... / 0.0. Needs a CUDA device and Triton; ``tools/verify_snapshot.py``
+runs it as the ``toy_program`` step and the test suites assert the same
+numbers on the CPU.
+"""
+
 import torch
 
 from tapeforge.kernels import launch_aggregate

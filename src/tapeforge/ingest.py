@@ -1,11 +1,18 @@
-"""Public aggTrades loading, normalization and validation (TF-02).
+"""Public aggTrades loading, normalization and validation.
 
-Loads one symbol-day of Binance spot ``aggTrades`` from the public archive,
+Loads one symbol-day of Binance Vision ``aggTrades`` (the spot and the USD-M
+futures archives share the 7-column layout; 2025-onward files add a header),
 normalizes timestamps to ``contract.TIME_UNIT``, converts price and quantity
-to exactly scaled integers, and records dataset provenance.
+to exactly scaled integer ticks, parses ``is_buyer_maker`` strictly, sorts
+by timestamp if the file is not already sorted, and records dataset
+provenance (sha256 of the raw file, record count, timestamp unit).
 
 A row is an *aggregate* trade record, not an individual fill. Record counts
-in this project always mean aggregate-trade records
+in this project always mean aggregate-trade records. Values that the fixed
+scales cannot represent exactly are rejected, never truncated.
+
+Network access exists only in ``download`` (spot archive URL); every other
+function reads local files, so the test suite stays offline.
 
 CLI:
     python -m tapeforge.ingest --symbol BTCUSDT --date 2025-01-02
@@ -106,8 +113,9 @@ def decimal_strings_to_ticks(values: np.ndarray, scale: int) -> np.ndarray:
         worst = text[np.argmax(np.char.str_len(significant))]
         raise ValueError(
             f"value {worst!r} carries more precision than the {digits}-digit scale "
-            f"{scale} can represent exactly; change the scale rather than truncating. "
-            "This symbol needs per-symbol scales (see contract.py, D-003)."
+            f"{scale} can represent exactly. Truncating would corrupt the integer sums; "
+            "this symbol needs a larger scale (contract.PRICE_SCALE / QUANTITY_SCALE are "
+            "fixed to BTCUSDT's 2 and 5 decimals; per-symbol scales are not implemented)."
         )
 
     whole = np.where(whole == "", "0", whole)
@@ -177,13 +185,23 @@ def load_agg_trades(path: str | Path) -> tuple[np.ndarray, Provenance]:
     """Parse a downloaded aggTrades ZIP/CSV into ``TRADE_DTYPE`` + provenance.
 
     Returns a timestamp-sorted array. Duplicate timestamps are preserved:
-    several aggregate records legitimately share a millisecond.
+    several aggregate records legitimately share a millisecond. A stable
+    sort is applied only when the file is out of order, and the provenance
+    says so (``was_resorted``).
+
+    Raises:
+        ValueError: unreadable archive, wrong column count, no records, an
+            implausible timestamp after unit detection, a price or quantity
+            the scales cannot represent, or an unparseable boolean.
     """
     path = Path(path)
     rows, raw = _read_rows(path)
     columns = list(zip(*rows, strict=False))
 
-    # detect the time in the trade record
+    # The archive's timestamp column switched from ms to us in 2025; the unit
+    # is inferred from magnitude and then sanity-checked against a plausible
+    # date range so a wrong guess fails loudly instead of shifting every
+    # record by a factor of 1,000.
     raw_time = np.array(columns[COL_TRANSACT_TIME], dtype=np.int64)
     unit = detect_timestamp_unit(raw_time)
     timestamps = raw_time if unit == "us" else raw_time * 1_000
@@ -194,7 +212,6 @@ def load_agg_trades(path: str | Path) -> tuple[np.ndarray, Provenance]:
             f"after assuming {unit}; the unit detection is wrong for {path.name}"
         )
 
-    # set column quantities extracted from the csv
     trades = np.zeros(len(rows), dtype=TRADE_DTYPE)
     trades["timestamp"] = timestamps
     trades["price"] = decimal_strings_to_ticks(np.array(columns[COL_PRICE]), PRICE_SCALE)

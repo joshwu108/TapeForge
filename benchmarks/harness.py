@@ -2,9 +2,10 @@
 
 Every benchmark result is written through ``record()`` so no number ever
 appears without the hardware, environment, code revision and dataset that
-produced it (PRD section 6, reproducibility).
+produced it; a performance claim in the public documentation must cite such
+a record.
 
-Timing rules enforced here (PRD section 6, fair comparisons):
+Timing rules enforced here, so that comparisons are like for like:
   - each implementation is warmed up before measurement, so Triton and
     ``torch.compile`` compilation never lands inside a timed region;
   - every timed region is a complete Python call: it includes Python

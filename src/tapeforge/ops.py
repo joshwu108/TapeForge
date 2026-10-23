@@ -1,4 +1,4 @@
-"""PyTorch-facing API (TF-07): typed tensors with documented shapes.
+"""PyTorch-facing API: typed tensors with documented shapes.
 
 Public surface:
 

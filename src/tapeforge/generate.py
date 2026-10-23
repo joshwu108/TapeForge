@@ -1,8 +1,11 @@
-"""Seeded synthetic trade generation
+"""Seeded synthetic trade generation.
 
 Deterministic fixtures: the same seed always reproduces byte-identical
-records. Covers the shapes that break naive implementations -- empty
-windows, duplicate timestamps, and large bursts.
+``TRADE_DTYPE`` records (int64 microsecond timestamps, int64 price and
+quantity ticks, the raw ``buyer_is_maker`` flag, increasing ids). Covers the
+shapes that break naive implementations -- empty windows, duplicate
+timestamps, and large bursts. Prices follow a random walk around 100.00, so
+synthetic tapes say nothing about real market behaviour.
 
 Why the shapes matter
 ---------------------
@@ -14,7 +17,7 @@ Why the shapes matter
 ``burst``    mean 50, but a small fraction of buckets are Pareto-amplified
              into thousands of records. This is the distribution that makes
              padding to the longest bucket wasteful, and the one that forces
-             the two-pass reduction path (TF-06).
+             the two-pass reduction path on the GPU.
 
 Event timestamps are quantized to ``EVENT_TIME_TICK_US`` (1 ms) inside each
 bucket, because an aggTrades row already aggregates fills that share a

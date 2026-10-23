@@ -154,6 +154,7 @@ class MarketSlice:
 
     @property
     def n_buckets(self) -> int:
+        """Buckets in the slice, before and after ``t_0`` together."""
         return int(self.event_count.size)
 
     @property

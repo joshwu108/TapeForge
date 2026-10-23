@@ -1,8 +1,9 @@
-"""Scope 1: kernel-only latency on already-resident tensors (TF-08).
+"""Scope 1: kernel-only latency on already-resident tensors.
 
 Inputs are moved to the device *before* timing starts. This number answers
 "how fast is the reduction", and must never be compared against a CPU
-pipeline that also decompresses a ZIP (PRD section 6).
+pipeline that also decompresses a ZIP; transfer costs are scope 2
+(``pipeline.py``).
 
 Rows (``baselines`` in the config). Every timed region is a complete Python
 call, so each row includes Python dispatch and kernel-launch overhead; what
@@ -324,6 +325,11 @@ def _measure(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the configured sweep; print one JSON line per row; exit 1 if any row is wrong.
+
+    Records to ``benchmarks/results.json`` only on CUDA and without
+    ``--no-record``. Without CUDA the CPU-capable rows run as a smoke test.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="benchmarks/configs/kernel_sweep.toml")
     parser.add_argument("--sizes", type=int, nargs="+", help="override config record counts")

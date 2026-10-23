@@ -55,6 +55,7 @@ class ObservationStatistics:
             raise ValueError("fields, mean and std must have the same length")
 
     def to_json(self) -> dict[str, Any]:
+        """Plain dict of built-in types, stored verbatim in run records."""
         return asdict(self)
 
 
