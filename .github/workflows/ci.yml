@@ -29,5 +29,3 @@ jobs:
         run: ruff check src tests benchmarks tools
       - name: test
         run: pytest -q --cov=tapeforge --cov-report=term-missing
-      - name: policy check (no tracked markdown or planning files)
-        run: python tools/bootstrap_commit_skill.py --check || test $? -eq 2

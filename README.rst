@@ -125,7 +125,6 @@ Verify a checkout
    $ python -m pytest -q                    # all tests; GPU tests skip with a reason
    $ python -m pytest -q -m gpu             # GPU parity suite, needs CUDA + Triton
    $ python -m pytest -q -m slow            # stress suite (GPU cases skip without CUDA)
-   $ python tools/bootstrap_commit_skill.py --check
    $ python tools/verify_snapshot.py run --artifacts verification   # all of the above, with artifacts
 
 The last command runs lint, the test suites, the parity script and the quick

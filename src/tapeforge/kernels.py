@@ -22,6 +22,7 @@ except ImportError:
 
 MAX_ONE_PASS_BUCKET: Final[int] = 4096
 MIN_BLOCK_SIZE: Final[int] = 16
+CHUNK_SIZE = 1024
 
 
 class BucketTooLargeError(ValueError):
@@ -59,6 +60,21 @@ def _num_warps(block_size: int) -> int:
     # tile grows (4 warps up to 1024 lanes, 16 warps at 4096).
     return min(16, max(4, block_size // 256))
 
+def build_chunk_metadata(offsets, chunk_size):
+    import torch
+    # shift array to find chunk lengths
+    lengths = offsets[1:] - offsets[:-1]
+    chunks_per_bucket = (lengths + chunk_size - 1) // chunk_size
+
+    chunk_offsets = torch.cat([offsets.new_zeros(1), chunks_per_bucket.cumsum(dim=0)])
+    n_chunks = int(chunk_offsets[-1].item())
+    bucket_ids = torch.repeat_interleave(torch.arange(lengths.numel(), device=offsets.device), chunks_per_bucket, output_size = n_chunks)
+
+    # chunk number with original bucket
+    local_chunk = (torch.arange(n_chunks, device=offsets.device) - chunk_offsets[bucket_ids])
+    chunk_starts = offsets[bucket_ids] + local_chunk * chunk_size
+    chunk_ends = torch.minimum(chunk_starts + chunk_size, offsets[bucket_ids + 1])
+    return chunk_starts, chunk_ends, chunk_offsets
 
 if TRITON_AVAILABLE:
 
@@ -127,6 +143,86 @@ if TRITON_AVAILABLE:
         tl.store(vwap_ptr + pid, vwap)
         tl.store(valid_ptr + pid, length > 0)
 
+    @triton.jit
+    def aggregate_partials(price_ptr,
+            quantity_ptr,
+            maker_ptr,
+            chunk_start_ptr,
+            chunk_end_ptr,
+            partial_total_ptr,
+            partial_signed_ptr,
+            partial_numerator_ptr,
+            BLOCK_SIZE: tl.constexpr,
+    ):
+        chunk = tl.program_id(0)
+        start, end = tl.load(chunk_start_ptr + chunk), tl.load(chunk_end_ptr + chunk)
+        indices = start + tl.arange(0, BLOCK_SIZE)
+        mask = indices < end
+
+        quantities = tl.load(quantity_ptr + indices, mask=mask, other = 0)
+        prices = tl.load(price_ptr + indices, mask=mask, other = 0)
+        makers = tl.load(maker_ptr + indices, mask=mask, other = False)
+
+        total = tl.sum(quantities, axis = 0)
+        signed = tl.sum(quantities * tl.where(makers, -1, 1), axis=0)
+        numerator = tl.sum(prices * quantities, axis = 0)
+
+        tl.store(partial_total_ptr + chunk, total)
+        tl.store(partial_signed_ptr + chunk, signed)
+        tl.store(partial_numerator_ptr + chunk, numerator)
+
+    @triton.jit
+    def combine_partials(
+        partial_total_ptr, 
+        partial_signed_ptr,
+        partial_numerator_ptr,
+        chunk_offsets_ptr,
+        offsets_ptr,
+        total_quantity_ptr,
+        event_count_ptr,
+        signed_quantity_ptr,
+        vwap_ptr,
+        valid_ptr,
+        BLOCK_SIZE: tl.constexpr,
+        PRICE_SCALE: tl.constexpr
+    ):
+        bucket = tl.program_id(0)
+        first_chunk = tl.load(chunk_offsets_ptr + bucket)
+        last_chunk = tl.load(chunk_offsets_ptr + bucket + 1)
+
+        # initialize accumulators using tl.full()
+        lanes = tl.arange(0, BLOCK_SIZE)
+        totals = tl.full((BLOCK_SIZE,), 0, tl.int64)
+        signeds = tl.full((BLOCK_SIZE,), 0, tl.int64)
+        numerators = tl.full((BLOCK_SIZE,), 0, tl.int64)
+
+        for base in range(first_chunk, last_chunk, BLOCK_SIZE):
+            indices = base + lanes
+            mask = indices < last_chunk
+            totals += tl.load(partial_total_ptr + indices, mask = mask, other = 0)
+            signeds += tl.load(partial_signed_ptr + indices, mask=mask, other=0)
+            numerators += tl.load(partial_numerator_ptr + indices, mask=mask, other = 0)
+
+        total = tl.sum(totals, axis = 0)
+        signed = tl.sum(signeds, axis = 0)
+        numerator = tl.sum(numerators, axis = 0)
+
+        start = tl.load(offsets_ptr + bucket)
+        end = tl.load(offsets_ptr + bucket + 1)
+        count = end - start
+
+        has_quantity = total > 0
+        denominator = tl.where(has_quantity, total, 1).to(tl.float64)
+        vwap = numerator.to(tl.float64) / denominator / PRICE_SCALE
+        vwap = tl.where(has_quantity, vwap, 0.0)
+
+        tl.store(total_quantity_ptr + bucket, total)
+        tl.store(signed_quantity_ptr + bucket, signed)
+        tl.store(event_count_ptr + bucket, count)
+        tl.store(vwap_ptr + bucket, vwap)
+        tl.store(valid_ptr + bucket, count > 0)
+
+
 
 def launch_aggregate(
     trades: Mapping[str, torch.Tensor],
@@ -158,18 +254,56 @@ def launch_aggregate(
     if offsets.device.type != "cuda":
         raise ValueError("launch_aggregate needs CUDA tensors; use ops.aggregate for CPU inputs")
     summary = validate_columns(trades, offsets)
-    try:
-        block = select_block_size(summary.max_bucket_len, block_size)
-    except BucketTooLargeError as exc:
-        raise BucketTooLargeError(f"bucket {summary.longest_bucket}: {exc}") from None
 
-    features = empty_features(summary.n_buckets, offsets.device)
-    if summary.n_records == 0:
-        # Every bucket is empty and the zero-filled outputs are already the
-        # answer; skipping the launch avoids handing Triton zero-size buffers.
+    use_one_pass = (block_size is not None or summary.max_bucket_len <= MAX_ONE_PASS_BUCKET)
+    block = None
+    if use_one_pass:
+        block = select_block_size(summary.max_bucket_len, block_size)
+
+    with torch.cuda.device(offsets.device):
+        features = empty_features(summary.n_buckets, offsets.device)
+        if summary.max_bucket_len == 0:
+            return features
+
+        if use_one_pass:
+            launch_one_pass_unchecked(trades, offsets, features, block)
+            return features
+
+        starts, ends, chunk_offsets = build_chunk_metadata(offsets, CHUNK_SIZE)
+        n_chunks =starts.numel()
+        partial_total = torch.empty(n_chunks, dtype=torch.int64, device=offsets.device)
+        partial_signed = torch.empty_like(partial_total)
+        partial_numerator = torch.empty_like(partial_total)
+
+        aggregate_partials[(n_chunks,)](
+            trades["price"],
+            trades["quantity"],
+            trades["buyer_is_maker"],
+            starts,
+            ends,
+            partial_total,
+            partial_signed,
+            partial_numerator,
+            BLOCK_SIZE=CHUNK_SIZE,
+            num_warps=_num_warps(CHUNK_SIZE),
+        )
+
+        combine_partials[(summary.n_buckets,)](
+            partial_total,
+            partial_signed,
+            partial_numerator,
+            chunk_offsets,
+            offsets,
+            features["total_quantity"],
+            features["event_count"],
+            features["signed_quantity"],
+            features["vwap"],
+            features["valid"],
+            BLOCK_SIZE=128,
+            PRICE_SCALE=PRICE_SCALE,
+            num_warps=4,
+        )
         return features
-    launch_one_pass_unchecked(trades, offsets, features, block)
-    return features
 
 
 def empty_features(n_buckets: int, device: torch.device) -> dict[str, torch.Tensor]:
