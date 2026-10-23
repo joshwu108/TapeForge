@@ -64,6 +64,9 @@ data/
 !tests/fixtures/
 !tests/fixtures/**
 
+# Baseline / policy run records (tapeforge.execution.runner.write_run_record)
+runs/
+
 # Profiler and trace artifacts
 *.nsys-rep
 *.sqlite
