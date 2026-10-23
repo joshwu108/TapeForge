@@ -59,6 +59,7 @@ class EpisodeDraw:
     rho_bps: int
 
     def to_json(self) -> dict[str, Any]:
+        """Plain dict of built-in types; ``(seed, role, index)`` rebuilds the draw."""
         return asdict(self)
 
 
@@ -85,10 +86,12 @@ def draw_episode(
     """
     if not rho_choices_bps:
         raise ValueError("rho_choices_bps must not be empty")
+    # Arguments are checked before the record is consulted, so a bad role is
+    # reported the same way whether or not the record knows it.
+    rng = _generator(seed, role, index)
     n_starts = record.n_starts(role)
     if n_starts == 0:
         raise ValueError(f"role {role!r} has no admissible episode start to sample from")
-    rng = _generator(seed, role, index)
     position = int(rng.integers(n_starts))
     side = SIDE_BUY if int(rng.integers(2)) == 0 else SIDE_SELL
     rho_bps = int(rho_choices_bps[int(rng.integers(len(rho_choices_bps)))])
