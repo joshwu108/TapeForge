@@ -29,8 +29,11 @@ host/device transfers affect feature-generation throughput. A streaming CPU
 aggregator computes the same features one chunk at a time, bitwise equal to
 the batch result, as the live-path counterpart of the batch engine. Buckets
 longer than one GPU tile are reduced by a two-pass kernel pair that carries
-integer partial sums and divides once. Planned extensions include
-pinned-memory stream overlap in the transfer benchmark and an end-to-end
+integer partial sums and divides once. On top of the features, a torch-free
+reference execution simulator replays an optimal-execution episode against
+the bucket tape with exact integer accounting (see "Execution simulator").
+Planned extensions include pinned-memory stream overlap in the transfer
+benchmark, policy baselines over frozen episode splits, and an end-to-end
 training throughput experiment. The classifier and training benchmark remain
 stubs. The input contains trades rather than order-book data.
 
@@ -46,7 +49,10 @@ buckets dispatch automatically to the two-pass path: pass 1 reduces
 contiguous partials in 128-wide tiles and performs the only division. No
 bucket length is rejected or truncated; an explicit one-pass tile size
 remains a hard capacity check. ``tapeforge.prepared`` validates and plans an
-input once for repeated execution into reused buffers.
+input once for repeated execution into reused buffers. The reference
+execution simulator (``tapeforge.execution``) is implemented and tested on
+the CPU against hand-calculated tables; it has no GPU counterpart yet, and
+no policy has been trained or evaluated with it.
 
 Hardware verification so far: the GPU parity suite of this revision (82 tests:
 one-pass and two-pass paths, prepared execution, multi-tile pass-2 cases,
@@ -253,6 +259,127 @@ never wrap. Property-based tests split generated days and arbitrary ordered
 records at random cut points and assert bitwise equality with the batch
 reference; the slow suite runs 1,000 such chunkings.
 
+Execution simulator (reference)
+===============================
+
+``tapeforge.execution`` is a deterministic CPU simulator of one
+optimal-execution episode: trade a target quantity Q* within a horizon of H
+one-second buckets, one decision per bucket, paying fees and an explicit
+residual charge for whatever is left at the end. It is torch-free, built from
+pure functions over frozen dataclasses, and every monetary and quantity field
+is a Python integer, so a replayed episode is byte-identical and a future
+batched implementation can be compared with it element by element.
+
+Accepted first configuration (owner decisions of 2026-10-23; the coefficients
+marked *swept* have no default and are zero, i.e. off, unless set):
+
+=========================  =========================================================
+parameter                  value
+=========================  =========================================================
+horizon                    H = 300 buckets of 1 s, one decision at each boundary
+side                       buy from zero to +Q*, or liquidate +Q* to zero
+target                     Q* = round_half_up(rho x V_ref), V_ref = total quantity
+                           over the 300 buckets before the start; rho in
+                           {2 %, 5 %, 10 %}; at least one tick; at most the
+                           participation cap of V_ref
+action                     fraction of the *remaining* quantity in [0, 1],
+                           floored to quantity ticks (the only float, converted once)
+fill rule                  ``bucket_vwap_capped`` (synthetic, see below)
+participation cap          10 % of the execution bucket's total quantity
+slippage                   0 price ticks (parameter)
+fee                        taker, 10 bps of notional, rounded *up* to the cash tick
+latency ``l``              0 (decision at boundary t fills in bucket t); 1 as ablation
+data delay ``d``           0 (a decision at t reads buckets <= t - 1); 1 as ablation
+arrival price P_0          VWAP of the last valid bucket before the first decision,
+                           searched over the lookback L
+residual at the horizon    Perold opportunity cost ``side x (P_T - P_0) x residual``
+                           plus ``mu x residual``; P_T = first valid bucket after
+                           the last fill bucket (``mu`` swept)
+per-step risk              ``lambda x remaining_after`` (``lambda`` swept)
+=========================  =========================================================
+
+Units follow the data contract: quantity ticks (1e-5 BTC), price ticks (0.01
+USDT) and *cash ticks* = price tick x quantity tick (1e-7 USDT). A notional is
+``price_ticks x quantity_ticks`` with no rounding; the fee ceiling is the only
+rounding anywhere in the accounting. Rates are integer basis points so caps,
+fees and targets never pass through a float. The bucket VWAP used as a fill
+price is the engine's exact integer numerator divided by the quantity and
+rounded half-up to a price tick, not the float ``vwap`` feature.
+
+**The fill assumption is synthetic.** The submitted quantity fills at the
+execution bucket's tick-rounded VWAP, capped at 10 % of that bucket's traded
+quantity; nothing fills in a bucket with no records or no quantity, and the
+decision is consumed. A real taker order would not get the bucket VWAP. The
+simulator models no market impact, no reaction of the market to the agent,
+no passive or limit orders, no queue position and no spread, because the
+input is aggregate trades without a book. The rule is a named string so a
+best-bid/ask fill-at-touch rule can be added beside it once quote data is
+ingested; nothing else changes.
+
+Reward and shortfall. Each ``StepResult`` carries the reward split into
+``cost_component`` = ``side x (notional - P_0 x fill) + fee`` (positive is a
+cost for both sides), ``risk_component`` = ``lambda x remaining_after`` and
+``terminal_component`` = the residual term at the horizon, with
+``reward_ticks = -(cost + risk + terminal)``. Summed over a terminated episode
+the rewards equal ``-IS - lambda x sum(remaining_after)`` exactly, where the
+implementation shortfall is ``IS = side x (exec_notional - P_0 x filled) +
+fees + residual term``. The accounting identity ``cash + inventory x P_0``
+(relative to the initial portfolio) ``== -IS`` of the fills so far holds after
+every step and is asserted in the tests. ``shortfall_bps`` divides by
+``P_0 x Q*`` for reporting only.
+
+Termination and truncation. ``remaining == 0`` or ``step == H`` sets
+``terminated`` (the horizon is part of the task, since time remaining is
+observed). A tape that ends before the fill bucket of a decision, or that has
+no valid bucket after the horizon when residual inventory needs a terminal
+mark, sets ``truncated`` instead; the two flags are never both set. Stepping a
+finished episode raises ``EpisodeOver``.
+
+Observations (``observe``) are a fixed float64 vector (``OBSERVATION_FIELDS``):
+remaining and time-remaining fractions, side, the return of the mark price
+(last valid visible VWAP) against P_0 and its age, and the newest visible
+bucket's validity, record count, quantity relative to Q*, taker imbalance and
+return against P_0. The visible tape is cut at bucket ``t - 1 - d`` before
+anything is read, so later buckets cannot leak in by construction; the tests
+perturb every later bucket and assert the observation is unchanged.
+
+.. code-block:: python
+
+   from tapeforge import generate, windows
+   from tapeforge.contract import DEFAULT_BUCKET_WIDTH_US
+   from tapeforge.execution import (
+       EpisodeSpec, action_for_quantity, implementation_shortfall, is_done,
+       make_episode, remaining_qty_ticks, reset, step,
+   )
+
+   trades = generate.generate_trades(seed=7, n_buckets=40, profile="uniform")
+   offsets = windows.build_offsets(trades["timestamp"], 0, 40, DEFAULT_BUCKET_WIDTH_US)
+   template = EpisodeSpec(side=1, target_qty_ticks=1, horizon_buckets=10, arrival_lookback=5)
+   spec, market = make_episode(trades, offsets, start_bucket=15, side=1, rho_bps=500,
+                               template=template)   # Q* from the 10 buckets before 15
+
+   state, rewards = reset(spec, market), []
+   while not is_done(state, spec):                   # TWAP: remaining / time remaining
+       remaining = remaining_qty_ticks(state, spec)
+       action = action_for_quantity(remaining // (spec.horizon_buckets - state.step), remaining)
+       state, result = step(state, action, market, spec)
+       rewards.append(result.reward_ticks)
+       if result.terminated or result.truncated:
+           break
+   shortfall = implementation_shortfall(state, spec, result.terminal_price_ticks or None)
+   assert sum(rewards) == -shortfall                 # lambda = 0: rewards are minus the shortfall
+
+``make_episode`` cuts the slice (``max(H, L + d)`` buckets before the start,
+``H + l + L`` after) and sizes Q*; ``reset`` fixes P_0 and runs the int64 bound
+check (``check_episode_bounds``: ``H x cap x max_price`` and ``cap x
+max_price x fee_bps`` must fit, like the feature engine's accumulation bound).
+``action_for_quantity`` is the inverse of the floor conversion for
+quantity-based baselines. The simulator is verified on the CPU only, against
+the hand-calculated worksheet tables (buy, sell, partial completion with the
+three residual rules, invalid bucket, the 5,002.5 -> 5,003 fee case) and
+Hypothesis properties over random tapes and actions. Episode splits, the
+baseline suite and any learned policy are not implemented.
+
 Reproducible GPU verification
 =============================
 
@@ -354,7 +481,13 @@ Layout
      validation.py  tensor input checks shared by ops and the kernel launcher
      ops.py         PyTorch-facing API: CUDA -> Triton, CPU -> reference
      model.py       small volatility-regime classifier
-   tests/           parity, edge-case, streaming, two-pass, prepared and stress suites
+     execution/     reference execution simulator (CPU, torch-free)
+       spec.py        EpisodeSpec, units, fee ceiling, participation cap, int64 bounds
+       state.py       MarketSlice (bucket tape, integer VWAP ticks), State, StepResult
+       simulator.py   reset / observe / step, shortfall, residual rules
+       episodes.py    tape window, reference volume, target Q*, make_episode
+   tests/           parity, edge-case, streaming, two-pass, prepared, stress and
+                    execution-simulator suites (tests/test_execution/)
    benchmarks/      harness, three timed scopes, versioned configs, results
    tools/           commit skill bootstrap, safe local commit helper,
                     GPU parity script, snapshot packer + verification runner
