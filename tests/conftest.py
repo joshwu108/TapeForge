@@ -42,10 +42,11 @@ TOY_EXPECTED = {
 
 # --- shared GPU parity helpers --------------------------------------------
 #
-# Used by test_gpu_parity.py (one-pass path) and test_two_pass.py (buckets
-# beyond the one-pass tile). Both compare the real CUDA code path against
-# reference.aggregate_reference_naive, the plain-loop oracle, so the GPU is
-# never checked against code that shares its vectorization tricks.
+# Used by test_gpu_parity.py (one-pass path), test_two_pass.py (buckets
+# beyond the one-pass tile) and test_prepared.py. All compare the real CUDA
+# code path against reference.aggregate_reference_naive, the plain-loop
+# oracle, so the GPU is never checked against code that shares its
+# vectorization tricks.
 #
 # Parity rule: counts and quantity sums exactly; VWAP within
 # contract.VWAP_RTOL / VWAP_ATOL; identical dtypes; outputs on the GPU.
@@ -54,15 +55,7 @@ from typing import Any  # noqa: E402
 
 import numpy as np  # noqa: E402
 
-from tapeforge import contract, kernels, reference  # noqa: E402
-
-# Strict: the day the two-pass reduction lands these tests XPASS and fail
-# loudly, and the marker must be removed from them.
-TWO_PASS_MISSING = pytest.mark.xfail(
-    raises=kernels.BucketTooLargeError,
-    strict=True,
-    reason="two-pass reduction for buckets beyond the one-pass limit is not implemented yet",
-)
+from tapeforge import contract, reference  # noqa: E402
 
 
 def cuda_inputs(trades: np.ndarray, offsets: np.ndarray) -> tuple[dict[str, Any], Any]:

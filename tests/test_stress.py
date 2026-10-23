@@ -65,10 +65,12 @@ def test_gpu_no_incorrect_features_at_scale(
     trades, offsets = _workload(n_records, profile)
     columns = {k: torch.as_tensor(trades[k].copy()).cuda() for k in trades.dtype.names}
     gpu_offsets = torch.as_tensor(offsets).cuda()
-    if int(np.diff(offsets).max()) > kernels.MAX_ONE_PASS_BUCKET:
-        with pytest.raises(kernels.BucketTooLargeError):
-            ops.aggregate(columns, gpu_offsets)
-        pytest.xfail("workload has buckets beyond the one-pass limit; two-pass not implemented")
+    # Burst workloads carry buckets beyond the one-pass tile and take the
+    # two-pass path; sparse and uniform stay one-pass. Assert which, so the
+    # suite is known to reach the parity comparison on both paths.
+    longest = int(np.diff(offsets).max())
+    expected_path = "two_pass" if profile == "burst" else "one_pass"
+    assert kernels.plan_dispatch(longest).path == expected_path, (profile, longest)
     expected = reference.aggregate_reference(trades, offsets)
     _assert_same(ops.aggregate(columns, gpu_offsets), expected)
 

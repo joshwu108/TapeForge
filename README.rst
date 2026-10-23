@@ -27,8 +27,10 @@ and volume-weighted average price (VWAP).
 The project investigates how workload skew, memory layout, validation, and
 host/device transfers affect feature-generation throughput. A streaming CPU
 aggregator computes the same features one chunk at a time, bitwise equal to
-the batch result, as the live-path counterpart of the batch engine. Planned
-extensions include a two-pass reduction for large buckets and an end-to-end
+the batch result, as the live-path counterpart of the batch engine. Buckets
+longer than one GPU tile are reduced by a two-pass kernel pair that carries
+integer partial sums and divides once. Planned extensions include
+pinned-memory stream overlap in the transfer benchmark and an end-to-end
 training throughput experiment. The classifier and training benchmark remain
 stubs. The input contains trades rather than order-book data.
 
@@ -36,18 +38,32 @@ Implementation status
 =====================
 
 Ingestion, deterministic generation, window indexing, CPU reference features,
-the streaming CPU aggregator, and CPU/CUDA API dispatch are implemented. The
-one-pass Triton kernel assigns one program per bucket and supports up to
-4,096 records per bucket. Larger buckets raise ``BucketTooLargeError`` until
-the two-pass reduction exists; the parity tests that reduction must pass are
-already in ``tests/test_two_pass.py`` as strict expected failures.
+the streaming CPU aggregator, CPU/CUDA API dispatch, and both GPU kernel
+paths are implemented. The one-pass Triton kernel assigns one program per
+bucket and covers buckets of up to 4,096 records with a single tile. Longer
+buckets dispatch automatically to the two-pass path: pass 1 reduces
+1,024-record chunks to int64 partial sums, pass 2 combines each bucket's
+contiguous partials in 128-wide tiles and performs the only division. No
+bucket length is rejected or truncated; an explicit one-pass tile size
+remains a hard capacity check. ``tapeforge.prepared`` validates and plans an
+input once for repeated execution into reused buffers.
 
-The GPU parity suite exercises the real code path but has **not yet been run
-on a CUDA GPU**, and CI has no GPU. GPU correctness and performance remain
-unverified. **No speedup figures are published.** Results belong in
-``benchmarks/results.json`` with hardware and software provenance. The
-streaming aggregator is verified on the CPU only, which is the only place it
-runs.
+Hardware verification so far: a Tesla T4 run (torch 2.14.1+cu130, Triton
+3.8.0) of a working-tree snapshot executed the one-pass path on 40 parity
+cases and the two-pass kernels on 20, all matching the plain-loop oracle
+(integers exactly, VWAP within tolerance), and the quick kernel benchmark
+reported correct results for sparse, uniform and burst workloads (the run's
+manifest, logs and environment capture are retained by the owner outside
+the repository). The launcher, the dispatch tests, the prepared-execution
+path, the multi-tile pass-2 cases and the extended benchmark rows in this
+revision were written after that run and have **not yet been executed on a
+GPU**; CI has no GPU. A Triton-interpreter run on CPU tensors checked the
+kernel semantics and launcher argument order of this revision, which is not
+hardware verification.
+**No speedup figures are published.** ``benchmarks/results.json`` is empty
+until a recorded sweep lands, and every performance claim must cite an
+entry there with its hardware and software provenance. The streaming
+aggregator is verified on the CPU only, which is the only place it runs.
 
 Preliminary dataset observations
 ================================
@@ -162,10 +178,40 @@ It returns ``event_count``, ``total_quantity`` and ``signed_quantity``
 (int64), ``vwap`` (float64, 0.0 where a bucket has no quantity) and ``valid``
 (bool), on the input device. Invalid input raises rather than being
 corrected. That covers wrong dtypes, strided tensors, mixed or unsupported
-devices, offsets outside the record range, sums that could overflow int64,
-and buckets beyond the one-pass limit on CUDA. Nothing is silently copied
-between devices or truncated. ``tapeforge.reference.aggregate_reference`` is
-the torch-free NumPy API.
+devices, offsets outside the record range, and sums that could overflow
+int64. Nothing is silently copied between devices or truncated.
+``tapeforge.reference.aggregate_reference`` is the torch-free NumPy API.
+
+On CUDA the launcher reads the longest bucket during validation and picks
+the kernel path from it (``kernels.plan_dispatch``): one-pass up to
+``kernels.MAX_ONE_PASS_BUCKET`` records, two-pass beyond. Both paths produce
+identical outputs by contract and are held to the same parity rule against
+the plain-loop oracle.
+
+Prepared execution
+==================
+
+``ops.aggregate`` validates, plans and allocates on every call. For repeated
+aggregation of fixed, resident tensors, ``tapeforge.prepared`` does that work
+once:
+
+.. code-block:: text
+
+   ready = prepared.prepare(columns, offsets)   # validation, dispatch plan,
+                                                # chunk schedule, buffers
+   features = ready.execute()                   # kernel launches only
+   features = ready.execute()                   # same borrowed buffers again
+   kept = ready.execute_owned()                 # independent copies
+
+The prepared object borrows the input tensors (they must stay unchanged; new
+data means a new ``prepare``), returns the same output tensors from every
+``execute`` (overwritten by the next call), launches on the current stream of
+the input device, owns one set of scratch buffers (so it is not shared
+between concurrent callers), and caches nothing: every ``prepare`` validates
+from scratch. ``run_pass_1`` and ``run_pass_2`` expose the two-pass stages
+for instrumentation, and ``path="two_pass"`` forces the two-pass path on
+inputs that would fit one tile so both paths can be measured on the same
+workload.
 
 Command line:
 
@@ -233,10 +279,11 @@ uploading the archive:
    $ pip install -e '.[dev]'                       # keep the runtime's torch and triton
    $ python tools/verify_snapshot.py run --artifacts verification --record --zip
 
-That runs, in order: lint, the full test suite, the GPU parity suite, the
-stress suite, ``tools/check_gpu_parity.py``, the toy program, the quick
-kernel check, and with ``--record`` the kernel sweep and the pipeline
-benchmark, which append to ``benchmarks/results.json``. Every step is a
+That runs, in order: lint, the full test suite, the GPU parity suite (both
+kernel paths and prepared execution), the stress suite,
+``tools/check_gpu_parity.py``, the toy program, the quick kernel check, and
+with ``--record`` the kernel sweep and the pipeline benchmark, which append
+to ``benchmarks/results.json``. Every step is a
 subprocess with its own log, pytest steps also write JUnit XML, and
 ``manifest.json`` lists each step's status, exit code and duration next to
 ``environment.json`` (GPU, driver, CUDA, torch, Triton, NumPy, commit, dirty
@@ -249,14 +296,20 @@ Benchmarks
 Three scopes are timed separately and never collapsed into one headline
 number:
 
-1. ``benchmarks/kernel.py`` -- inputs already resident on the device. It
-   compares ``ops.aggregate`` on CUDA (validation plus the one-pass Triton
-   kernel), the bare kernel launch with validation done outside the timed
-   region, an eager PyTorch baseline (``searchsorted`` plus ``index_add_``),
-   the same baseline under ``torch.compile``, and the NumPy reference on the
-   host. Workloads with buckets beyond the one-pass limit are recorded as
-   unsupported for the Triton path. Without CUDA it runs the CPU-capable
-   implementations as a smoke test and records nothing.
+1. ``benchmarks/kernel.py`` -- inputs already resident on the device. Its
+   feature rows are ``ops.aggregate`` on CUDA as a user calls it (validation,
+   planning, allocation, launches), the prepared path (launches into reused
+   buffers, preparation untimed), the bare unchecked launchers, pass 1 and
+   pass 2 alone on two-pass workloads, the two-pass path forced onto
+   one-pass workloads so both paths see identical data, an eager PyTorch
+   baseline (``searchsorted`` plus ``index_add_``), the same baseline under
+   ``torch.compile``, and the NumPy reference on the host. Its stage rows
+   time validation, chunk-metadata construction, allocation and
+   ``prepare`` on their own; they overlap with the end-to-end rows and are
+   never summed with them. Every row records which host-side work its timed
+   region includes, the dispatch path, the chunk count and the bucket-length
+   distribution. Without CUDA it runs the CPU-capable implementations as a
+   smoke test and records nothing.
 2. ``benchmarks/pipeline.py`` -- host-to-device copy, compute and
    device-to-host copy, timed separately and end to end, from pageable and
    from pinned host memory, against the NumPy reference. It needs CUDA. The
@@ -264,19 +317,26 @@ number:
 3. ``benchmarks/train.py`` -- the whole training loop. Not implemented yet.
 
 Every implementation must match the CPU reference before it is timed:
-integers exactly, VWAP within the contract tolerance. Timing is wall clock
-around each call, after untimed warm-up calls, with
-``torch.cuda.synchronize()`` before and after every timed call on CUDA.
-Configurations are versioned TOML under ``benchmarks/configs/``. Results are
-appended to ``benchmarks/results.json`` with the workload, the timing method,
-and hardware and software provenance (GPU, CUDA, torch, Triton, NumPy, git
-commit and whether the tree had uncommitted changes). Negative results are
-published too.
+integers exactly, VWAP within the contract tolerance. Each timed region is a
+complete Python call, so every number includes Python dispatch and launch
+overhead; compilation happens in untimed warm-up. Two timing methods are
+recorded by name: ``wall`` (``time.perf_counter`` with
+``torch.cuda.synchronize()`` before and after every call on CUDA, the
+default) and ``cuda_events`` (CUDA event pairs on the current stream, which
+exclude the host-side synchronize but still charge launch latency when the
+stream is idle). Configurations are versioned TOML under
+``benchmarks/configs/``. Results are appended to ``benchmarks/results.json``
+with the workload, the timing method, and hardware and software provenance
+(GPU, CUDA, torch, Triton, NumPy, git commit, whether the tree had
+uncommitted changes, and the snapshot digest when run from a packed
+snapshot). Negative results are published too. Dispatch thresholds and
+tuning choices are made from recorded sweeps, never from a single run.
 
 .. code-block:: console
 
    $ python benchmarks/kernel.py --sizes 100000 --seeds 1 --no-record   # quick check
-   $ python benchmarks/kernel.py                                         # full sweep
+   $ python benchmarks/kernel.py --timing cuda_events --no-record        # device-stream view
+   $ python benchmarks/kernel.py                                         # full sweep, recorded
    $ python benchmarks/pipeline.py
 
 Layout
@@ -292,11 +352,13 @@ Layout
      reference.py   NumPy reference features: vectorized, plus a naive
                     plain-loop oracle that validates it
      streaming.py   chunk-at-a-time CPU aggregator, bitwise equal to the batch path
-     kernels.py     Triton kernels: one-pass bucket reduction and its launcher
+     kernels.py     Triton kernels: one-pass bucket reduction, two-pass
+                    chunk partials + combine, dispatch plan and launchers
+     prepared.py    validate-once, launch-many execution on fixed inputs
      validation.py  tensor input checks shared by ops and the kernel launcher
      ops.py         PyTorch-facing API: CUDA -> Triton, CPU -> reference
      model.py       small volatility-regime classifier
-   tests/           parity, edge-case, streaming, two-pass and stress suites
+   tests/           parity, edge-case, streaming, two-pass, prepared and stress suites
    benchmarks/      harness, three timed scopes, versioned configs, results
    tools/           commit skill bootstrap, safe local commit helper,
                     GPU parity script, snapshot packer + verification runner

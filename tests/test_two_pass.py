@@ -1,52 +1,62 @@
-"""Parity cases for buckets longer than one tile: the two-pass reduction.
+"""Parity suite for buckets longer than one tile: the two-pass reduction.
 
-These tests pin the contract the two-pass path must meet before it exists.
-Each case drives ``ops.aggregate`` on CUDA tensors and compares every output
-with the plain-loop oracle, exactly like test_gpu_parity.py. Cases whose
-longest bucket fits the one-pass tile run (and must pass) today; cases beyond
-``kernels.MAX_ONE_PASS_BUCKET`` carry the strict ``TWO_PASS_MISSING`` marker
-and start failing (XPASS) the day the reduction lands, at which point the
-marker is removed and the file becomes an ordinary parity suite.
+Each GPU case drives ``ops.aggregate`` on CUDA tensors and compares every
+output with the plain-loop oracle, exactly like test_gpu_parity.py, and
+asserts through ``kernels.plan_dispatch`` which path its fixture takes, so a
+case meant for the two-pass kernels cannot silently pass through the
+one-pass tile (or the reverse). A spy test additionally checks that the
+two-pass launcher is the one invoked for a long bucket.
 
-What is covered, per the design notes for the two-pass path:
+What is covered:
 
   * chunk boundaries: bucket lengths CHUNK-1, CHUNK, CHUNK+1, 2*CHUNK and
-    3*CHUNK+17 (a ragged last chunk) for every plausible CHUNK;
+    3*CHUNK+17 (a ragged last chunk) for the configured ``kernels.CHUNK_SIZE``
+    and the other plausible chunk sizes; lengths that fit a one-pass tile are
+    additionally pushed through the two-pass kernels with
+    ``prepared.prepare(path="two_pass")``, otherwise the configured chunk
+    size would never be exercised on a single bucket;
   * mixed-size and empty buckets side by side, so chunk offsets repeat;
   * clipped windows: records before offsets[0] and after offsets[-1] with
     long buckets inside, and a long bucket that is the very last one;
+  * pass-2 accumulation over several tiles of partials: buckets with more
+    chunks than ``kernels.COMBINE_BLOCK_SIZE``, including a ragged last tile
+    and two such buckets separated by empty and short ones;
+  * signed quantity on long buckets (mixed, all sell-initiated), zero
+    quantity throughout a long bucket and in whole leading chunks;
   * exact integer partial sums near the int64 bound, so combining partials
-    cannot lose a bit;
-  * the overflow bound still refusing a long bucket that could wrap;
+    cannot lose a bit, and the overflow bound still refusing a long bucket
+    that could wrap;
   * the partial-VWAP averaging trap: two halves of one bucket with different
     quantities, where a mean of per-chunk VWAPs is wrong and only integer
     partials divided once give the right answer.
 
 The last trap is also pinned on the CPU here, so the oracle the GPU is held
-to is itself checked against hand arithmetic.
+to is itself checked against hand arithmetic. Host-side schedule logic
+(``build_chunk_metadata``, ``plan_dispatch``) is tested on the CPU in
+test_kernels.py.
 """
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
-from conftest import TWO_PASS_MISSING, assert_gpu_parity, cuda_inputs
+from conftest import assert_gpu_parity, cuda_inputs
 
-from tapeforge import contract, kernels, ops, reference, windows
+from tapeforge import contract, kernels, ops, prepared, reference, windows
 
 W = contract.DEFAULT_BUCKET_WIDTH_US
 P = contract.PRICE_SCALE
 Q = contract.QUANTITY_SCALE
 LIMIT = kernels.MAX_ONE_PASS_BUCKET
+CHUNK = kernels.CHUNK_SIZE
+TILE = kernels.COMBINE_BLOCK_SIZE
 
-# Tile sizes the two-pass path might reasonably chunk by. The boundary cases
-# below are generated for each, so the suite does not depend on which one
-# the implementation picks.
-CHUNK_CANDIDATES = (1024, 2048, 4096)
-
-
-def _needs_two_pass(longest: int) -> list[pytest.MarkDecorator]:
-    return [TWO_PASS_MISSING] if longest > LIMIT else []
+# Chunk sizes the boundary cases are generated for: the configured one plus
+# the other plausible powers of two, so the suite keeps its coverage if the
+# owner retunes CHUNK_SIZE.
+CHUNK_CANDIDATES = tuple(sorted({CHUNK, 1024, 2048, 4096}))
 
 
 def _buckets(lengths: list[int], before: int = 0, after: int = 0) -> tuple[np.ndarray, np.ndarray]:
@@ -55,7 +65,8 @@ def _buckets(lengths: list[int], before: int = 0, after: int = 0) -> tuple[np.nd
     Prices and quantities vary record by record so that any chunk-sized
     sub-range has a different mean price and a different total quantity from
     its neighbours: a reduction that mixes partials up, drops a chunk, or
-    averages partial VWAPs cannot match the oracle by luck.
+    averages partial VWAPs cannot match the oracle by luck. Every third
+    record is sell-initiated, so signed quantity differs from total quantity.
     """
     n_buckets = len(lengths)
     n = before + sum(lengths) + after
@@ -94,8 +105,36 @@ def _trap_bucket(half: int) -> tuple[np.ndarray, np.ndarray]:
     return trades, np.array([0, n], dtype=np.int64)
 
 
-def _gpu(trades: np.ndarray, offsets: np.ndarray) -> None:
-    assert_gpu_parity(ops.aggregate(*cuda_inputs(trades, offsets)), trades, offsets)
+def _path_of(offsets: np.ndarray) -> str:
+    return kernels.plan_dispatch(int(np.diff(offsets).max())).path
+
+
+def _gpu(trades: np.ndarray, offsets: np.ndarray, path: str = "two_pass") -> dict[str, Any]:
+    """Run the public API on CUDA, assert the dispatch path, and check parity."""
+    assert _path_of(offsets) == path, f"fixture takes the {_path_of(offsets)} path, not {path}"
+    got = ops.aggregate(*cuda_inputs(trades, offsets))
+    assert_gpu_parity(got, trades, offsets)
+    return got
+
+
+def _both_paths(trades: np.ndarray, offsets: np.ndarray) -> dict[str, Any]:
+    """Public API on its automatic path, plus the two-pass kernels forced if auto is one-pass.
+
+    Boundary and trap fixtures sized around ``CHUNK`` fit a one-pass tile
+    whenever ``CHUNK`` is well below ``MAX_ONE_PASS_BUCKET``; forcing the
+    two-pass path through ``tapeforge.prepared`` is the only way those sizes
+    reach the chunk kernels. Returns the two-pass result.
+    """
+    columns, dev_offsets = cuda_inputs(trades, offsets)
+    auto = ops.aggregate(columns, dev_offsets)
+    assert_gpu_parity(auto, trades, offsets)
+    if _path_of(offsets) == "two_pass":
+        return auto
+    forced = prepared.prepare(columns, dev_offsets, path="two_pass")
+    assert forced.path == "two_pass" and forced.n_chunks > 0
+    got = forced.execute()
+    assert_gpu_parity(got, trades, offsets)
+    return got
 
 
 # --- the oracle itself, on the CPU -----------------------------------------
@@ -117,6 +156,39 @@ def test_fixture_builder_places_records_outside_the_window() -> None:
     assert trades.size == 4 + 5005 + 6
 
 
+def test_configured_chunk_size_is_among_the_boundary_candidates() -> None:
+    assert CHUNK in CHUNK_CANDIDATES
+    assert CHUNK & (CHUNK - 1) == 0 and CHUNK <= LIMIT
+
+
+# --- which launcher actually runs ------------------------------------------
+
+
+@pytest.mark.gpu
+def test_two_pass_launcher_runs_for_a_long_bucket_and_one_pass_for_a_short_one(
+    gpu_ready: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spy on the unchecked launchers: the dispatch plan is what executes."""
+    calls: list[str] = []
+    real_one, real_two = kernels.launch_one_pass_unchecked, kernels.launch_two_pass_unchecked
+
+    def spy_one(*args: Any, **kwargs: Any) -> None:
+        calls.append("one_pass")
+        real_one(*args, **kwargs)
+
+    def spy_two(*args: Any, **kwargs: Any) -> None:
+        calls.append("two_pass")
+        real_two(*args, **kwargs)
+
+    monkeypatch.setattr(kernels, "launch_one_pass_unchecked", spy_one)
+    monkeypatch.setattr(kernels, "launch_two_pass_unchecked", spy_two)
+
+    _gpu(*_buckets([LIMIT + 1]), path="two_pass")
+    assert calls == ["two_pass"]
+    _gpu(*_buckets([LIMIT]), path="one_pass")
+    assert calls == ["two_pass", "one_pass"]
+
+
 # --- chunk boundaries --------------------------------------------------------
 
 
@@ -124,7 +196,7 @@ def test_fixture_builder_places_records_outside_the_window() -> None:
 @pytest.mark.parametrize(
     "length",
     [
-        pytest.param(n, id=f"{chunk}{sign}", marks=_needs_two_pass(n))
+        pytest.param(n, id=f"{chunk}{sign}")
         for chunk in CHUNK_CANDIDATES
         for sign, n in (
             ("-1", chunk - 1),
@@ -136,11 +208,15 @@ def test_fixture_builder_places_records_outside_the_window() -> None:
     ],
 )
 def test_single_bucket_around_each_chunk_boundary(gpu_ready: None, length: int) -> None:
-    _gpu(*_buckets([length]))
+    """Lengths at and around every chunk multiple, through the two-pass kernels.
+
+    Lengths within the one-pass limit also run on their automatic (one-pass)
+    path; the two-pass result is what the chunk-boundary claim is about.
+    """
+    _both_paths(*_buckets([length]))
 
 
 @pytest.mark.gpu
-@TWO_PASS_MISSING
 def test_one_bucket_longer_than_the_real_busiest_second_by_far(gpu_ready: None) -> None:
     """28,000 records in one bucket: the measured tail of the burst generator."""
     _gpu(*_buckets([28_000]))
@@ -150,26 +226,23 @@ def test_one_bucket_longer_than_the_real_busiest_second_by_far(gpu_ready: None) 
 
 
 @pytest.mark.gpu
-@TWO_PASS_MISSING
 def test_long_buckets_interleaved_with_empty_and_short_ones(gpu_ready: None) -> None:
     lengths = [0, 5, 9_000, 0, 0, LIMIT + 1, 1, 0, 12_345, 3, 0, 0]
-    _gpu(*_buckets(lengths))
+    got = _gpu(*_buckets(lengths))
+    assert got["valid"].tolist() == [n > 0 for n in lengths]
 
 
 @pytest.mark.gpu
-@TWO_PASS_MISSING
 def test_every_bucket_is_long(gpu_ready: None) -> None:
     _gpu(*_buckets([LIMIT + 1, 2 * LIMIT, LIMIT + 1023, 3 * LIMIT + 1]))
 
 
 @pytest.mark.gpu
-@TWO_PASS_MISSING
 def test_all_records_in_the_last_bucket_which_is_long(gpu_ready: None) -> None:
     _gpu(*_buckets([0, 0, 0, 0, 0, 10_000]))
 
 
 @pytest.mark.gpu
-@TWO_PASS_MISSING
 def test_all_records_in_the_first_bucket_which_is_long(gpu_ready: None) -> None:
     _gpu(*_buckets([10_000, 0, 0, 0]))
 
@@ -178,28 +251,109 @@ def test_all_records_in_the_first_bucket_which_is_long(gpu_ready: None) -> None:
 
 
 @pytest.mark.gpu
-@TWO_PASS_MISSING
 def test_records_before_and_after_the_window_with_long_buckets_inside(gpu_ready: None) -> None:
     _gpu(*_buckets([7, LIMIT + 5, 0, 2 * LIMIT + 1], before=1_500, after=6_000))
 
 
 @pytest.mark.gpu
-@TWO_PASS_MISSING
 def test_long_bucket_ending_exactly_at_the_last_record(gpu_ready: None) -> None:
     _gpu(*_buckets([2, 0, LIMIT + 1], before=3, after=0))
 
 
 @pytest.mark.gpu
 def test_records_before_and_after_the_window_with_one_pass_buckets_inside(gpu_ready: None) -> None:
-    """The clipped-window case that runs today; must keep passing after dispatch changes."""
-    _gpu(*_buckets([7, 1_500, 0, 4_000], before=1_500, after=6_000))
+    """The clipped-window case on the one-pass path; must keep passing after dispatch changes."""
+    _gpu(*_buckets([7, 1_500, 0, 4_000], before=1_500, after=6_000), path="one_pass")
+
+
+# --- pass 2 over several tiles of partials ---------------------------------
+
+
+def _n_chunks(length: int) -> int:
+    return -(-length // CHUNK)
+
+
+@pytest.mark.gpu
+def test_pass_2_accumulates_over_several_tiles_with_a_ragged_last_tile(gpu_ready: None) -> None:
+    """A bucket with more chunks than one pass-2 tile: the in-program tile loop runs.
+
+    (3 * TILE + 5) full chunks plus a 17-record ragged chunk give
+    3 * TILE + 6 partials: three full pass-2 tiles and a six-wide remainder.
+    """
+    length = (3 * TILE + 5) * CHUNK + 17
+    assert _n_chunks(length) == 3 * TILE + 6 > TILE
+    trades, offsets = _buckets([length])
+    import torch
+
+    schedule = kernels.build_chunk_metadata(torch.from_numpy(offsets), CHUNK)
+    assert schedule.n_chunks == 3 * TILE + 6
+    got = _gpu(trades, offsets)
+    assert got["event_count"].item() == length
+
+
+@pytest.mark.gpu
+def test_pass_2_tile_boundaries_do_not_leak_between_adjacent_long_buckets(gpu_ready: None) -> None:
+    """Two multi-tile buckets separated by empty and short buckets.
+
+    The second long bucket has exactly TILE + 1 chunks (one full tile plus a
+    one-partial remainder) and starts at a chunk index that is not a tile
+    multiple, so a pass-2 program that read past its own slice would pick
+    up a neighbour's partial.
+    """
+    first = (TILE + 3) * CHUNK + 5
+    second = (TILE + 1) * CHUNK
+    lengths = [first, 0, 3, second, 0]
+    assert _n_chunks(first) == TILE + 4 and _n_chunks(second) == TILE + 1
+    got = _gpu(*_buckets(lengths))
+    assert got["event_count"].tolist() == lengths
+
+
+# --- signed and zero quantities on long buckets ----------------------------
+
+
+@pytest.mark.gpu
+def test_long_bucket_entirely_sell_initiated_has_signed_equal_to_minus_total(
+    gpu_ready: None,
+) -> None:
+    trades, offsets = _buckets([2 * LIMIT + 3])
+    trades["buyer_is_maker"] = True
+    got = _gpu(trades, offsets)
+    assert got["signed_quantity"].item() == -got["total_quantity"].item() < 0
+
+
+@pytest.mark.gpu
+def test_long_bucket_with_zero_quantity_everywhere_is_valid_with_vwap_zero(
+    gpu_ready: None,
+) -> None:
+    """Records exist but carry no quantity: count and validity are set, VWAP is 0.0."""
+    n = 2 * LIMIT + 5
+    trades, offsets = _buckets([n])
+    trades["quantity"] = 0
+    got = _gpu(trades, offsets)
+    assert got["event_count"].item() == n
+    assert got["total_quantity"].item() == 0 == got["signed_quantity"].item()
+    assert got["vwap"].item() == 0.0
+    assert bool(got["valid"].item())
+
+
+@pytest.mark.gpu
+def test_long_bucket_whose_leading_chunks_carry_no_quantity(gpu_ready: None) -> None:
+    """Whole chunks with zero partials must not disturb the division in pass 2."""
+    head, tail = 2 * CHUNK, 3 * CHUNK + 11
+    n = head + tail
+    trades, offsets = _buckets([n])
+    trades["quantity"][:head] = 0
+    trades["price"][head:] = 250 * P
+    trades["quantity"][head:] = 2 * Q
+    got = _gpu(trades, offsets)
+    assert got["vwap"].item() == pytest.approx(250.0, rel=contract.VWAP_RTOL)
+    assert got["total_quantity"].item() == tail * 2 * Q
 
 
 # --- exact partial sums and the overflow bound ---------------------------
 
 
 @pytest.mark.gpu
-@TWO_PASS_MISSING
 def test_long_bucket_just_inside_the_int64_bound_is_exact(gpu_ready: None) -> None:
     """Every partial is a sub-sum of a bounded bucket sum; recombination must lose nothing."""
     n = 2 * LIMIT
@@ -209,10 +363,9 @@ def test_long_bucket_just_inside_the_int64_bound_is_exact(gpu_ready: None) -> No
     trades["buyer_is_maker"] = np.arange(n) % 2 == 0
     offsets = np.array([0, n], dtype=np.int64)
     assert n * 2**30 * int(trades["quantity"][0]) <= contract.INT64_MAX
-    got = ops.aggregate(*cuda_inputs(trades, offsets))
+    got = _gpu(trades, offsets)
     assert got["total_quantity"].item() == int(trades["quantity"].sum())
     assert got["signed_quantity"].item() == 0
-    assert_gpu_parity(got, trades, offsets)
 
 
 @pytest.mark.gpu
@@ -231,35 +384,30 @@ def test_long_bucket_past_the_int64_bound_raises_overflow_not_size_error(gpu_rea
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize(
-    "half",
-    [pytest.param(c, id=str(c), marks=_needs_two_pass(2 * c)) for c in CHUNK_CANDIDATES],
-)
+@pytest.mark.parametrize("half", CHUNK_CANDIDATES, ids=str)
 def test_vwap_of_two_unequal_halves_is_175_not_150(gpu_ready: None, half: int) -> None:
+    """Both halves are exactly one chunk each when ``half == CHUNK``: forced two-pass."""
     trades, offsets = _trap_bucket(half)
-    got = ops.aggregate(*cuda_inputs(trades, offsets))
+    got = _both_paths(trades, offsets)
     vwap = got["vwap"].item()
     assert vwap == pytest.approx(175.0, rel=contract.VWAP_RTOL, abs=contract.VWAP_ATOL)
     assert abs(vwap - 150.0) > 1.0, "VWAP looks like a mean of per-chunk VWAPs"
-    assert_gpu_parity(got, trades, offsets)
 
 
 @pytest.mark.gpu
-@TWO_PASS_MISSING
-def test_ragged_last_chunk_cannot_be_averaged_either(gpu_ready: None) -> None:
+@pytest.mark.parametrize("chunk", CHUNK_CANDIDATES, ids=str)
+def test_ragged_last_chunk_cannot_be_averaged_either(gpu_ready: None, chunk: int) -> None:
     """Three full chunks of 1 unit at 100, then 17 records of 3 units at 200.
 
     True VWAP = (100*3C + 200*51) / (3C + 51); a mean over four chunk VWAPs
     would be 125, far off for every C.
     """
-    for chunk in CHUNK_CANDIDATES:
-        n_head = 3 * chunk
-        n = n_head + 17
-        trades = np.zeros(n, dtype=contract.TRADE_DTYPE)
-        trades["price"] = np.where(np.arange(n) < n_head, 100 * P, 200 * P)
-        trades["quantity"] = np.where(np.arange(n) < n_head, 1 * Q, 3 * Q)
-        offsets = np.array([0, n], dtype=np.int64)
-        got = ops.aggregate(*cuda_inputs(trades, offsets))
-        expected = (100 * n_head + 200 * 51) / (n_head + 51)
-        assert got["vwap"].item() == pytest.approx(expected, rel=contract.VWAP_RTOL)
-        assert_gpu_parity(got, trades, offsets)
+    n_head = 3 * chunk
+    n = n_head + 17
+    trades = np.zeros(n, dtype=contract.TRADE_DTYPE)
+    trades["price"] = np.where(np.arange(n) < n_head, 100 * P, 200 * P)
+    trades["quantity"] = np.where(np.arange(n) < n_head, 1 * Q, 3 * Q)
+    offsets = np.array([0, n], dtype=np.int64)
+    got = _both_paths(trades, offsets)
+    expected = (100 * n_head + 200 * 51) / (n_head + 51)
+    assert got["vwap"].item() == pytest.approx(expected, rel=contract.VWAP_RTOL)

@@ -4,6 +4,11 @@ A workload is a seeded synthetic trade array plus its offsets, sized by
 record count. Nothing is timed until its output has matched the CPU
 reference (exact integers, VWAP within the contract tolerance), and the
 outcome of that check is recorded alongside the timing.
+
+``WorkloadInfo`` records the bucket-length distribution, because that
+distribution, not the record count, decides which kernel path runs and how
+much of each one-pass tile is masked: the one-pass tile follows the longest
+bucket, and the two-pass chunk count follows the sum of ceil(len / CHUNK).
 """
 
 from __future__ import annotations
@@ -30,9 +35,40 @@ class WorkloadInfo:
     bucket_width_us: int
     max_bucket_len: int
     buckets_over_one_pass_limit: int
+    # Bucket-length distribution and the dispatch it implies.
+    n_empty_buckets: int
+    bucket_len_p50: int
+    bucket_len_p90: int
+    bucket_len_p99: int
+    dispatch_path: str  # kernels.plan_dispatch on the longest bucket
+    one_pass_block_size: int | None  # tile the one-pass path would use, if it applies
+    two_pass_chunk_size: int
+    two_pass_n_chunks: int  # pass-1 programs the two-pass path would launch
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def describe_offsets(offsets: np.ndarray) -> dict[str, Any]:
+    """Distribution and dispatch facts for a given offsets array."""
+    lengths = np.diff(offsets)
+    longest = int(lengths.max()) if lengths.size else 0
+    plan = kernels.plan_dispatch(longest)
+    chunk = kernels.CHUNK_SIZE
+    return {
+        "max_bucket_len": longest,
+        "buckets_over_one_pass_limit": int((lengths > kernels.MAX_ONE_PASS_BUCKET).sum()),
+        "n_empty_buckets": int((lengths == 0).sum()),
+        "bucket_len_p50": int(np.percentile(lengths, 50)) if lengths.size else 0,
+        "bucket_len_p90": int(np.percentile(lengths, 90)) if lengths.size else 0,
+        "bucket_len_p99": int(np.percentile(lengths, 99)) if lengths.size else 0,
+        "dispatch_path": plan.path,
+        "one_pass_block_size": (
+            kernels.select_block_size(longest) if longest <= kernels.MAX_ONE_PASS_BUCKET else None
+        ),
+        "two_pass_chunk_size": chunk,
+        "two_pass_n_chunks": int((-(-lengths // chunk)).sum()),
+    }
 
 
 def make_workload(
@@ -43,7 +79,6 @@ def make_workload(
         seed=seed, n_buckets=n_buckets, profile=profile, width_us=width_us  # type: ignore[arg-type]
     )
     offsets = windows.build_offsets(trades["timestamp"], 0, n_buckets, width_us)
-    lengths = np.diff(offsets)
     info = WorkloadInfo(
         profile=profile,
         seed=seed,
@@ -51,8 +86,7 @@ def make_workload(
         n_records=int(trades.size),
         n_buckets=n_buckets,
         bucket_width_us=width_us,
-        max_bucket_len=int(lengths.max()),
-        buckets_over_one_pass_limit=int((lengths > kernels.MAX_ONE_PASS_BUCKET).sum()),
+        **describe_offsets(offsets),
     )
     return trades, offsets, info
 

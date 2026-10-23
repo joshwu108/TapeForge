@@ -6,11 +6,12 @@ Every test drives the real code path -- ``ops.aggregate`` on CUDA tensors or
 never checked against code that shares its vectorization tricks.
 
 Skips only for genuine hardware/software absence (no torch, no CUDA device,
-no Triton), via the ``gpu_ready`` fixture. Missing functionality is not
-skipped: buckets beyond the one-pass limit are asserted to raise, and the
-two-pass parity tests are strict xfails that start failing (XPASS) the day the
-two-pass path lands, so their markers must then be removed. The full set of
-tests waiting for the two-pass reduction is in test_two_pass.py.
+no Triton), via the ``gpu_ready`` fixture. Nothing is skipped or expected to
+fail for missing functionality: buckets beyond the one-pass tile dispatch to
+the two-pass path and are held to the same parity rule. Each test that
+depends on a particular path asserts the path through ``kernels.plan_dispatch``
+on the fixture's longest bucket, so a large fixture cannot silently take the
+other path. The focused two-pass suite is test_two_pass.py.
 
 Parity rule (PRD section 6): counts and quantity sums exactly; VWAP within
 contract.VWAP_RTOL / VWAP_ATOL; identical dtypes.
@@ -20,7 +21,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from conftest import TWO_PASS_MISSING, assert_gpu_parity, cuda_inputs
+from conftest import assert_gpu_parity, cuda_inputs
 
 from tapeforge import contract, generate, kernels, ops, windows
 
@@ -77,26 +78,24 @@ def test_gpu_matches_cpu_reference_on_burst_within_one_pass_limit(
 
 
 @pytest.mark.parametrize("seed", [1, 2, 3])
-def test_gpu_rejects_burst_buckets_beyond_one_pass_limit(gpu_ready: None, seed: int) -> None:
-    trades, offsets = _workload("burst", seed, 1000)
-    lengths = np.diff(offsets)
-    assert lengths.max() > LIMIT
-    longest = int(np.argmax(lengths))
-    with pytest.raises(kernels.BucketTooLargeError, match=f"bucket {longest}: "):
-        ops.aggregate(*_cuda(trades, offsets))
-
-
-@TWO_PASS_MISSING
-@pytest.mark.parametrize("seed", [1, 2, 3])
 def test_gpu_matches_cpu_reference_on_full_burst(gpu_ready: None, seed: int) -> None:
+    """Burst workloads whose busiest bucket exceeds the one-pass tile: two-pass parity.
+
+    The same workloads the automatic dispatch used to reject; now an
+    independent CPU/GPU parity check through the public API, with the path
+    asserted so the fixture is known to exercise the two-pass kernels.
+    """
     trades, offsets = _workload("burst", seed, 1000)
+    longest = int(np.diff(offsets).max())
+    assert longest > LIMIT, f"workload no longer has an oversized bucket ({longest})"
+    assert kernels.plan_dispatch(longest).path == "two_pass"
     _assert_parity(ops.aggregate(*_cuda(trades, offsets)), trades, offsets)
 
 
-@TWO_PASS_MISSING
 def test_oversized_bucket_takes_the_two_pass_path(gpu_ready: None) -> None:
     """TF-06: one bucket several tiles long, with a ragged final tile."""
     trades, offsets = _one_bucket(3 * LIMIT + 17)
+    assert kernels.plan_dispatch(3 * LIMIT + 17).path == "two_pass"
     _assert_parity(ops.aggregate(*_cuda(trades, offsets)), trades, offsets)
 
 
@@ -105,13 +104,22 @@ def test_oversized_bucket_takes_the_two_pass_path(gpu_ready: None) -> None:
 
 def test_bucket_of_exactly_the_one_pass_limit_is_exact(gpu_ready: None) -> None:
     trades, offsets = _one_bucket(LIMIT)
+    assert kernels.plan_dispatch(LIMIT).path == "one_pass"
     _assert_parity(ops.aggregate(*_cuda(trades, offsets)), trades, offsets)
 
 
-def test_bucket_one_past_the_limit_is_rejected_not_truncated(gpu_ready: None) -> None:
+def test_bucket_one_past_the_limit_is_not_truncated(gpu_ready: None) -> None:
+    """LIMIT + 1 records: the first length that cannot fit a one-pass tile.
+
+    Dispatches to the two-pass path (LIMIT // CHUNK_SIZE full chunks plus a
+    one-record ragged chunk) and must match the oracle record for record; a
+    truncating or re-tiling implementation would drop the extra record.
+    """
     trades, offsets = _one_bucket(LIMIT + 1)
-    with pytest.raises(kernels.BucketTooLargeError, match=f"{LIMIT + 1} records"):
-        ops.aggregate(*_cuda(trades, offsets))
+    assert kernels.plan_dispatch(LIMIT + 1).path == "two_pass"
+    got = ops.aggregate(*_cuda(trades, offsets))
+    assert got["event_count"].item() == LIMIT + 1
+    _assert_parity(got, trades, offsets)
 
 
 def test_explicit_block_size_boundary(gpu_ready: None) -> None:

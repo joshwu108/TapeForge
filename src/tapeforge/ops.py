@@ -10,10 +10,14 @@ Supported inputs (offsets must be the same kind as trades):
     ------------------------------------------  --------------------  ---------------
     NumPy structured array of TRADE_DTYPE       NumPy int64 array     CPU reference
     mapping of column -> CPU torch tensors      CPU int64 tensor      CPU reference
-    mapping of column -> CUDA torch tensors     CUDA int64 tensor     Triton one-pass
+    mapping of column -> CUDA torch tensors     CUDA int64 tensor     Triton kernels
 
 Column requirements for the tensor path are in ``tapeforge.validation``.
-Other devices (MPS, meta, ...) and mixed devices are rejected.
+Other devices (MPS, meta, ...) and mixed devices are rejected. On CUDA the
+launcher picks the one-pass kernel when every bucket fits one tile
+(``kernels.MAX_ONE_PASS_BUCKET`` records) and the two-pass reduction
+otherwise; see ``tapeforge.kernels``. Repeated execution on fixed inputs
+belongs in ``tapeforge.prepared``, which validates once.
 
 Returns a dict of tensors on the input device (CPU for NumPy input), each of
 shape ``(n_buckets,)``:
@@ -25,9 +29,9 @@ shape ``(n_buckets,)``:
     valid           bool    False for empty buckets
 
 Dispatch never falls back across devices. CUDA input without Triton raises
-instead of being copied to the CPU, and a bucket too long for the one-pass
-kernel raises ``kernels.BucketTooLargeError`` instead of being truncated or
-silently computed elsewhere. Both paths check the int64 accumulation bound
+instead of being copied to the CPU. No bucket length is rejected or
+truncated here: buckets beyond the one-pass tile are reduced by the
+two-pass path. Both devices check the int64 accumulation bound
 (``contract.check_exact_accumulation_bound``) first.
 
 Requires torch (``pip install -e '.[torch]'``). ``tapeforge.reference`` is
@@ -132,8 +136,6 @@ def aggregate(trades: Any, offsets: Any) -> dict[str, torch.Tensor]:
         ValueError: invalid columns or offsets (see ``tapeforge.validation``),
             or an unsupported device.
         OverflowError: int64 bucket sums could wrap around.
-        kernels.BucketTooLargeError: CUDA input with a bucket beyond the
-            one-pass limit.
         RuntimeError: CUDA input but Triton is not installed.
     """
     if isinstance(trades, np.ndarray):

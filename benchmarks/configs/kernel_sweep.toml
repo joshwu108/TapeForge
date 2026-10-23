@@ -12,4 +12,21 @@ warmup = 25
 repeats = 200
 synchronize = true
 
-baselines = ["tapeforge_triton", "tapeforge_triton_kernel_only", "torch_eager", "torch_compile", "numpy_reference"]
+# Row names are documented in benchmarks/kernel.py. Feature rows are gated
+# on correctness; the tapeforge_stage_* rows are preparation costs and are
+# not summable with the end-to-end rows.
+baselines = [
+  "tapeforge_triton",
+  "tapeforge_prepared",
+  "tapeforge_triton_kernel_only",
+  "tapeforge_pass1_only",
+  "tapeforge_pass2_only",
+  "tapeforge_two_pass_forced",
+  "torch_eager",
+  "torch_compile",
+  "numpy_reference",
+  "tapeforge_stage_validate",
+  "tapeforge_stage_chunk_metadata",
+  "tapeforge_stage_allocate",
+  "tapeforge_stage_prepare",
+]
