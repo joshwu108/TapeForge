@@ -16,11 +16,15 @@ Variants (``variants`` in the config):
 
     pageable_sync   ordinary host memory, blocking copies
     pinned_sync     page-locked host memory, non_blocking copies + synchronize
-    pinned_streams  NOT IMPLEMENTED: overlapping copy and compute on separate
-                    CUDA streams is the week-6 exercise; reported as such
+    pinned_streams  NOT IMPLEMENTED: overlapping the copy of one chunk with
+                    the compute of the previous one on separate CUDA streams;
+                    reported as skipped until it exists
 
-Also records ``numpy_reference`` (CPU features on the host, no transfer) as
-the end-to-end CPU baseline. Every variant is checked against the reference
+``compute_ms`` is ``ops.aggregate`` as a user calls it (validation, planning,
+allocation, launches), on whichever kernel path the workload's longest
+bucket selects; the path is recorded in the workload info. Also records
+``numpy_reference`` (CPU features on the host, no transfer) as the
+end-to-end CPU baseline. Every variant is checked against the reference
 before it is timed. Requires CUDA; exits with status 2 without it.
 
     python benchmarks/pipeline.py --config benchmarks/configs/pipeline.toml
@@ -40,7 +44,7 @@ from typing import Any
 from harness import TIMING_METHOD, record, time_callable
 from workload import check_features, features_dict, host_columns, make_workload
 
-from tapeforge import kernels, ops, reference
+from tapeforge import ops, reference
 
 IMPLEMENTED_VARIANTS = ("pageable_sync", "pinned_sync")
 
@@ -84,8 +88,6 @@ def _measure_variant(
     try:
         parts = _variant_callables(trades, offsets, pinned)
         check_features(parts["end_to_end"](), expected)
-    except kernels.BucketTooLargeError as exc:
-        return {"status": "unsupported", "reason": str(exc)}
     except AssertionError as exc:
         return {"status": "incorrect", "reason": str(exc)[:500]}
     metrics: dict[str, Any] = {"status": "ok", "correct": True}
@@ -123,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
             results: dict[str, dict[str, Any]] = {}
             for variant in config["variants"]:
                 if variant not in IMPLEMENTED_VARIANTS:
-                    print(f"skip {variant}: not implemented (week-6 exercise)", file=sys.stderr)
+                    print(f"skip {variant}: not implemented", file=sys.stderr)
                     continue
                 results[variant] = _measure_variant(
                     trades, offsets, variant.startswith("pinned"), expected, warmup, repeats

@@ -22,10 +22,13 @@ def main() -> int:
     parser.add_argument("--config", default="benchmarks/configs/train.toml")
     args = parser.parse_args()
     config = tomllib.loads(Path(args.config).read_text())
-    # TODO(week 7): train the small model twice -- reference features vs GPU
-    # features -- on the identical chronological split, and record examples/s,
-    # torch.cuda.max_memory_allocated(), and profiler GPU-idle share.
-    raise NotImplementedError(f"week 7: implement using {config}")
+    # Not implemented: train the small model twice -- reference features vs
+    # GPU features -- on the identical chronological split, and record
+    # examples/s, torch.cuda.max_memory_allocated(), and the profiler's
+    # GPU-idle share. Blocked on the model/label specification (model.py).
+    raise NotImplementedError(
+        f"training throughput benchmark is not implemented; config was {config}"
+    )
 
 
 if __name__ == "__main__":

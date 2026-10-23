@@ -1,15 +1,34 @@
 """Shared benchmark plumbing: provenance, warmup, percentiles, JSON records.
 
 Every benchmark result is written through ``record()`` so no number ever
-appears without the hardware, environment and dataset that produced it
-(PRD section 6, reproducibility).
+appears without the hardware, environment, code revision and dataset that
+produced it (PRD section 6, reproducibility).
 
 Timing rules enforced here (PRD section 6, fair comparisons):
-  - each implementation is warmed up before measurement;
-  - on CUDA, ``torch.cuda.synchronize()`` brackets every timed region;
+  - each implementation is warmed up before measurement, so Triton and
+    ``torch.compile`` compilation never lands inside a timed region;
+  - every timed region is a complete Python call: it includes Python
+    dispatch, argument handling and kernel launch overhead, not only GPU
+    execution time;
+  - two timing methods are available and recorded by name:
+
+        wall         ``time.perf_counter`` around the call; with
+                     ``synchronize=True``, ``torch.cuda.synchronize()`` before
+                     and after every call. The host's view: what a caller
+                     waiting for the result experiences.
+        cuda_events  ``torch.cuda.Event(enable_timing=True)`` pairs recorded
+                     on the current stream around the call, elapsed time read
+                     after a synchronize. The device-stream view. Because the
+                     start event executes as soon as the stream reaches it,
+                     an idle GPU still charges the host's launch latency to
+                     this measurement; what it excludes is the host-side
+                     synchronize cost and Python work after the last launch.
+
   - the three scopes -- kernel-only on resident tensors, host-to-device plus
     features, and whole training loop -- are recorded as separate entries and
-    never mixed into one headline number.
+    never mixed into one headline number. Stage timings of one pipeline
+    (validation, metadata, allocation, pass 1, pass 2) overlap with the
+    end-to-end rows and must not be summed as if they were independent.
 """
 
 from __future__ import annotations
@@ -23,9 +42,14 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 RESULTS_PATH = Path(__file__).parent / "results.json"
+REPO = Path(__file__).resolve().parent.parent
+SNAPSHOT_PATH = REPO / "snapshot.json"  # written by tools/verify_snapshot.py pack
+
+TimingMethod = Literal["wall", "cuda_events"]
+TIMING_METHODS: tuple[str, ...] = ("wall", "cuda_events")
 
 
 @dataclass(frozen=True)
@@ -98,10 +122,36 @@ def capture_environment() -> Environment:
     )
 
 
-TIMING_METHOD = (
-    "wall clock (time.perf_counter) around each call; with synchronize=True, "
-    "torch.cuda.synchronize() before and after every call; warm-up calls untimed"
-)
+def snapshot_metadata() -> dict[str, Any] | None:
+    """The packed tree's identity when running from an unpacked snapshot, else None.
+
+    A snapshot carries the full commit, dirty flag and a digest over every
+    packed file, which identifies the tested tree even when ``git`` is not
+    available on the GPU machine.
+    """
+    if not SNAPSHOT_PATH.is_file():
+        return None
+    try:
+        loaded = json.loads(SNAPSHOT_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+TIMING_DESCRIPTIONS: dict[str, str] = {
+    "wall": (
+        "wall clock (time.perf_counter) around each call; with synchronize=True, "
+        "torch.cuda.synchronize() before and after every call; warm-up calls untimed; "
+        "includes Python dispatch and launch overhead"
+    ),
+    "cuda_events": (
+        "torch.cuda.Event(enable_timing=True) recorded on the current stream before and "
+        "after each call, elapsed_time after synchronize; warm-up calls untimed; includes "
+        "launch latency when the stream is idle, excludes host-side synchronize cost"
+    ),
+}
+# Backwards-compatible name for the default method's description.
+TIMING_METHOD = TIMING_DESCRIPTIONS["wall"]
 
 
 def time_callable(
@@ -110,8 +160,33 @@ def time_callable(
     warmup: int = 10,
     repeats: int = 100,
     synchronize: bool = False,
+    method: TimingMethod = "wall",
 ) -> dict[str, float]:
-    """Return p50/p95/p99/min/mean latencies in milliseconds."""
+    """Return p50/p95/p99/min/mean latencies in milliseconds.
+
+    ``method="cuda_events"`` requires CUDA and implies synchronization
+    (events are read after ``torch.cuda.synchronize()``).
+    """
+    if method not in TIMING_METHODS:
+        raise ValueError(f"method must be one of {TIMING_METHODS}, got {method!r}")
+    if method == "cuda_events":
+        samples = _cuda_event_samples(fn, warmup, repeats)
+    else:
+        samples = _wall_samples(fn, warmup, repeats, synchronize)
+    samples.sort()
+    return {
+        "min_ms": samples[0],
+        "mean_ms": statistics.fmean(samples),
+        "p50_ms": samples[len(samples) // 2],
+        "p95_ms": samples[int(len(samples) * 0.95)],
+        "p99_ms": samples[int(len(samples) * 0.99)],
+        "repeats": float(repeats),
+    }
+
+
+def _wall_samples(
+    fn: Callable[[], Any], warmup: int, repeats: int, synchronize: bool
+) -> list[float]:
     sync = _make_sync(synchronize)
     for _ in range(warmup):
         fn()
@@ -123,15 +198,27 @@ def time_callable(
         fn()
         sync()
         samples.append((time.perf_counter() - t0) * 1e3)
-    samples.sort()
-    return {
-        "min_ms": samples[0],
-        "mean_ms": statistics.fmean(samples),
-        "p50_ms": samples[len(samples) // 2],
-        "p95_ms": samples[int(len(samples) * 0.95)],
-        "p99_ms": samples[int(len(samples) * 0.99)],
-        "repeats": float(repeats),
-    }
+    return samples
+
+
+def _cuda_event_samples(fn: Callable[[], Any], warmup: int, repeats: int) -> list[float]:
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("method='cuda_events' needs a CUDA device")
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    samples: list[float] = []
+    for _ in range(repeats):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn()
+        end.record()
+        torch.cuda.synchronize()
+        samples.append(float(start.elapsed_time(end)))
+    return samples
 
 
 def _make_sync(synchronize: bool) -> Callable[[], None]:
@@ -160,6 +247,7 @@ def record(
         "name": name,
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "environment": asdict(capture_environment()),
+        "snapshot": snapshot_metadata(),
         "config": config,
         "metrics": metrics,
     }
