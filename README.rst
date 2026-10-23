@@ -42,36 +42,92 @@ data.
 Implementation status
 =====================
 
-Ingestion, deterministic generation, window indexing, CPU reference features,
-the streaming CPU aggregator, CPU/CUDA API dispatch, and both GPU kernel
-paths are implemented. The one-pass Triton kernel assigns one program per
-bucket and covers buckets of up to 4,096 records with a single tile. Longer
-buckets dispatch automatically to the two-pass path: pass 1 reduces
-1,024-record chunks to int64 partial sums, pass 2 combines each bucket's
-contiguous partials in 128-wide tiles and performs the only division. No
-bucket length is rejected or truncated; an explicit one-pass tile size
-remains a hard capacity check. ``tapeforge.prepared`` validates and plans an
-input once for repeated execution into reused buffers. The reference
-execution simulator (``tapeforge.execution``) is implemented and tested on
-the CPU against hand-calculated tables; it has no GPU counterpart yet. Day
-tapes, chronological splits with embargo and purge, seeded episode sampling,
-train-only observation statistics, the replay runner with JSON run records
-and three signal-free baselines (TWAP, immediate, cap-aware TWAP) are
-implemented and CPU-tested, on synthetic days and on the downloaded futures
-day when it is present. No policy has been trained.
+Three things are kept apart below. *Implemented* means the code and its
+tests exist in this tree. *CPU-verified* means the test suite asserts the
+behaviour on a CPU; every such check runs in CI on each push. *GPU-verified*
+means the CUDA code path was executed on hardware against a clean snapshot of
+a named commit; CI has no GPU, so that column only ever reflects the last
+manual run and must be refreshed whenever the GPU-facing modules change.
 
-Hardware verification so far: the GPU parity suite of this revision (82 tests:
-one-pass and two-pass paths, prepared execution, multi-tile pass-2 cases,
-forced two-pass, stress burst workloads) passed on a Tesla T4 (torch
+.. list-table::
+   :header-rows: 1
+   :widths: 34 12 24 30
+
+   * - component
+     - implemented
+     - CPU-verified
+     - GPU-verified
+   * - data contract, ingest, synthetic generation, window index
+     - yes
+     - yes
+     - no GPU code
+   * - NumPy reference features and the plain-loop oracle
+     - yes
+     - yes (each against the other)
+     - no GPU code
+   * - streaming CPU aggregator
+     - yes
+     - yes, bitwise equal to the batch reference
+     - runs on the CPU only, by design
+   * - ``ops.aggregate`` CPU path, tensor input validation
+     - yes
+     - yes
+     - CUDA dispatch: Tesla T4, commit ``c5d0f80``
+   * - one-pass Triton kernel, dispatch plan, launcher
+     - yes
+     - plan and tile selection only
+     - Tesla T4, commit ``c5d0f80``
+   * - two-pass Triton kernels (chunk partials, combine)
+     - yes
+     - chunk schedule only
+     - Tesla T4, commit ``c5d0f80``
+   * - ``tapeforge.prepared`` validate-once execution
+     - yes
+     - error paths and immutability only
+     - Tesla T4, commit ``c5d0f80``
+   * - execution simulator (``tapeforge.execution``: spec, state, transitions, episodes)
+     - yes
+     - yes, against hand-calculated tables and Hypothesis properties
+     - no GPU counterpart exists
+   * - day tapes, chronological splits (embargo, purge), seeded sampling, train-only statistics, replay runner, run records, three baselines
+     - yes
+     - yes, on synthetic days; on the downloaded futures day when present
+     - no GPU counterpart exists
+   * - kernel and pipeline benchmarks
+     - yes
+     - CPU smoke run of the CPU-capable rows
+     - executed on a T4, not recorded (``results.json`` is empty)
+   * - ``pinned_streams`` transfer variant
+     - no
+     - --
+     - --
+   * - training throughput benchmark, ``model.py``
+     - stubs that raise
+     - --
+     - --
+
+The one-pass Triton kernel assigns one program per bucket and covers buckets
+of up to 4,096 records with a single tile. Longer buckets dispatch
+automatically to the two-pass path: pass 1 reduces 1,024-record chunks to
+int64 partial sums, pass 2 combines each bucket's contiguous partials in
+128-wide tiles and performs the only division. No bucket length is rejected
+or truncated; an explicit one-pass tile size remains a hard capacity check.
+``tapeforge.prepared`` validates and plans an input once for repeated
+execution into reused buffers. No policy has been trained.
+
+Hardware verification so far: the GPU parity suite of commit ``c5d0f80`` (82
+tests: one-pass and two-pass paths, prepared execution, multi-tile pass-2
+cases, forced two-pass, stress burst workloads) passed on a Tesla T4 (torch
 2.14.1+cu130, Triton 3.8.0, CUDA 13.0) against a clean snapshot of the
 committed tree, and the quick kernel benchmark reported correct results for
-every row on sparse, uniform and burst workloads. The run's manifest, JUnit
-report, logs and environment capture are retained by the owner outside the
-repository. CI has no GPU, so each revision must be re-verified that way.
-**No speedup figures are published.** ``benchmarks/results.json`` is empty
-until a recorded sweep lands, and every performance claim must cite an
-entry there with its hardware and software provenance. The streaming
-aggregator is verified on the CPU only, which is the only place it runs.
+every row on sparse, uniform and burst workloads. The kernel, launcher,
+validation and prepared-execution modules and the GPU test suites are
+unchanged since that commit; later commits added the CPU-only
+``tapeforge.execution`` package, tests and documentation. The run's manifest,
+JUnit report, logs and environment capture are retained by the owner outside
+the repository. **No speedup figures are published.** ``benchmarks/results.json``
+is empty until a recorded sweep lands, and every performance claim must cite
+an entry there with its hardware and software provenance.
 
 Preliminary dataset observations
 ================================
@@ -146,7 +202,10 @@ Verify a checkout
 
 .. code-block:: console
 
+   $ python -m ruff check src tests benchmarks tools
+   $ python -m mypy                         # strict; the model.py stub has two known errors
    $ python -m pytest -q                    # all tests; GPU tests skip with a reason
+   $ python -m pytest -q --cov=tapeforge --cov-report=term-missing   # what CI runs
    $ python -m pytest -q -m gpu             # GPU parity suite, needs CUDA + Triton
    $ python -m pytest -q -m slow            # stress suite (GPU cases skip without CUDA)
    $ python tools/verify_snapshot.py run --artifacts verification   # all of the above, with artifacts
@@ -154,7 +213,9 @@ Verify a checkout
 The last command runs lint, the test suites, the parity script and the quick
 kernel benchmark as subprocesses and writes a manifest, logs, JUnit reports
 and the captured environment under ``verification/``. Steps that need CUDA
-are recorded as skipped, with the reason, on a machine without a GPU.
+are recorded as skipped, with the reason, on a machine without a GPU. The
+default ``pytest`` run includes the ``slow`` marker; tests that need a
+downloaded archive skip, naming the missing file, when ``data/`` is empty.
 
 Usage
 =====
@@ -590,12 +651,19 @@ Layout
        runner.py      Observation, run_episode, summaries, JSON run records
        baselines.py   twap, immediate, cap_aware_twap
        normalization.py  train-only observation statistics
-   tests/           parity, edge-case, streaming, two-pass, prepared, stress and
-                    execution-simulator suites (tests/test_execution/)
+   tests/           parity, edge-case, streaming, two-pass, prepared, stress,
+                    docs and tooling suites; tests/test_execution/ holds the
+                    simulator, splits, sampling, runner, baseline, leakage and
+                    real-day suites with their tape and policy helpers;
+                    tests/fixtures/ holds five-row aggTrades excerpts
+   test_program.py  toy CUDA example, run by the snapshot verifier
+   benchmarks/      harness, the three timed scopes, baselines, workloads,
+                    versioned configs/, results.json (empty until recorded)
+   tools/           check_gpu_parity.py (one-screen GPU parity summary),
+                    verify_snapshot.py (snapshot packer + verification runner)
+   .github/workflows/ci.yml   lint and CPU test matrix (Python 3.11, 3.12)
    runs/            baseline run records (ignored, never committed)
-   benchmarks/      harness, three timed scopes, versioned configs, results
-   tools/           commit skill bootstrap, safe local commit helper,
-                    GPU parity script, snapshot packer + verification runner
+   data/            downloaded archives (ignored, never committed)
 
 Development guidelines
 ======================
