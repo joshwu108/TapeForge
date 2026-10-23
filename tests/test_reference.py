@@ -22,8 +22,8 @@ def _trades(rows: list[tuple[int, float, float, bool]]) -> np.ndarray:
     return out
 
 
-def test_prd_toy_example() -> None:
-    """PRD section 3: 2 records, total 3, signed +1, vwap 100.666..."""
+def test_toy_example() -> None:
+    """The hand-calculated toy example: 2 records, total 3, signed +1, vwap 100.666..."""
     trades = _trades([(1, 100.0, 2.0, False), (1, 102.0, 1.0, True)])
     offsets = windows.build_offsets(
         trades["timestamp"],

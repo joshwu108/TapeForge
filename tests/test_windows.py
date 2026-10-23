@@ -12,8 +12,8 @@ from tapeforge import contract, windows
 SEC = contract.US_PER_SECOND
 
 
-def test_prd_offsets_example() -> None:
-    """PRD section 4: offsets [0, 2, 2, 7] -- bucket 1 is empty."""
+def test_documented_offsets_example() -> None:
+    """The documented example: offsets [0, 2, 2, 7] -- bucket 1 is empty."""
     ts = np.array([0, 0, 2, 2, 2, 2, 2], dtype=np.int64) * SEC
     offsets = windows.build_offsets(ts, 0, 3, SEC)
     np.testing.assert_array_equal(offsets, np.array([0, 2, 2, 7]))
@@ -64,7 +64,7 @@ def test_empty_input_gives_all_zero_offsets() -> None:
 
 # --- bucket_lengths ------------------------------------------------------
 
-def test_bucket_lengths_matches_the_prd_example() -> None:
+def test_bucket_lengths_matches_the_documented_example() -> None:
     np.testing.assert_array_equal(
         windows.bucket_lengths(np.array([0, 2, 2, 7], dtype=np.int64)), [2, 0, 5]
     )

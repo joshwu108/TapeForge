@@ -1,4 +1,4 @@
-"""Deterministic synthetic trade generation (TF-01)."""
+"""Deterministic synthetic trade generation."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ def test_agg_trade_ids_are_unique_and_increasing() -> None:
 
 
 def test_determinism_survives_a_fresh_interpreter() -> None:
-    """TF-01's real claim: reproducible across processes, not just calls.
+    """The generator's real claim: reproducible across processes, not just calls.
 
     An in-process check would pass even if the generator read a module-level
     RNG, so this spawns a new interpreter and compares the raw bytes.

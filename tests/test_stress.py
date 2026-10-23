@@ -1,4 +1,4 @@
-"""Robustness across the published stress cases (PRD section 7).
+"""Robustness at scale: a million records per profile, with the correctness gate.
 
 Slow: run with ``python -m pytest -q -m slow``. The CPU cases run everywhere;
 the GPU cases additionally need the ``gpu_ready`` capability and skip with its

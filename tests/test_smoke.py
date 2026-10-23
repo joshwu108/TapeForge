@@ -46,7 +46,7 @@ def test_trade_dtype_carries_the_documented_fields() -> None:
 
 
 def test_scaled_integer_products_fit_in_int64_at_real_magnitudes() -> None:
-    """D-003's overflow bound, asserted against measured data, not unit values.
+    """The contract's overflow bound, asserted against measured data, not unit values.
 
     The original version of this test multiplied PRICE_SCALE by
     QUANTITY_SCALE -- a price of 1.0 and a quantity of 1.0 -- and so passed

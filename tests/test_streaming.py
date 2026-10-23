@@ -51,7 +51,7 @@ def _chunks(trades: np.ndarray, cuts: list[int]) -> list[np.ndarray]:
 # --- hand-calculated semantics -------------------------------------------
 
 
-def test_prd_toy_example_in_one_chunk() -> None:
+def test_toy_example_in_one_chunk() -> None:
     trades = _trades([(1, 100.0, 2.0, False), (1, 102.0, 1.0, True)])
     got = aggregate_stream([trades], contract.US_PER_SECOND, 1)
     assert got.event_count.tolist() == [2]
@@ -61,7 +61,7 @@ def test_prd_toy_example_in_one_chunk() -> None:
     assert got.valid.tolist() == [True]
 
 
-def test_prd_toy_example_one_record_per_chunk() -> None:
+def test_toy_example_one_record_per_chunk() -> None:
     trades = _trades([(1, 100.0, 2.0, False), (1, 102.0, 1.0, True)])
     per_event = [trades[i : i + 1] for i in range(trades.size)]
     _assert_bitwise(aggregate_stream(per_event, contract.US_PER_SECOND, 1),

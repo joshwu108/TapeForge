@@ -50,8 +50,10 @@ def schedule_policy(quantity: int) -> Policy:
 
 
 def immediate_policy(state: State, spec: EpisodeSpec) -> float:
+    """Submit everything that is left; the participation cap decides the fill."""
     return 1.0
 
 
 def zero_policy(state: State, spec: EpisodeSpec) -> float:
+    """Never trade; isolates the residual term and the risk term."""
     return 0.0

@@ -1,4 +1,4 @@
-"""The PyTorch-facing API (TF-07): input formats, dispatch, and CPU correctness.
+"""The PyTorch-facing API: input formats, dispatch, and CPU correctness.
 
 Every correctness check here compares against an independent oracle --
 hand-calculated values or ``reference.aggregate_reference_naive`` (a plain
@@ -83,7 +83,7 @@ def test_returns_documented_keys_shapes_and_dtypes(to_format: Formatter) -> None
 
 
 @FORMATS
-def test_prd_toy_example(to_format: Formatter) -> None:
+def test_toy_example(to_format: Formatter) -> None:
     trades = _trades([(1, 100.0, 2.0, False), (1, 102.0, 1.0, True)])
     offsets = windows.build_offsets(trades["timestamp"], 1 * contract.US_PER_SECOND, 1, W)
     got = _run(to_format, trades, offsets)

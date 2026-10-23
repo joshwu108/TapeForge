@@ -285,6 +285,23 @@ def test_code_revision_reports_a_commit_or_none() -> None:
         assert len(revision["commit"]) == 40 and isinstance(revision["dirty"], bool)
 
 
+def test_code_revision_without_git_is_none_not_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unpacked snapshot on a machine without git still gets a run record."""
+    import subprocess
+
+    def no_git(*args: object, **kwargs: object) -> None:
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(subprocess, "run", no_git)
+    assert code_revision() == {"commit": None, "dirty": None}
+
+    def not_a_repo(*args: object, **kwargs: object) -> None:
+        raise subprocess.CalledProcessError(128, ["git"])
+
+    monkeypatch.setattr(subprocess, "run", not_a_repo)
+    assert code_revision() == {"commit": None, "dirty": None}
+
+
 def test_run_record_stores_observation_statistics_verbatim() -> None:
     stats = {"fields": ["a"], "mean": [0.0], "std": [1.0]}
     record, _ = run_policy(_synthetic_splits(), "train", twap, "twap", SPEC, 1, seed=1,

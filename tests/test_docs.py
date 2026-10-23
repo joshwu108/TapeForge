@@ -59,10 +59,10 @@ def _recorded_gpu_kernel_results() -> list[dict[str, object]]:
 
 
 def test_readme_publishes_no_speedup_claim_before_a_gpu_measurement_exists() -> None:
-    """PRD section 7: no number is reported until our own benchmarks reproduce it.
+    """No speedup figure is published until a recorded benchmark reproduces it.
 
-    Guards against the resume figures drifting into the public docs ahead of
-    the measurements. The kernel existing is not enough: the guard lifts only
+    Guards against earlier, unrecorded figures drifting into the public docs
+    ahead of the measurements. The kernel existing is not enough: the guard lifts only
     once benchmarks/results.json holds a correct, successful kernel-scope entry
     recorded on a GPU; failed or unsupported runs do not count.
     """

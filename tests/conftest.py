@@ -27,8 +27,8 @@ def gpu_ready() -> None:
         pytest.skip(reason)
 
 
-# The PRD section 3 toy example, kept in one place so CPU and GPU tests
-# assert against identical hand-calculated numbers.
+# The hand-calculated toy example (also test_program.py), kept in one place
+# so CPU and GPU tests assert against identical numbers.
 #   bucket at 10:00:01: buy-initiated price 100 qty 2, sell-initiated price 102 qty 1
 #   -> event_count 2, total_quantity 3, signed_quantity +1, vwap 100.666...
 TOY_EXPECTED = {
@@ -67,6 +67,7 @@ def cuda_inputs(trades: np.ndarray, offsets: np.ndarray) -> tuple[dict[str, Any]
 
 
 def assert_gpu_parity(got: dict[str, Any], trades: np.ndarray, offsets: np.ndarray) -> None:
+    """Assert the parity rule above between CUDA outputs and the plain-loop oracle."""
     expected = reference.aggregate_reference_naive(trades, offsets)
     assert tuple(got) == contract.FEATURE_NAMES
     for name in contract.FEATURE_NAMES:

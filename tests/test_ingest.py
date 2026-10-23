@@ -1,4 +1,4 @@
-"""Public aggTrades loading, normalization and validation (TF-02).
+"""Public aggTrades loading, normalization and validation.
 
 No network access: every case runs against the committed fixtures in
 tests/fixtures/, which are 5-row excerpts in the two layouts the archive has
@@ -27,7 +27,7 @@ ZIP_US = FIXTURES / "BTCUSDT-aggTrades-2025-01-02.zip"
     ("text", "scale", "expected"),
     [
         # Archive formatting: everything is padded to 8 decimals, so the
-        # trailing zeros must not count against the scale (D-003).
+        # trailing zeros must not count against the scale.
         ("94591.78000000", contract.PRICE_SCALE, 9_459_178),
         ("94591.79000000", contract.PRICE_SCALE, 9_459_179),
         ("100", contract.PRICE_SCALE, 100 * contract.PRICE_SCALE),
@@ -56,7 +56,7 @@ def test_trailing_zeros_are_not_precision() -> None:
 
 
 def test_a_symbol_the_scales_cannot_represent_fails_loudly(tmp_path: Path) -> None:
-    """D-003's accepted limitation: refuse, never truncate.
+    """The fixed-scale limitation is enforced by refusing, never by truncating.
 
     SHIBUSDT-style prices carry 8 significant decimals. The chosen BTCUSDT
     scales cannot hold them, and the error says what to do about it.

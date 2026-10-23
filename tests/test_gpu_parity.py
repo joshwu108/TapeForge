@@ -1,4 +1,4 @@
-"""The GPU engine must agree with the CPU reference (TF-05, TF-06).
+"""The GPU engine must agree with the CPU reference on both kernel paths.
 
 Every test drives the real code path -- ``ops.aggregate`` on CUDA tensors or
 ``kernels.launch_aggregate`` -- and compares against
@@ -13,7 +13,7 @@ depends on a particular path asserts the path through ``kernels.plan_dispatch``
 on the fixture's longest bucket, so a large fixture cannot silently take the
 other path. The focused two-pass suite is test_two_pass.py.
 
-Parity rule (PRD section 6): counts and quantity sums exactly; VWAP within
+Parity rule: counts and quantity sums exactly; VWAP within
 contract.VWAP_RTOL / VWAP_ATOL; identical dtypes.
 """
 
@@ -93,7 +93,7 @@ def test_gpu_matches_cpu_reference_on_full_burst(gpu_ready: None, seed: int) -> 
 
 
 def test_oversized_bucket_takes_the_two_pass_path(gpu_ready: None) -> None:
-    """TF-06: one bucket several tiles long, with a ragged final tile."""
+    """One bucket several tiles long, with a ragged final tile."""
     trades, offsets = _one_bucket(3 * LIMIT + 17)
     assert kernels.plan_dispatch(3 * LIMIT + 17).path == "two_pass"
     _assert_parity(ops.aggregate(*_cuda(trades, offsets)), trades, offsets)
@@ -134,7 +134,7 @@ def test_explicit_block_size_boundary(gpu_ready: None) -> None:
 # --- edge cases -----------------------------------------------------------
 
 
-def test_prd_toy_example(gpu_ready: None) -> None:
+def test_toy_example(gpu_ready: None) -> None:
     trades = _rows([(1, 100.0, 2.0, False), (1, 102.0, 1.0, True)])
     offsets = np.array([0, 2, 2], dtype=np.int64)
     got = ops.aggregate(*_cuda(trades, offsets))
