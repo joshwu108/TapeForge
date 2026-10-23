@@ -48,18 +48,14 @@ bucket length is rejected or truncated; an explicit one-pass tile size
 remains a hard capacity check. ``tapeforge.prepared`` validates and plans an
 input once for repeated execution into reused buffers.
 
-Hardware verification so far: a Tesla T4 run (torch 2.14.1+cu130, Triton
-3.8.0) of a working-tree snapshot executed the one-pass path on 40 parity
-cases and the two-pass kernels on 20, all matching the plain-loop oracle
-(integers exactly, VWAP within tolerance), and the quick kernel benchmark
-reported correct results for sparse, uniform and burst workloads (the run's
-manifest, logs and environment capture are retained by the owner outside
-the repository). The launcher, the dispatch tests, the prepared-execution
-path, the multi-tile pass-2 cases and the extended benchmark rows in this
-revision were written after that run and have **not yet been executed on a
-GPU**; CI has no GPU. A Triton-interpreter run on CPU tensors checked the
-kernel semantics and launcher argument order of this revision, which is not
-hardware verification.
+Hardware verification so far: the GPU parity suite of this revision (82 tests:
+one-pass and two-pass paths, prepared execution, multi-tile pass-2 cases,
+forced two-pass, stress burst workloads) passed on a Tesla T4 (torch
+2.14.1+cu130, Triton 3.8.0, CUDA 13.0) against a clean snapshot of the
+committed tree, and the quick kernel benchmark reported correct results for
+every row on sparse, uniform and burst workloads. The run's manifest, JUnit
+report, logs and environment capture are retained by the owner outside the
+repository. CI has no GPU, so each revision must be re-verified that way.
 **No speedup figures are published.** ``benchmarks/results.json`` is empty
 until a recorded sweep lands, and every performance claim must cite an
 entry there with its hardware and software provenance. The streaming
