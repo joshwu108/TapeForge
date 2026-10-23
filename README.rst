@@ -31,11 +31,13 @@ the batch result, as the live-path counterpart of the batch engine. Buckets
 longer than one GPU tile are reduced by a two-pass kernel pair that carries
 integer partial sums and divides once. On top of the features, a torch-free
 reference execution simulator replays an optimal-execution episode against
-the bucket tape with exact integer accounting (see "Execution simulator").
-Planned extensions include pinned-memory stream overlap in the transfer
-benchmark, policy baselines over frozen episode splits, and an end-to-end
+the bucket tape with exact integer accounting (see "Execution simulator"),
+and signal-free baselines replay over chronological day splits with embargo
+and purge (see "Episodes, splits and baselines"). Planned extensions include
+pinned-memory stream overlap in the transfer benchmark and an end-to-end
 training throughput experiment. The classifier and training benchmark remain
-stubs. The input contains trades rather than order-book data.
+stubs; no policy is learned. The input contains trades rather than order-book
+data.
 
 Implementation status
 =====================
@@ -51,8 +53,12 @@ bucket length is rejected or truncated; an explicit one-pass tile size
 remains a hard capacity check. ``tapeforge.prepared`` validates and plans an
 input once for repeated execution into reused buffers. The reference
 execution simulator (``tapeforge.execution``) is implemented and tested on
-the CPU against hand-calculated tables; it has no GPU counterpart yet, and
-no policy has been trained or evaluated with it.
+the CPU against hand-calculated tables; it has no GPU counterpart yet. Day
+tapes, chronological splits with embargo and purge, seeded episode sampling,
+train-only observation statistics, the replay runner with JSON run records
+and three signal-free baselines (TWAP, immediate, cap-aware TWAP) are
+implemented and CPU-tested, on synthetic days and on the downloaded futures
+day when it is present. No policy has been trained.
 
 Hardware verification so far: the GPU parity suite of this revision (82 tests:
 one-pass and two-pass paths, prepared execution, multi-tile pass-2 cases,
@@ -377,8 +383,100 @@ max_price x fee_bps`` must fit, like the feature engine's accumulation bound).
 quantity-based baselines. The simulator is verified on the CPU only, against
 the hand-calculated worksheet tables (buy, sell, partial completion with the
 three residual rules, invalid bucket, the 5,002.5 -> 5,003 fee case) and
-Hypothesis properties over random tapes and actions. Episode splits, the
-baseline suite and any learned policy are not implemented.
+Hypothesis properties over random tapes and actions. No learned policy
+exists; the next section covers how episodes are drawn and replayed.
+
+Episodes, splits and baselines
+==============================
+
+The pieces needed to run signal-free baselines reproducibly on real or
+synthetic tapes, with the leakage controls the owner accepted. Nothing in
+them is trained or fitted, apart from the observation statistics described
+below.
+
+**Day tapes.** A ``DayTape`` is one UTC calendar day of bucket features (an
+``origin == 0`` ``MarketSlice`` plus its date, start timestamp and bucket
+width). ``synthetic_day`` builds one from the seeded generator;
+``day_from_archive`` builds the 86,400 one-second buckets of a downloaded
+aggTrades day through the trade ingest and refuses records outside the day.
+Contiguous days join into one tape, so an episode may run across midnight
+inside a split.
+
+**Splits.** Days are assigned to train, validation and test explicitly, by
+date, with no defaults (the test role may be empty), and the assignment
+must be chronological. Contiguous same-role days form a segment. An episode
+may start at ``t_0`` only if the whole slice it reads (``max(H, L + d)``
+buckets before, ``H + l + L`` after) lies inside its segment, if the window
+``[t_0 - L, t_0 + H + l + 1]`` lies inside it (purge), and if the slice
+avoids the first ``max(H + l, L)`` buckets of a segment that follows a
+different role (embargo). The admissible starts of each segment are one
+half-open range, listed in a JSON-serialisable ``SplitRecord`` together
+with every day, the segment structure and the parameters that produced the
+ranges; the tests check the ranges on hand-built boundaries and with
+Hypothesis over random day structures.
+
+**Sampling.** ``sample_episodes`` draws episodes inside one role. Draw
+``index`` of ``seed`` is a pure function of ``(seed, role, index)``: the
+start is uniform over the admissible starts, the side is buy or sell with
+equal probability, rho is uniform over {2 %, 5 %, 10 %}, and Q* is sized
+from the volume before the start when the episode is cut. A run record that
+lists ``(seed, index)`` per episode is enough to rebuild it exactly.
+
+**Normalisation.** ``observation_statistics`` computes per-field mean and
+standard deviation of the observations a reference policy sees on training
+draws only; it refuses draws from any other role, and a test changes the
+validation and test days and asserts the statistics are unchanged. The
+baselines do not use them.
+
+**Replay and baselines.** ``run_episode`` steps a policy callable through an
+episode and returns the full trajectory (states, observations, actions, step
+results with the reward split); ``summarize_episode`` reduces it to exact
+integer accounting plus the shortfall in basis points, and ``summarize_set``
+aggregates a set with completion and truncation rates and nearest-rank
+tail percentiles. A policy receives an ``Observation``: the float vector of
+``observe`` next to the exact integers behind it, so the baselines never
+round through a float. Three baselines are plain functions: ``twap`` submits
+``remaining // time_remaining`` and completes exactly whenever the fill rule
+allows; ``immediate`` submits everything and is spread out by the
+participation cap alone; ``cap_aware_twap`` raises the TWAP share to
+whatever the newest visible bucket's cap estimate says the remaining
+decisions cannot absorb (a proposed heuristic, not an accepted
+specification).
+
+**Run records.** ``run_policy`` samples a role, replays one policy and
+returns a record with the configuration, seeds, split record, code revision,
+per-episode draws and summaries, and the set summary; ``write_run_record``
+writes it as JSON under ``runs/``, which Git ignores. Two runs with the same
+inputs produce identical records except for the creation time and the code
+revision fields, and the tests assert exactly that.
+
+.. code-block:: python
+
+   from tapeforge.execution import (
+       BASELINES, EpisodeSpec, SplitDates, build_splits, run_policy, synthetic_day,
+   )
+
+   SECOND = 1_000_000
+   days = [
+       synthetic_day(seed=1, day="2024-01-01", n_buckets=80, start_us=0),
+       synthetic_day(seed=2, day="2024-01-02", n_buckets=80, start_us=80 * SECOND),
+       synthetic_day(seed=3, day="2024-01-03", n_buckets=60, start_us=160 * SECOND),
+   ]
+   template = EpisodeSpec(side=1, target_qty_ticks=1, horizon_buckets=5, arrival_lookback=3)
+   splits = build_splits(days, SplitDates(("2024-01-01", "2024-01-02"), ("2024-01-03",)),
+                         template)
+   assert splits.record.segments[1].embargo_before == 5   # max(H + l, L) after a role change
+
+   record, trajectories = run_policy(
+       splits, "validation", BASELINES["twap"], "twap", template, n_episodes=10, seed=1
+   )
+   assert record["summary"]["n_episodes"] == 10
+   assert all(t.last_result.terminated for t in trajectories)
+
+The example runs on CPU without data (a real day replaces ``synthetic_day``
+with ``day_from_archive``). The real futures day, when downloaded under
+``data/``, is covered by tests that skip precisely when it is absent; no
+result from it is published here.
 
 Reproducible GPU verification
 =============================
@@ -486,8 +584,15 @@ Layout
        state.py       MarketSlice (bucket tape, integer VWAP ticks), State, StepResult
        simulator.py   reset / observe / step, shortfall, residual rules
        episodes.py    tape window, reference volume, target Q*, make_episode
+       days.py        DayTape: one UTC day of features, synthetic / archive adapters
+       splits.py      chronological day splits, embargo, purge, SplitRecord
+       sampling.py    seeded episode draws, reproducible from (seed, role, index)
+       runner.py      Observation, run_episode, summaries, JSON run records
+       baselines.py   twap, immediate, cap_aware_twap
+       normalization.py  train-only observation statistics
    tests/           parity, edge-case, streaming, two-pass, prepared, stress and
                     execution-simulator suites (tests/test_execution/)
+   runs/            baseline run records (ignored, never committed)
    benchmarks/      harness, three timed scopes, versioned configs, results
    tools/           commit skill bootstrap, safe local commit helper,
                     GPU parity script, snapshot packer + verification runner
