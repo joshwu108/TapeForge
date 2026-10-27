@@ -1,35 +1,44 @@
 """Chronological train / validation / test splits over whole UTC days, with leakage controls.
 
 Days are assigned to a role by calendar date, explicitly (``SplitDates``;
-there are no defaults and the test role may be empty). The order must be
+there are no defaults, and the test role may be empty). The order must be
 chronological: every train day precedes every validation day, which
 precedes every test day. Contiguous days of one role form a *segment*
 (``days.concat_tapes``), inside which an episode may run across midnight;
 a calendar gap or a change of role ends the segment.
 
-Where an episode may start inside a segment of ``n`` buckets, for a spec
-with horizon H, latency l, arrival lookback L and data delay d:
+Admissible starts:
+    Where an episode may start inside a segment of ``n`` buckets is governed
+    by three rules, for a spec with ``horizon_buckets``, ``latency_buckets``,
+    ``arrival_lookback`` and ``data_delay_buckets``:
 
-* **data**: the slice ``episodes.required_window`` needs,
-  ``[t_0 - n_before, t_0 + n_after)``, lies inside the segment, so a
-  split never reads another split's buckets, not even for V_ref;
-* **purge**: the window ``[t_0 - L, t_0 + H + l + 1]`` (closed) lies inside
-  the segment, so no episode's history, fills or terminal mark cross a
-  boundary (the slice rule implies this for L >= 2; both are enforced);
-* **embargo**: the first ``E = max(H + l, L)`` buckets of a segment that
-  follows a segment of a *different* role are unusable, so the last
-  episode before a boundary and the first after it are at least E buckets
-  apart. The embargo sits in the later segment, like the embargo that
-  follows a held-out period in purged cross-validation; two same-role
-  segments separated by a gap have no embargo between them because
-  nothing can be learned across a boundary where no episode is cut.
+    * **data**: the slice ``episodes.required_window`` needs,
+      ``[start - n_before, start + n_after)``, lies inside the segment, so a
+      split never reads another split's buckets, not even for the reference
+      volume;
+    * **purge**: the closed window
+      ``[start - arrival_lookback, start + horizon_buckets + latency_buckets + 1]``
+      lies inside the segment, so no episode's history, fills or terminal
+      mark cross a boundary (the slice rule implies this for
+      ``arrival_lookback >= 2``; both are enforced);
+    * **embargo**: the first
+      ``embargo_buckets = max(horizon_buckets + latency_buckets, arrival_lookback)``
+      buckets of a segment that follows a segment of a *different* role are
+      unusable, so the last episode before a boundary and the first after it
+      are at least that many buckets apart. The embargo sits in the later
+      segment, as in purged cross-validation; two same-role segments
+      separated by a gap have no embargo between them because nothing can be
+      learned across a boundary where no episode is cut.
 
-The admissible starts of a segment are therefore one half-open range
-``[first_start, end_start)`` in segment-local buckets, possibly empty. The
+    The admissible starts of a segment are therefore one half-open range
+    ``[first_start, end_start)`` in segment-local buckets, possibly empty.
+
 ``SplitRecord`` is a frozen, JSON-serialisable description of the days, the
 segments, the ranges and the parameters that produced them; ``Splits`` pairs
-it with the segment tapes so episodes can be cut. Sampling and policies live
-elsewhere; nothing here is random.
+it with the segment tapes so episodes can be cut.
+
+Not covered:
+    Sampling and policies live elsewhere; nothing in this module is random.
 """
 
 from __future__ import annotations
@@ -55,16 +64,23 @@ __all__ = [
     "purge_window",
 ]
 
-ROLES: Final[tuple[str, ...]] = ("train", "validation", "test")
+ROLES: Final[tuple[str, ...]] = ("train", "validation", "test")  # In chronological order.
 
 
 def embargo_buckets(spec: EpisodeSpec) -> int:
-    """``max(H + l, L)``: the accepted embargo width in buckets."""
+    """Return the embargo width in buckets.
+
+    ``max(horizon_buckets + latency_buckets, arrival_lookback)``.
+    """
     return max(spec.horizon_buckets + spec.latency_buckets, spec.arrival_lookback)
 
 
 def purge_window(start_bucket: int, spec: EpisodeSpec) -> tuple[int, int]:
-    """Closed bucket interval ``[t_0 - L, t_0 + H + l + 1]`` that must not cross a boundary."""
+    """Return the closed bucket interval that must not cross a segment boundary.
+
+    ``[start_bucket - arrival_lookback,
+    start_bucket + horizon_buckets + latency_buckets + 1]``.
+    """
     return (
         start_bucket - spec.arrival_lookback,
         start_bucket + spec.horizon_buckets + spec.latency_buckets + 1,
@@ -73,14 +89,24 @@ def purge_window(start_bucket: int, spec: EpisodeSpec) -> tuple[int, int]:
 
 @dataclass(frozen=True)
 class SplitDates:
-    """The explicit role of every day. Dates are ``YYYY-MM-DD``; ``test`` may be empty."""
+    """Explicit role assignment of every day by calendar date.
+
+    Attributes:
+        train: Training dates, ``YYYY-MM-DD``.
+        validation: Validation dates.
+        test: Test dates; may be empty.
+    """
 
     train: tuple[str, ...]
     validation: tuple[str, ...]
     test: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        """Raises ``ValueError`` on a date listed twice or in two roles."""
+        """Coerce each role to a tuple and reject duplicate dates.
+
+        Raises:
+            ValueError: A date is listed twice or under two roles.
+        """
         for role in ROLES:
             object.__setattr__(self, role, tuple(getattr(self, role)))
         seen: dict[str, str] = {}
@@ -91,7 +117,7 @@ class SplitDates:
                 seen[day] = role
 
     def role_of(self, day: str) -> str | None:
-        """The role a date is assigned to, or ``None`` when it is not listed."""
+        """Return the role a date is assigned to, or ``None`` when it is not listed."""
         for role in ROLES:
             if day in getattr(self, role):
                 return role
@@ -100,7 +126,16 @@ class SplitDates:
 
 @dataclass(frozen=True)
 class DayRecord:
-    """What the record keeps about one day (no features)."""
+    """What the split record keeps about one day; no features.
+
+    Attributes:
+        date: The UTC calendar day, ``YYYY-MM-DD``.
+        role: One of ``ROLES``.
+        start_us: Timestamp of bucket 0, in microseconds since the epoch.
+        width_us: Bucket width in microseconds.
+        n_buckets: Buckets in the day.
+        source: Provenance string from the ``DayTape``.
+    """
 
     date: str
     role: str
@@ -115,11 +150,20 @@ class Segment:
     """A maximal run of contiguous same-role days and its admissible episode starts.
 
     Buckets are segment-local: bucket ``b`` of the segment is bucket
-    ``b - sum(day_n_buckets[:k])`` of its ``k``-th day. ``embargo_before`` is
-    ``E`` when a segment of another role precedes this one, else 0.
-    ``[first_start, end_start)`` is the admissible range of ``t_0``;
-    ``end_start == first_start`` means the segment is too short to hold an
-    episode under the rules.
+    ``b - sum(day_n_buckets[:k])`` of its ``k``-th day.
+
+    Attributes:
+        index: Position of the segment in ``SplitRecord.segments``.
+        role: One of ``ROLES``.
+        dates: Calendar dates of the days, in order.
+        day_n_buckets: Buckets per day, aligned with ``dates``.
+        n_buckets: Total buckets, ``sum(day_n_buckets)``.
+        embargo_before: ``embargo_buckets`` when a segment of another role
+            precedes this one, else 0.
+        first_start: First admissible start bucket, segment-local.
+        end_start: One past the last admissible start.
+            ``end_start == first_start`` means the segment is too short to
+            hold an episode under the rules.
     """
 
     index: int
@@ -133,14 +177,14 @@ class Segment:
 
     @property
     def n_starts(self) -> int:
-        """Admissible episode starts in this segment (0 when it is too short)."""
+        """Return the number of admissible episode starts (0 when the segment is too short)."""
         return self.end_start - self.first_start
 
     def date_at(self, bucket: int) -> str:
-        """Calendar date of a segment-local bucket.
+        """Return the calendar date of a segment-local bucket.
 
         Raises:
-            IndexError: the bucket is outside the segment.
+            IndexError: The bucket is outside the segment.
         """
         if not 0 <= bucket < self.n_buckets:
             raise IndexError(f"bucket {bucket} is outside the {self.n_buckets}-bucket segment")
@@ -154,7 +198,25 @@ class Segment:
 
 @dataclass(frozen=True)
 class SplitRecord:
-    """Frozen, JSON-serialisable description of a split (``to_json``)."""
+    """Frozen, JSON-serialisable description of a split (``to_json``).
+
+    Attributes:
+        horizon_buckets: Spec geometry the ranges were computed for.
+        latency_buckets: See ``horizon_buckets``.
+        arrival_lookback: See ``horizon_buckets``.
+        data_delay_buckets: See ``horizon_buckets``.
+        embargo_buckets: ``embargo_buckets(template)``.
+        n_before: Buckets the slice needs before a start
+            (``required_window``).
+        n_after: Buckets the slice needs after a start.
+        purge_before: ``arrival_lookback``; buckets before a start in the
+            purge window.
+        purge_after: ``horizon_buckets + latency_buckets + 1``; buckets after
+            a start in the closed purge window.
+        days: One ``DayRecord`` per day, chronological.
+        segments: One ``Segment`` per maximal run of contiguous same-role
+            days, chronological.
+    """
 
     horizon_buckets: int
     latency_buckets: int
@@ -163,30 +225,30 @@ class SplitRecord:
     embargo_buckets: int
     n_before: int
     n_after: int
-    purge_before: int  # L: buckets before t_0 in the purge window
-    purge_after: int   # H + l + 1: buckets after t_0 in the purge window (closed)
+    purge_before: int  # arrival_lookback: buckets before the start in the purge window.
+    purge_after: int   # horizon_buckets + latency_buckets + 1: buckets after the start (closed).
     days: tuple[DayRecord, ...]
     segments: tuple[Segment, ...]
 
     def segments_for(self, role: str) -> tuple[Segment, ...]:
-        """The role's segments in chronological order.
+        """Return the role's segments in chronological order.
 
         Raises:
-            ValueError: unknown role.
+            ValueError: Unknown role.
         """
         _check_role(role)
         return tuple(s for s in self.segments if s.role == role)
 
     def n_starts(self, role: str) -> int:
-        """Admissible episode starts of a role, summed over its segments."""
+        """Return the admissible episode starts of a role, summed over its segments."""
         return sum(s.n_starts for s in self.segments_for(role))
 
     def start_at(self, role: str, position: int) -> tuple[int, int]:
-        """``(segment index, t_0)`` of the ``position``-th admissible start of a role.
+        """Return ``(segment index, start bucket)`` of the ``position``-th admissible start.
 
         Positions enumerate the role's segments in chronological order and
-        each segment's range in increasing ``t_0``, so a position is a stable
-        name for a start as long as the record is unchanged.
+        each segment's range in increasing start bucket, so a position is a
+        stable name for a start as long as the record is unchanged.
 
         Raises:
             IndexError: ``position`` is outside ``[0, n_starts(role))``.
@@ -201,11 +263,15 @@ class SplitRecord:
         raise IndexError(f"position {position} >= {self.n_starts(role)} starts of role {role!r}")
 
     def dates_for(self, role: str) -> tuple[str, ...]:
-        """Calendar dates assigned to a role, in order (empty for an unused role)."""
+        """Return the calendar dates assigned to a role, in order (empty for an unused role)."""
         return tuple(d.date for d in self.days if d.role == role)
 
     def matches(self, spec: EpisodeSpec) -> bool:
-        """Whether ``spec`` has the geometry (H, l, L, d) the ranges were computed for."""
+        """Return whether ``spec`` has the geometry the ranges were computed for.
+
+        The geometry is ``horizon_buckets``, ``latency_buckets``,
+        ``arrival_lookback`` and ``data_delay_buckets``.
+        """
         return (
             spec.horizon_buckets == self.horizon_buckets
             and spec.latency_buckets == self.latency_buckets
@@ -214,13 +280,19 @@ class SplitRecord:
         )
 
     def to_json(self) -> dict[str, Any]:
-        """Plain dict of built-in types (tuples become lists under ``json.dumps``)."""
+        """Return a plain dict of built-in types (tuples become lists under ``json.dumps``)."""
         return asdict(self)
 
 
 @dataclass(frozen=True, eq=False)
 class Splits:
-    """A ``SplitRecord`` with the segment tapes it describes (one ``origin == 0`` slice each)."""
+    """A ``SplitRecord`` together with the segment tapes it describes.
+
+    Attributes:
+        record: The split description.
+        tapes: One ``origin == 0`` slice per entry of ``record.segments``, in
+            the same order.
+    """
 
     record: SplitRecord
     tapes: tuple[MarketSlice, ...]
@@ -232,7 +304,7 @@ class Splits:
 
         Raises:
             ValueError: ``template`` does not have the record's geometry.
-            IndexError: ``position`` out of range.
+            IndexError: ``position`` is out of range.
         """
         if not self.record.matches(template):
             raise ValueError(
@@ -247,12 +319,22 @@ class Splits:
 
 
 def _check_role(role: str) -> None:
+    """Raise ``ValueError`` unless ``role`` is one of ``ROLES``."""
     if role not in ROLES:
         raise ValueError(f"unknown role {role!r}; expected one of {ROLES}")
 
 
 def _ordered_days(days: Sequence[DayTape], dates: SplitDates) -> list[tuple[DayTape, str]]:
-    """Sort the days, check uniqueness, assignment and chronological roles."""
+    """Sort the days and check uniqueness, assignment and chronological roles.
+
+    Returns:
+        ``(day, role)`` pairs in increasing ``start_us``.
+
+    Raises:
+        ValueError: No days, overlapping or unordered days, a listed date
+            without a tape, a day without a role, or roles out of
+            chronological order.
+    """
     if not days:
         raise ValueError("build_splits needs at least one day")
     ordered = sorted(days, key=lambda d: (d.start_us, d.date))
@@ -287,10 +369,12 @@ def _ordered_days(days: Sequence[DayTape], dates: SplitDates) -> list[tuple[DayT
 
 
 def _dates_of(assigned: Sequence[tuple[DayTape, str]], role: str) -> tuple[str, ...]:
+    """Return the dates of the ``assigned`` days with ``role``, in order."""
     return tuple(day.date for day, r in assigned if r == role)
 
 
 def _group_segments(assigned: Sequence[tuple[DayTape, str]]) -> list[list[tuple[DayTape, str]]]:
+    """Group consecutive contiguous same-role days into segments, preserving order."""
     groups: list[list[tuple[DayTape, str]]] = []
     for day, role in assigned:
         if groups and groups[-1][-1][1] == role and groups[-1][-1][0].is_contiguous_with(day):
@@ -303,18 +387,26 @@ def _group_segments(assigned: Sequence[tuple[DayTape, str]]) -> list[list[tuple[
 def _start_range(
     n_buckets: int, embargo_before: int, n_before: int, n_after: int, purge_after: int
 ) -> tuple[int, int]:
+    """Return the admissible start range ``(first, end)`` of a segment.
+
+    ``first`` is ``embargo_before + n_before``; ``end`` is
+    ``n_buckets - max(purge_after, n_after - 1)``. An empty range is returned
+    as ``(first, first)``.
+    """
     first = embargo_before + n_before
     end = n_buckets - max(purge_after, n_after - 1)
     return (first, end) if end > first else (first, first)
 
 
 def build_splits(days: Sequence[DayTape], dates: SplitDates, template: EpisodeSpec) -> Splits:
-    """Assign days to roles and compute the admissible episode starts (module docstring).
+    """Assign days to roles and compute each segment's admissible episode starts.
 
-    ``template`` supplies H, l, L and d; its side and target are ignored.
+    ``template`` supplies ``horizon_buckets``, ``latency_buckets``,
+    ``arrival_lookback`` and ``data_delay_buckets``; its side and target are
+    ignored. See the module docstring for the rules.
 
     Raises:
-        ValueError: no days; a date listed twice, unassigned or without a
+        ValueError: No days; a date listed twice, unassigned or without a
             tape; days out of calendar order or overlapping; roles not
             chronological.
     """

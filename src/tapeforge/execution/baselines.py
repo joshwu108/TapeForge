@@ -5,23 +5,28 @@ Each baseline is a plain function ``Observation -> action`` for
 (remaining quantity, time remaining, the newest visible bucket's quantity)
 and convert a quantity to the simulator's fractional action with
 ``simulator.action_for_quantity``, so the submitted quantity is exactly the
-one computed here. None of them looks at prices; they are the reference
-points a learned policy has to beat, not strategies.
+one computed here. None of them reads prices; they are the reference points
+a learned policy has to beat, not strategies.
 
-* ``twap``: submit ``remaining // time_remaining`` each step (1/H, then
-  1/(H-1) of what is left, ...). The last decision submits everything left,
-  so TWAP completes exactly whenever the fill rule lets it.
-* ``immediate``: submit everything at every step; the participation cap is
-  what spreads it out.
-* ``cap_aware_twap``: TWAP, raised to whatever the estimated future liquidity
-  cannot absorb. The liquidity estimate is the participation cap of the
-  newest visible bucket (``floor(cap_bps * quantity / 10_000)``), assumed to
-  persist: with ``k`` decisions after this one, the future can absorb about
-  ``k * cap_estimate``, so ``max(0, remaining - k * cap_estimate)`` must be
-  submitted now to stay feasible. When liquidity is deep the policy is TWAP;
-  when the newest bucket was empty the estimate is 0 and everything is
-  submitted (the fill is still capped by the real bucket). This definition is
-  a proposal recorded for the owner, not an accepted specification.
+Policies:
+    * ``twap``: submit ``remaining // time_remaining`` each step
+      (``1 / horizon_buckets`` of the target, then
+      ``1 / (horizon_buckets - 1)`` of what is left, and so on). The last
+      decision submits everything left, so TWAP completes exactly whenever
+      the fill rule lets it.
+    * ``immediate``: submit everything at every step; the participation cap
+      is what spreads it out.
+    * ``cap_aware_twap``: TWAP, raised to whatever the estimated future
+      liquidity cannot absorb. The liquidity estimate is the participation
+      cap of the newest visible bucket
+      (``floor(cap_bps * quantity / 10_000)``), assumed to persist: with
+      ``k`` decisions after this one, the future can absorb about
+      ``k * cap_estimate``, so ``max(0, remaining - k * cap_estimate)`` must
+      be submitted now to stay feasible. When liquidity is deep the policy
+      is TWAP; when the newest bucket was empty the estimate is 0 and
+      everything is submitted (the fill is still capped by the real bucket).
+      This definition is a candidate pending review, not part of the default
+      production configuration.
 """
 
 from __future__ import annotations
@@ -43,10 +48,10 @@ __all__ = [
 
 
 def twap_quantity(remaining_qty_ticks: int, time_remaining_buckets: int) -> int:
-    """``remaining // time_remaining``: the TWAP share of what is left, in ticks.
+    """Return the TWAP share of what is left: ``remaining // time_remaining``, in ticks.
 
     Raises:
-        ValueError: no time remaining or a negative quantity.
+        ValueError: No time remaining, or a negative quantity.
     """
     if time_remaining_buckets < 1:
         raise ValueError(f"time_remaining_buckets must be positive, got {time_remaining_buckets}")
@@ -56,7 +61,7 @@ def twap_quantity(remaining_qty_ticks: int, time_remaining_buckets: int) -> int:
 
 
 def twap(observation: Observation) -> float:
-    """Time-weighted schedule over the remaining decisions (module docstring)."""
+    """Submit a time-weighted share of the remaining quantity each step."""
     quantity = twap_quantity(observation.remaining_qty_ticks, observation.time_remaining_buckets)
     return action_for_quantity(quantity, observation.remaining_qty_ticks)
 
@@ -72,10 +77,14 @@ def cap_aware_twap_quantity(
     newest_bucket_total_qty_ticks: int,
     participation_cap_bps: int,
 ) -> int:
-    """TWAP share, raised to ``remaining - (time_remaining - 1) * cap_estimate`` when positive.
+    """Return the TWAP share, raised to what the estimated future liquidity cannot absorb.
+
+    The result is ``max(share, remaining - (time_remaining - 1) *
+    cap_estimate)`` clamped to ``[0, remaining]``, where ``cap_estimate`` is
+    the participation cap of the newest visible bucket.
 
     Raises:
-        ValueError: as ``twap_quantity``, or a negative bucket quantity.
+        ValueError: As ``twap_quantity``, or a negative bucket quantity.
     """
     share = twap_quantity(remaining_qty_ticks, time_remaining_buckets)
     if newest_bucket_total_qty_ticks < 0:
@@ -90,7 +99,7 @@ def cap_aware_twap_quantity(
 
 
 def cap_aware_twap(observation: Observation) -> float:
-    """TWAP that front-loads what the estimated future liquidity cannot absorb."""
+    """Submit the TWAP share, front-loading what the estimated future liquidity cannot absorb."""
     quantity = cap_aware_twap_quantity(
         observation.remaining_qty_ticks,
         observation.time_remaining_buckets,
@@ -100,7 +109,7 @@ def cap_aware_twap(observation: Observation) -> float:
     return action_for_quantity(quantity, observation.remaining_qty_ticks)
 
 
-# Names used in run records; a learned policy is recorded under its own name.
+# Policy names used in run records; a learned policy is recorded under its own name.
 BASELINES: Final[dict[str, Policy]] = {
     "twap": twap,
     "immediate": immediate,

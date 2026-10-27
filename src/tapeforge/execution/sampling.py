@@ -6,13 +6,16 @@ index)))``, so draw ``index`` is the same whether 10 or 10,000 episodes are
 sampled, draws never depend on each other, and a run record that lists
 ``(seed, index)`` per episode is enough to rebuild any episode exactly.
 
-Per draw, in this order: the start position (uniform over the role's
-admissible starts in the ``SplitRecord``), the side (buy or sell with equal
-probability) and rho (uniform over the accepted target fractions in basis
-points). Q* is sized when the episode is cut (``Splits.episode``), from the
-reference volume before the start; the draw itself carries no market data.
+Draw order:
+    Per draw: the start position (uniform over the role's admissible starts
+    in the ``SplitRecord``), the side (buy or sell with equal probability)
+    and ``rho_bps`` (uniform over the given target fractions, in basis
+    points). ``target_qty_ticks`` is sized when the episode is cut
+    (``Splits.episode``), from the reference volume before the start; the
+    draw itself carries no market data.
 
-This module chooses nothing about the split rules and runs no policy.
+Not covered:
+    This module chooses nothing about the split rules and runs no policy.
 """
 
 from __future__ import annotations
@@ -41,11 +44,19 @@ __all__ = [
 
 @dataclass(frozen=True)
 class EpisodeDraw:
-    """One sampled episode: where it starts and what it trades, no features.
+    """One sampled episode: where it starts and what it trades, without features.
 
-    ``position`` indexes the role's admissible starts (``SplitRecord.start_at``);
-    ``segment`` and ``start_bucket`` are the resolved segment-local location
-    and ``date`` the calendar day holding ``t_0``.
+    Attributes:
+        seed: Base seed of the sampling run.
+        role: One of ``ROLES``.
+        index: Draw index within the seed and role.
+        position: Index into the role's admissible starts
+            (``SplitRecord.start_at``).
+        segment: Resolved segment index.
+        start_bucket: Resolved segment-local start bucket.
+        date: Calendar day holding the start bucket.
+        side: ``SIDE_BUY`` or ``SIDE_SELL``.
+        rho_bps: Target fraction of the reference volume, in basis points.
     """
 
     seed: int
@@ -59,11 +70,16 @@ class EpisodeDraw:
     rho_bps: int
 
     def to_json(self) -> dict[str, Any]:
-        """Plain dict of built-in types; ``(seed, role, index)`` rebuilds the draw."""
+        """Return a plain dict of built-in types; ``(seed, role, index)`` rebuilds the draw."""
         return asdict(self)
 
 
 def _generator(seed: int, role: str, index: int) -> np.random.Generator:
+    """Return the generator for draw ``index`` of ``seed`` in ``role``.
+
+    Raises:
+        ValueError: Unknown role, or a negative seed or index.
+    """
     if role not in ROLES:
         raise ValueError(f"unknown role {role!r}; expected one of {ROLES}")
     if seed < 0 or index < 0:
@@ -78,11 +94,13 @@ def draw_episode(
     index: int,
     rho_choices_bps: tuple[int, ...] = ACCEPTED_TARGET_FRACTIONS_BPS,
 ) -> EpisodeDraw:
-    """The ``index``-th draw of ``seed`` in ``role`` (see the module docstring for the order).
+    """Return the ``index``-th draw of ``seed`` in ``role``.
+
+    See the module docstring for the order in which the fields are drawn.
 
     Raises:
-        ValueError: unknown role, negative seed or index, no rho choices, or a
-            role with no admissible start.
+        ValueError: Unknown role, negative seed or index, empty
+            ``rho_choices_bps``, or a role with no admissible start.
     """
     if not rho_choices_bps:
         raise ValueError("rho_choices_bps must not be empty")
@@ -116,10 +134,11 @@ def sample_episodes(
     seed: int,
     rho_choices_bps: tuple[int, ...] = ACCEPTED_TARGET_FRACTIONS_BPS,
 ) -> tuple[EpisodeDraw, ...]:
-    """Draws ``0 .. n_episodes - 1`` of ``seed`` in ``role``, each independent of the others.
+    """Return draws ``0 .. n_episodes - 1`` of ``seed`` in ``role``, each independent.
 
     Raises:
-        ValueError: negative ``n_episodes``, plus whatever ``draw_episode`` rejects.
+        ValueError: Negative ``n_episodes``, or anything ``draw_episode``
+            rejects.
     """
     if n_episodes < 0:
         raise ValueError(f"n_episodes must be non-negative, got {n_episodes}")
@@ -131,5 +150,5 @@ def sample_episodes(
 def materialize(
     splits: Splits, draw: EpisodeDraw, template: EpisodeSpec
 ) -> tuple[EpisodeSpec, MarketSlice]:
-    """Cut the episode a draw names: ``Splits.episode`` with the draw's side and rho."""
+    """Cut the episode a draw names: ``Splits.episode`` with the draw's side and ``rho_bps``."""
     return splits.episode(draw.role, draw.position, draw.side, draw.rho_bps, template)

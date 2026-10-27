@@ -1,19 +1,23 @@
-"""Observation scaling statistics from the training split only.
+"""Observation scaling statistics computed from the training split only.
 
 ``observation_statistics`` replays a reference policy over sampled *train*
-episodes, stacks the observation vectors a policy saw (``OBSERVATION_FIELDS``)
-and keeps their per-field mean and population standard deviation. It refuses
-draws from any other role, so validation and test data cannot reach the
-statistics by construction; the test suite additionally proves that
-perturbing validation and test days leaves them unchanged.
+episodes, stacks the observation vectors the policy saw
+(``OBSERVATION_FIELDS``) and keeps their per-field mean and population
+standard deviation. It refuses draws from any other role, so validation and
+test data cannot reach the statistics by construction; the test suite
+additionally checks that perturbing validation and test days leaves them
+unchanged.
 
 ``normalize`` applies ``(x - mean) / std`` with a unit divisor where the
 standard deviation is zero (a constant field, such as ``side`` on a buy-only
-set, is centred and left unscaled). The statistics are stored next to the
-split record in run records (``ObservationStatistics.to_json``); the
-baselines do not use them, since they read exact quantities rather than the
-scaled vector. The observations depend on the reference policy's actions
-through the remaining fraction, so the policy is recorded with the result.
+set, is centred and left unscaled).
+
+Invariants:
+    The statistics are stored next to the split record in run records
+    (``ObservationStatistics.to_json``). The baselines do not use them, since
+    they read exact quantities rather than the scaled vector. The
+    observations depend on the reference policy's actions through the
+    remaining fraction, so the policy name is recorded with the result.
 """
 
 from __future__ import annotations
@@ -39,7 +43,18 @@ __all__ = [
 
 @dataclass(frozen=True)
 class ObservationStatistics:
-    """Per-field mean and population standard deviation of training observations."""
+    """Per-field mean and population standard deviation of training observations.
+
+    Attributes:
+        fields: Observation field names, ``OBSERVATION_FIELDS``.
+        mean: Per-field mean, aligned with ``fields``.
+        std: Per-field population standard deviation, aligned with
+            ``fields``; zero for a constant field.
+        n_observations: Number of observation vectors stacked.
+        n_episodes: Number of training episodes replayed.
+        policy: Name of the reference policy that produced the observations.
+        seed: Seed of the training draws.
+    """
 
     fields: tuple[str, ...]
     mean: tuple[float, ...]
@@ -50,12 +65,16 @@ class ObservationStatistics:
     seed: int
 
     def __post_init__(self) -> None:
-        """Raises ``ValueError`` when the three per-field tuples disagree in length."""
+        """Check that the three per-field tuples agree in length.
+
+        Raises:
+            ValueError: ``fields``, ``mean`` and ``std`` differ in length.
+        """
         if not len(self.fields) == len(self.mean) == len(self.std):
             raise ValueError("fields, mean and std must have the same length")
 
     def to_json(self) -> dict[str, Any]:
-        """Plain dict of built-in types, stored verbatim in run records."""
+        """Return a plain dict of built-in types, stored verbatim in run records."""
         return asdict(self)
 
 
@@ -66,11 +85,18 @@ def observation_statistics(
     policy: Policy,
     policy_name: str,
 ) -> ObservationStatistics:
-    """Mean and std of every observation a reference policy sees on train draws.
+    """Compute the mean and std of every observation a reference policy sees on train draws.
+
+    Args:
+        splits: Split tapes to cut episodes from.
+        draws: Training draws; every ``role`` must be ``"train"``.
+        template: Spec template passed to ``materialize``.
+        policy: Reference policy replayed on each episode.
+        policy_name: Name recorded on the result.
 
     Raises:
-        ValueError: no draws, a draw whose role is not ``"train"``, or a
-            set of episodes that yields no observation.
+        ValueError: No draws, a draw whose role is not ``"train"``, or a set
+            of episodes that yields no observation.
     """
     if not draws:
         raise ValueError("observation statistics need at least one training draw")
@@ -99,10 +125,11 @@ def observation_statistics(
 
 
 def normalize(vector: np.ndarray, statistics: ObservationStatistics) -> np.ndarray:
-    """``(vector - mean) / std`` per field, dividing by 1 where ``std == 0``.
+    """Return ``(vector - mean) / std`` per field, dividing by 1 where ``std == 0``.
 
     Raises:
-        ValueError: the vector's length differs from the statistics' field count.
+        ValueError: The vector's length differs from the statistics' field
+            count.
     """
     values = np.asarray(vector, dtype=np.float64)
     if values.shape != (len(statistics.fields),):

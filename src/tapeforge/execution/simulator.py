@@ -400,8 +400,9 @@ def step(
 def residual_perold(side: int, arrival: int, terminal: int, residual: int, mu: int) -> int:
     """Return the residual-inventory term of the implementation-shortfall decomposition.
 
-    This is the default production residual rule: the opportunity cost of
-    the residual at the terminal mark plus ``mu * residual``.
+    This is the default production residual rule (rule R2 in the oracle
+    tests): the opportunity cost of the residual at the terminal mark plus
+    ``mu * residual``.
     ``side * (terminal - arrival) * residual`` is positive when the price
     moved against the policy; with ``mu == 0`` a favourable move makes the
     term negative, so inaction is rewarded. That is the documented reason
@@ -423,7 +424,7 @@ def residual_perold(side: int, arrival: int, terminal: int, residual: int, mu: i
 def residual_forced_liquidation(
     side: int, arrival: int, terminal: int, residual: int, kappa: int, fee_bps: int
 ) -> int:
-    """Return the forced-liquidation residual rule, for comparison only.
+    """Return the forced-liquidation residual rule (rule R1), for comparison only.
 
     Models trading the residual at ``terminal + side * kappa`` with fees and
     returns the shortfall of that forced fill against the arrival price:
@@ -447,7 +448,7 @@ def residual_forced_liquidation(
 
 
 def residual_fixed_penalty(residual: int, mu: int) -> int:
-    """Return the fixed-penalty residual rule, for comparison only.
+    """Return the fixed-penalty residual rule (rule R3), for comparison only.
 
     ``mu * residual``, in cash ticks, regardless of where the price went.
     """

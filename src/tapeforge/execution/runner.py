@@ -1,25 +1,28 @@
-"""Replay a policy through episodes and summarise the outcome, exactly and reproducibly.
+"""Policy replay through episodes, summaries and JSON run records.
 
 A *policy* is any callable ``Observation -> action`` with the action a
 fraction of the remaining quantity in ``[0, 1]`` (``simulator.step``'s
 domain). ``Observation`` carries the float vector a learned policy consumes
 (``simulator.observe``) next to the exact integers behind it (remaining
-quantity, time remaining, the newest visible bucket's quantity) so that the
+quantity, time remaining, the newest visible bucket's quantity), so the
 quantity-based baselines never round through a float. Everything the policy
-sees is computed from buckets ``<= t - 1 - d``; the runner adds no
-information of its own.
+sees is computed from buckets ``<= t - 1 - data_delay_buckets``; the runner
+adds no information of its own.
 
 ``run_episode`` returns the full ``Trajectory`` (states, observations,
 actions, step results); ``summarize_episode`` reduces it to integer
 accounting plus the shortfall in basis points; ``summarize_set`` aggregates a
 set of episodes with nearest-rank percentiles (``sorted[ceil(p * n) - 1]``,
-no interpolation) so a plain loop can recompute every figure.
+no interpolation), so a plain loop can recompute every figure.
 
-``run_policy`` samples a split role, replays one policy, and writes a JSON
+``run_policy`` samples a split role, replays one policy and writes a JSON
 run record (configuration, seeds, split record, code revision, per-episode
 draws and summaries, set summary) under a runs directory that Git ignores.
-Two runs with the same inputs produce identical records except for the
-``created_utc`` and ``code_revision`` fields. Nothing here learns.
+
+Invariants:
+    Two runs with the same inputs produce identical records except for the
+    ``created_utc`` and ``code_revision`` fields. This module performs no
+    training.
 """
 
 from __future__ import annotations
@@ -67,19 +70,31 @@ __all__ = [
     "write_run_record",
 ]
 
-RUN_RECORD_SCHEMA: Final[str] = "tapeforge.execution.run/1"
-TAIL_PERCENTILES: Final[tuple[int, ...]] = (50, 95, 99)
+RUN_RECORD_SCHEMA: Final[str] = "tapeforge.execution.run/1"  # Schema tag of every run record.
+TAIL_PERCENTILES: Final[tuple[int, ...]] = (50, 95, 99)  # Percentiles reported by SetSummary.
 
 
 @dataclass(frozen=True, eq=False)
 class Observation:
     """What a policy may see before one decision.
 
-    ``vector`` is ``simulator.observe`` (``OBSERVATION_FIELDS``, float64).
-    The integer fields are exact and visible at the same time: the remaining
-    quantity and horizon are episode state, ``newest_bucket_total_qty_ticks``
-    is the quantity of bucket ``t - 1 - d`` (0 when it had none), and the
-    cap rate lets a baseline estimate the next fill's liquidity limit.
+    The integer fields are exact and visible at the same time as ``vector``:
+    the remaining quantity and horizon are episode state,
+    ``newest_bucket_total_qty_ticks`` is the quantity of bucket
+    ``t - 1 - data_delay_buckets`` (0 when it had none), and the cap rate
+    lets a baseline estimate the next fill's liquidity limit.
+
+    Attributes:
+        vector: ``simulator.observe`` output (``OBSERVATION_FIELDS``,
+            float64).
+        remaining_qty_ticks: Quantity still to trade, in quantity ticks.
+        time_remaining_buckets: Decisions left, ``horizon_buckets - step``.
+        target_qty_ticks: The episode's target, in quantity ticks.
+        side: ``SIDE_BUY`` or ``SIDE_SELL``.
+        newest_bucket_total_qty_ticks: Total quantity of the newest visible
+            bucket, in quantity ticks.
+        participation_cap_bps: The spec's participation cap, in basis
+            points.
     """
 
     vector: np.ndarray
@@ -91,6 +106,7 @@ class Observation:
     participation_cap_bps: int
 
 
+# A policy maps an observation to the fraction of the remaining quantity to submit.
 Policy = Callable[[Observation], float]
 
 
@@ -110,7 +126,17 @@ def observation_for(state: State, market: MarketSlice, spec: EpisodeSpec) -> Obs
 
 @dataclass(frozen=True, eq=False)
 class Trajectory:
-    """Everything one replay produced. ``states[0]`` is the reset state."""
+    """Everything one replay produced.
+
+    Attributes:
+        spec: The episode's spec.
+        states: ``states[0]`` is the reset state and ``states[i + 1]`` the
+            state after decision ``i``; at most ``horizon_buckets + 1``
+            entries.
+        observations: The vector shown before each decision.
+        actions: The float each decision submitted.
+        results: The ``StepResult`` of each decision.
+    """
 
     spec: EpisodeSpec
     states: tuple[State, ...]
@@ -120,15 +146,17 @@ class Trajectory:
 
     @property
     def final_state(self) -> State:
-        """The state after the last decision (the reset state if none was taken)."""
+        """Return the state after the last decision (the reset state if none was taken)."""
         return self.states[-1]
 
     @property
     def last_result(self) -> StepResult:
-        """The step that ended the episode; its flags say whether it terminated or truncated.
+        """Return the step that ended the episode.
+
+        Its ``terminated`` and ``truncated`` flags say how it ended.
 
         Raises:
-            IndexError: the trajectory holds no step, which ``run_episode``
+            IndexError: The trajectory holds no step, which ``run_episode``
                 never produces (a fresh episode always takes at least one).
         """
         return self.results[-1]
@@ -138,8 +166,9 @@ def run_episode(spec: EpisodeSpec, market: MarketSlice, policy: Policy) -> Traje
     """Reset, then step the policy until the episode terminates or truncates.
 
     Raises:
-        Whatever ``reset`` and ``step`` raise (undefined arrival price, int64
-        bounds, an action outside ``[0, 1]``).
+        ValueError: ``reset`` finds no arrival price, or ``step`` rejects the
+            action (not a finite fraction in ``[0, 1]``).
+        OverflowError: The int64 bounds check in ``reset`` fails.
     """
     state = reset(spec, market)
     states, observations, actions, results = [state], [], [], []
@@ -169,11 +198,32 @@ def run_episode(spec: EpisodeSpec, market: MarketSlice, policy: Policy) -> Traje
 class EpisodeSummary:
     """Integer accounting of one episode plus the shortfall in basis points.
 
-    ``shortfall_ticks`` is the implementation shortfall against ``P_0``
-    including the residual term when the episode terminated with residual
-    inventory, and the shortfall of the fills alone when it truncated.
-    ``n_capped_steps`` counts fills cut by the participation cap
-    (``fill == cap < submitted``).
+    Attributes:
+        n_steps: Decisions taken.
+        terminated: The episode ended by filling the target or reaching the
+            horizon.
+        truncated: The tape ran out before the task did.
+        arrival_price_ticks: Arrival price in price ticks.
+        terminal_price_ticks: Terminal mark used for the residual term; 0
+            when none was needed or available.
+        target_qty_ticks: Target quantity in quantity ticks.
+        filled_qty_ticks: Filled quantity in quantity ticks.
+        residual_qty_ticks: ``target_qty_ticks - filled_qty_ticks``.
+        completed: ``residual_qty_ticks == 0``.
+        exec_notional_ticks: Cumulative fill notional in cash ticks.
+        fees_ticks: Cumulative fees in cash ticks.
+        shortfall_ticks: Implementation shortfall against the arrival price,
+            in cash ticks: including the residual term when the episode
+            terminated with residual inventory, and the shortfall of the
+            fills alone when it truncated.
+        shortfall_bps: ``shortfall_ticks`` as basis points of the arrival
+            notional.
+        cost_sum_ticks: Sum of ``cost_component`` over the steps.
+        risk_sum_ticks: Sum of ``risk_component`` over the steps.
+        terminal_component_ticks: ``terminal_component`` of the last step.
+        reward_sum_ticks: Sum of ``reward_ticks`` over the steps.
+        n_capped_steps: Fills cut by the participation cap
+            (``fill_qty_ticks == cap_qty_ticks < submitted_qty_ticks``).
     """
 
     n_steps: int
@@ -196,12 +246,16 @@ class EpisodeSummary:
     n_capped_steps: int
 
     def to_json(self) -> dict[str, Any]:
-        """Plain dict of built-in types; integers stay exact under ``json.dumps``."""
+        """Return a plain dict of built-in types; integers stay exact under ``json.dumps``."""
         return asdict(self)
 
 
 def summarize_episode(trajectory: Trajectory) -> EpisodeSummary:
-    """Reduce a trajectory to its accounting; every integer is exact."""
+    """Reduce a trajectory to its accounting; every integer is exact.
+
+    A truncated episode reports the shortfall of its fills alone, because no
+    terminal mark exists to price the residual.
+    """
     spec, final, last = trajectory.spec, trajectory.final_state, trajectory.last_result
     residual = remaining_qty_ticks(final, spec)
     if last.truncated:
@@ -238,10 +292,12 @@ def summarize_episode(trajectory: Trajectory) -> EpisodeSummary:
 
 
 def nearest_rank_percentile(values: Sequence[float], percentile: int) -> float:
-    """``sorted(values)[ceil(percentile / 100 * n) - 1]``; the 0th percentile is the minimum.
+    """Return the nearest-rank percentile: ``sorted(values)[ceil(percentile / 100 * n) - 1]``.
+
+    The 0th percentile is the minimum; there is no interpolation.
 
     Raises:
-        ValueError: no values, or a percentile outside ``[0, 100]``.
+        ValueError: No values, or a percentile outside ``[0, 100]``.
     """
     if not values:
         raise ValueError("a percentile of no values is undefined")
@@ -254,7 +310,26 @@ def nearest_rank_percentile(values: Sequence[float], percentile: int) -> float:
 
 @dataclass(frozen=True)
 class SetSummary:
-    """Aggregate of an episode set. Percentiles are nearest-rank over ``shortfall_bps``."""
+    """Aggregate of an episode set.
+
+    Percentiles are nearest-rank over ``shortfall_bps``.
+
+    Attributes:
+        n_episodes: Episodes in the set.
+        n_completed: Episodes with ``completed`` set.
+        n_truncated: Episodes with ``truncated`` set.
+        completion_rate: ``n_completed / n_episodes``.
+        mean_shortfall_bps: Mean of ``shortfall_bps``.
+        p50_shortfall_bps: 50th nearest-rank percentile of ``shortfall_bps``.
+        p95_shortfall_bps: 95th nearest-rank percentile.
+        p99_shortfall_bps: 99th nearest-rank percentile.
+        max_shortfall_bps: Largest ``shortfall_bps``.
+        total_shortfall_ticks: Sum of ``shortfall_ticks``, in cash ticks.
+        total_fees_ticks: Sum of ``fees_ticks``, in cash ticks.
+        mean_residual_fraction: Mean of
+            ``residual_qty_ticks / target_qty_ticks``.
+        mean_capped_steps: Mean of ``n_capped_steps``.
+    """
 
     n_episodes: int
     n_completed: int
@@ -271,15 +346,17 @@ class SetSummary:
     mean_capped_steps: float
 
     def to_json(self) -> dict[str, Any]:
-        """Plain dict of built-in types for the run record."""
+        """Return a plain dict of built-in types for the run record."""
         return asdict(self)
 
 
 def summarize_set(summaries: Sequence[EpisodeSummary]) -> SetSummary:
-    """Aggregate episode summaries; an empty set is an error, not a summary of zeros.
+    """Aggregate episode summaries.
+
+    An empty set is an error, not a summary of zeros.
 
     Raises:
-        ValueError: no summaries.
+        ValueError: No summaries.
     """
     if not summaries:
         raise ValueError("summarize_set needs at least one episode")
@@ -308,7 +385,11 @@ def summarize_set(summaries: Sequence[EpisodeSummary]) -> SetSummary:
 
 
 def code_revision() -> dict[str, Any]:
-    """``{"commit", "dirty"}`` of the checkout this module runs from; ``None`` without git."""
+    """Return ``{"commit", "dirty"}`` of the checkout this module runs from.
+
+    Both values are ``None`` when ``git`` is unavailable or the module does
+    not live in a repository.
+    """
     here = Path(__file__).resolve().parent
     try:
         commit = subprocess.run(
@@ -323,7 +404,7 @@ def code_revision() -> dict[str, Any]:
 
 
 def _template_json(template: EpisodeSpec) -> dict[str, Any]:
-    """The template's fields except side and target, which every draw overrides."""
+    """Return the template's fields except side and target, which every draw overrides."""
     return {
         f.name: getattr(template, f.name)
         for f in fields(template)
@@ -342,12 +423,24 @@ def run_policy(
     rho_choices_bps: tuple[int, ...] = ACCEPTED_TARGET_FRACTIONS_BPS,
     observation_statistics: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], tuple[Trajectory, ...]]:
-    """Sample ``n_episodes`` of ``role``, replay ``policy`` on each, build the run record.
+    """Sample ``n_episodes`` of ``role``, replay ``policy`` on each and build the run record.
 
-    Returns the JSON-ready record and the trajectories (not stored in the
-    record, which keeps per-episode summaries only). ``observation_statistics``
-    is stored verbatim when given (see ``normalization``); the runner does not
-    apply it, since the baselines read raw observations.
+    Args:
+        splits: Split tapes and record.
+        role: One of ``ROLES``.
+        policy: The policy to replay.
+        policy_name: Name stored in the record's ``config``.
+        template: Spec template; side and target come from each draw.
+        n_episodes: Number of draws; positive.
+        seed: Sampling seed.
+        rho_choices_bps: Target fractions the draws choose from.
+        observation_statistics: Stored verbatim in the record when given
+            (see ``normalization``); the runner does not apply it, since the
+            baselines read raw observations.
+
+    Returns:
+        The JSON-ready record and the trajectories. The trajectories are not
+        stored in the record, which keeps per-episode summaries only.
 
     Raises:
         ValueError: ``n_episodes < 1``, a template that does not match the
@@ -384,6 +477,7 @@ def run_policy(
 
 
 def _episode_json(draw: EpisodeDraw, spec: EpisodeSpec, summary: EpisodeSummary) -> dict[str, Any]:
+    """Return the per-episode entry of a run record: draw, resolved side and target, summary."""
     return {
         "draw": draw.to_json(),
         "spec": {"side": spec.side, "target_qty_ticks": spec.target_qty_ticks},
