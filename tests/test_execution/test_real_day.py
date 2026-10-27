@@ -1,8 +1,9 @@
-"""The downloaded futures day (BTCUSDT USD-M, 2023-12-01) through the day tape and the baselines.
+"""Tests for the day-tape loader, splits and baselines on a downloaded futures day (BTCUSDT
+USD-M, 2023-12-01).
 
-Skips with a precise reason when the archive is absent, so a fresh checkout
-passes without data. Nothing here is a performance claim; the figures are
-properties of the day that the loader must reproduce.
+The module skips with a precise reason when the archive is absent, so a fresh
+checkout passes without data. The asserted figures are properties of the day
+that the loader must reproduce, not performance claims.
 """
 
 from __future__ import annotations
@@ -21,16 +22,17 @@ from tapeforge.execution.splits import SplitDates, Splits, build_splits
 REPO = Path(__file__).resolve().parent.parent.parent
 FUTURES_DAY = REPO / "data" / "futures-um" / "aggTrades" / "BTCUSDT-aggTrades-2023-12-01.zip"
 DATE = "2023-12-01"
-TEMPLATE = EpisodeSpec(side=1, target_qty_ticks=1)   # the accepted defaults: H 300, L 60
+TEMPLATE = EpisodeSpec(side=1, target_qty_ticks=1)   # Defaults: horizon 300, lookback 60.
 
 
 def _stable(record: dict) -> dict:
-    """The record without the two fields that differ between otherwise identical runs."""
+    """Return ``record`` without the two fields that differ between otherwise identical runs."""
     return {k: v for k, v in record.items() if k not in ("created_utc", "code_revision")}
 
 
 @pytest.fixture(scope="module")
 def futures_day() -> DayTape:
+    """Load the futures day from the archive, or skip the module when it is not downloaded."""
     if not FUTURES_DAY.exists():
         pytest.skip(f"{FUTURES_DAY.relative_to(REPO)} is not downloaded (step 01 data)")
     day, provenance = day_from_archive(FUTURES_DAY)
@@ -40,14 +42,15 @@ def futures_day() -> DayTape:
 
 @pytest.fixture(scope="module")
 def single_day_splits(futures_day: DayTape) -> Splits:
+    """Build splits with the whole day as the training role and nothing else."""
     return build_splits([futures_day], SplitDates((DATE,), ()), TEMPLATE)
 
 
 def test_the_day_loads_into_86400_one_second_buckets(futures_day: DayTape) -> None:
     assert futures_day.date == DATE and futures_day.n_buckets == BUCKETS_PER_DAY
-    assert int(futures_day.tape.event_count.sum()) == 1_038_461   # every record is in the day
-    assert int((~futures_day.tape.valid).sum()) == 1_044           # empty seconds
-    assert int(futures_day.tape.event_count.max()) == 2_918        # busiest second
+    assert int(futures_day.tape.event_count.sum()) == 1_038_461   # Every record is in the day.
+    assert int((~futures_day.tape.valid).sum()) == 1_044           # Empty seconds.
+    assert int(futures_day.tape.event_count.max()) == 2_918        # Busiest second.
     assert futures_day.tape.vwap_ticks[futures_day.tape.valid].min() >= 3_760_000  # 37,600.00
 
 
@@ -73,7 +76,7 @@ def test_baselines_run_reproducibly_on_the_real_day(
     path = write_run_record(first, tmp_path)
     assert json.loads(path.read_text())["summary"]["n_episodes"] == 6
     for trajectory in trajectories:
-        assert trajectory.last_result.terminated   # a full day never truncates inside the ranges
+        assert trajectory.last_result.terminated   # A full day never truncates inside the ranges.
         assert trajectory.final_state.filled_qty_ticks <= trajectory.spec.target_qty_ticks
     summary = first["summary"]
     assert summary["n_truncated"] == 0 and 0.0 <= summary["completion_rate"] <= 1.0

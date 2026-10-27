@@ -1,4 +1,8 @@
-"""EpisodeSpec validation, fee rounding, the participation cap and the int64 bounds."""
+"""Tests for tapeforge.execution.spec: EpisodeSpec defaults, validation and normalisation, the fee
+ceiling, the participation-cap floor and the int64 bounds check.
+
+Rounding and bound cases are pinned with exact integers; no fixtures are needed.
+"""
 
 from __future__ import annotations
 
@@ -90,13 +94,13 @@ def test_spec_is_immutable() -> None:
 @pytest.mark.parametrize(
     "notional, fee_bps, expected",
     [
-        (1_000_200_000, 10, 1_000_200),  # exact
-        (5_002_500, 10, 5_003),          # 5,002.5 rounds up, the worksheet case
-        (5_002_400, 10, 5_003),          # 5,002.4 rounds up too: ceil, not half-up
-        (1, 10, 1),                      # one cash tick of notional still costs a tick
+        (1_000_200_000, 10, 1_000_200),  # Exact.
+        (5_002_500, 10, 5_003),          # 5,002.5 rounds up: the reference-fixture case.
+        (5_002_400, 10, 5_003),          # 5,002.4 rounds up too: ceiling, not half-up.
+        (1, 10, 1),                      # One cash tick of notional still costs a tick.
         (0, 10, 0),
-        (123_456_789, 0, 0),             # zero fee tier
-        (10_000, 10_000, 10_000),        # 100 % fee
+        (123_456_789, 0, 0),             # Zero fee tier.
+        (10_000, 10_000, 10_000),        # 100 % fee.
     ],
 )
 def test_fee_is_the_ceiling_in_cash_ticks(notional: int, fee_bps: int, expected: int) -> None:
@@ -118,16 +122,19 @@ def test_participation_cap_is_an_exact_floor(total: int, cap_bps: int, expected:
     assert participation_cap_ticks(total, cap_bps) == expected
 
 
-# --- (d) overflow bound -------------------------------------------------------------
+# --- case (d): int64 overflow bounds ------------------------------------------------
 
-MAX_PRICE = 100_000_00           # 100,000.00 USDT in price ticks
-THOUSAND_BTC = 1_000 * 100_000   # 1,000 BTC in quantity ticks
+MAX_PRICE = 100_000_00           # 100,000.00 USDT in price ticks.
+THOUSAND_BTC = 1_000 * 100_000   # 1,000 BTC in quantity ticks.
 
 
 def test_example_d_realistic_extremes_pass() -> None:
-    """Cap 10^8 ticks (1,000 BTC) at 10^7 price ticks over H = 300: 3e17 and 1e16, inside int64."""
+    """A 10^8-tick cap (1,000 BTC) at 10^7 price ticks over 300 buckets stays inside int64.
+
+    The cash bound is 3e17 and the fee bound 1e16, both below ``INT64_MAX``.
+    """
     spec = EpisodeSpec(side=1, target_qty_ticks=THOUSAND_BTC)
-    max_total = THOUSAND_BTC * 10  # so the 10 % cap is exactly 1,000 BTC
+    max_total = THOUSAND_BTC * 10  # The 10 % cap is then exactly 1,000 BTC.
     assert participation_cap_ticks(max_total, spec.participation_cap_bps) == 10**8
     assert 300 * 10**8 * 10**7 == 3 * 10**17 < contract.INT64_MAX
     assert 10**8 * 10**7 * 10 == 10**16 < contract.INT64_MAX
@@ -135,7 +142,11 @@ def test_example_d_realistic_extremes_pass() -> None:
 
 
 def test_cash_bound_raises_for_the_million_record_stress_pattern() -> None:
-    """One bucket of 1,000,000 records at the canonical day's extremes wraps over 300 steps."""
+    """One bucket of 1,000,000 records at the canonical day's price and size extremes overflows.
+
+    The cap times the price over 300 steps exceeds ``INT64_MAX``, so the bounds
+    check must raise before any arithmetic wraps.
+    """
     price = round(97_839.50 * contract.PRICE_SCALE)
     total = 1_000_000 * round(18.89042 * contract.QUANTITY_SCALE)
     spec = EpisodeSpec(side=1, target_qty_ticks=1)
@@ -146,7 +157,7 @@ def test_cash_bound_raises_for_the_million_record_stress_pattern() -> None:
 
 
 def test_fee_bound_is_checked_separately_from_cash() -> None:
-    price, total = 10**9, 10**10  # cap 10^9; cap * price = 10^18 fits, x fee 10 does not
+    price, total = 10**9, 10**10  # Cap 10^9; cap x price = 10^18 fits, times fee 10 does not.
     spec = EpisodeSpec(side=1, target_qty_ticks=1, horizon_buckets=1)
     with pytest.raises(OverflowError, match="int64 fee bound exceeded"):
         check_episode_bounds(spec, price, total)
@@ -156,7 +167,7 @@ def test_fee_bound_is_checked_separately_from_cash() -> None:
 
 
 def test_slippage_counts_toward_the_worst_price() -> None:
-    """cap 10^9 x price 10^9 = 10^18 fits; a slippage of 9 x 10^9 ticks pushes it to 10^19."""
+    """Cap 10^9 x price 10^9 = 10^18 fits; a slippage of 9 x 10^9 ticks pushes it to 10^19."""
     spec = EpisodeSpec(side=1, target_qty_ticks=1, horizon_buckets=1, fee_bps=0, slippage_ticks=1)
     check_episode_bounds(spec, 10**9 - 1, 10**10)
     with pytest.raises(OverflowError, match="cash bound"):

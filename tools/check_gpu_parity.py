@@ -1,16 +1,20 @@
-"""Quick GPU parity check for both kernel paths.
+"""GPU parity check of both kernel entry points against the NumPy reference.
 
-Run with: python tools/check_gpu_parity.py (requires CUDA and Triton).
+Usage:
+    python tools/check_gpu_parity.py    (requires CUDA and Triton)
 
 For each profile and seed, a 1,000-bucket workload is aggregated on CUDA
 through the checked API (``kernels.launch_aggregate``) and through the
-prepared path (``prepared.prepare(...).execute()``), and both are compared
-with the NumPy reference: integers exactly, VWAP within the contract
-tolerance. Burst workloads carry buckets beyond the one-pass tile and
-exercise the two-pass kernels; sparse and uniform exercise the one-pass
-kernel. The dispatch path and pass-1 chunk count are printed so the log
-shows which kernels ran. The pytest GPU suite is the thorough check; this
-script is the one-screen summary for a verification log.
+prepared path (``prepared.prepare(...).execute()``), and both results are
+compared with the NumPy reference: integer features exactly, VWAP within the
+contract tolerance. Burst workloads contain buckets longer than the one-pass
+tile and exercise the two-pass kernels; sparse and uniform workloads exercise
+the one-pass kernel. The dispatch path and the pass-1 chunk count are printed
+so the log records which kernels ran.
+
+The pytest GPU suite is the exhaustive check; this script is the one-screen
+summary for a verification log. It refuses to start without a CUDA device
+and exits non-zero on the first mismatch (an uncaught ``AssertionError``).
 """
 
 import sys
@@ -27,10 +31,11 @@ if not torch.cuda.is_available():
 from tapeforge import contract, generate, prepared, reference, windows  # noqa: E402
 from tapeforge.kernels import launch_aggregate, plan_dispatch  # noqa: E402
 
-N_BUCKETS = 1_000
+N_BUCKETS = 1_000  # Buckets per workload, for every profile and seed.
 
 
 def _assert_matches(got: dict[str, torch.Tensor], expected: reference.Features) -> None:
+    """Assert every feature in ``got`` matches ``expected`` with the contract tolerances."""
     for name in contract.FEATURE_NAMES:
         actual = got[name].cpu().numpy()
         target = getattr(expected, name)
@@ -44,12 +49,16 @@ def _assert_matches(got: dict[str, torch.Tensor], expected: reference.Features) 
 
 
 def check(profile: str, seed: int) -> None:
-    """Aggregate one workload through both entry points and assert parity; print the path.
+    """Aggregate one workload through both entry points, assert parity and print the path.
+
+    Args:
+        profile: Generator profile (``sparse``, ``uniform`` or ``burst``).
+        seed: Generator seed.
 
     Raises:
-        AssertionError: a feature differs from the NumPy reference beyond the
-            contract tolerance, or the prepared path chose another dispatch
-            than ``plan_dispatch`` predicts.
+        AssertionError: A feature differs from the NumPy reference beyond the
+            contract tolerance, or the prepared path chose a different
+            dispatch than ``plan_dispatch`` predicts.
     """
     trades = generate.generate_trades(seed=seed, n_buckets=N_BUCKETS, profile=profile)
     offsets = windows.build_offsets(
@@ -68,7 +77,7 @@ def check(profile: str, seed: int) -> None:
     ready = prepared.prepare(columns, gpu_offsets)
     assert ready.path == plan.path
     _assert_matches(ready.execute(), expected)
-    _assert_matches(ready.execute(), expected)  # buffer reuse
+    _assert_matches(ready.execute(), expected)  # Second execute: buffer reuse must match.
 
     detail = (
         f"block_size {plan.block_size}"

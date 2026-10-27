@@ -1,8 +1,11 @@
-"""Hand-calculated oracles: the worksheet tables, asserted exactly in cash ticks.
+"""Tests for tapeforge.execution.simulator against the hand-verified reference fixture, asserted
+exactly in cash ticks.
 
-Examples (a) buy, (b) sell, (c) partial completion with the three residual
-rules, (e) invalid bucket and the 5,002.5 -> 5,003 fee case, plus the
-baselines-as-tests (TWAP, immediate, all-zero) on the example (a) tape.
+Cases: (a) a buy under TWAP, (b) the same episode as a sell, (c) partial
+completion under the three residual rules, (e) an invalid bucket and the
+5,002.5 -> 5,003 fee case, plus the TWAP, immediate and all-zero policies on
+the case (a) tape. Every expected value is a row of the reference tables in
+``test_execution.tapes``.
 """
 
 from __future__ import annotations
@@ -35,10 +38,10 @@ from test_execution.tapes import (
     worksheet_tape,
 )
 
-# --- (a) BUY 3.00000 BTC over 3 buckets, TWAP ----------------------------------
+# --- case (a): buy 3.00000 BTC over 3 buckets under TWAP -----------------------
 
 BUY_TABLE = [
-    # fill qty, notional,      fee,       cash after,     inventory, remaining
+    # Fill qty, notional,      fee,       cash after,     inventory, remaining.
     (100_000, 1_000_200_000, 1_000_200, -1_001_200_200, 100_000, 200_000),
     (100_000, 1_000_500_000, 1_000_500, -2_002_700_700, 200_000, 100_000),
     (100_000, 1_000_100_000, 1_000_100, -3_003_800_800, 300_000, 0),
@@ -63,7 +66,7 @@ def test_example_a_buy_twap_table() -> None:
     assert final.fees_ticks == 3_000_800
     assert implementation_shortfall(final, spec) == BUY_IS
     assert shortfall_bps(BUY_IS, P0, Q_STAR) == pytest.approx(12.669, abs=1e-3)
-    # Paper portfolio at P_0 minus real portfolio is the shortfall.
+    # The paper portfolio at the arrival price minus the real portfolio is the shortfall.
     assert final.cash_ticks + final.inventory_ticks * P0 == -BUY_IS
     assert results[-1].terminated and not results[-1].truncated
 
@@ -78,14 +81,18 @@ def test_example_a_reward_decomposition() -> None:
 
 
 def test_example_a_risk_term_accrues_on_remaining_quantity() -> None:
-    """Worksheet: remaining after each step is 2/3, 1/3, 0 of Q*; lambda per quantity tick."""
+    """The risk term charges ``risk_lambda`` per remaining quantity tick after each step.
+
+    Remaining quantity after each step is 2/3, 1/3 and 0 of the target, so the
+    total risk charge is ``risk_lambda`` times the target.
+    """
     spec, market = worksheet_spec(side=1, risk_lambda=7), worksheet_tape()
     _, results = rollout(spec, market, twap_policy)
     assert [r.risk_component for r in results] == [7 * 200_000, 7 * 100_000, 0]
     assert sum(r.reward_ticks for r in results) == -BUY_IS - 7 * Q_STAR
 
 
-# --- (b) the same episode as a SELL -------------------------------------------
+# --- case (b): the same episode as a sell --------------------------------------
 
 SELL_TABLE = [
     (100_000, 1_000_200_000, 1_000_200, 999_199_800, 200_000, 200_000),
@@ -109,17 +116,17 @@ def test_example_b_sell_mirror_table() -> None:
         assert spec.target_qty_ticks - state.filled_qty_ticks == remaining
     final = states[-1]
     assert implementation_shortfall(final, spec) == SELL_IS
-    assert SELL_IS != BUY_IS  # a simulator that forgets the sign flip reports 12.67 bps twice
+    assert SELL_IS != BUY_IS  # A simulator that forgets the sign flip reports 12.67 bps twice.
     assert shortfall_bps(SELL_IS, P0, Q_STAR) == pytest.approx(7.336, abs=1e-3)
-    # Paper proceeds P_0 * Q* minus real cash is the shortfall.
+    # Paper proceeds at the arrival price minus real cash are the shortfall.
     assert P0 * Q_STAR - final.cash_ticks == SELL_IS
     assert sum(r.reward_ticks for r in results) == -SELL_IS
 
 
-# --- (c) partial completion: the liquidity cap binds ---------------------------
+# --- case (c): partial completion because the liquidity cap binds --------------
 
 PARTIAL_TABLE = [
-    # total,   cap,    submitted, fill,   notional,    fee,     cash after,     remaining
+    # Total,   cap,    submitted, fill,   notional,    fee,     cash after,     remaining.
     (600_000, 60_000, 100_000, 60_000, 600_120_000, 600_120, -600_720_120, 240_000),
     (400_000, 40_000, 100_000, 40_000, 400_200_000, 400_200, -1_001_320_320, 200_000),
     (800_000, 80_000, 100_000, 80_000, 800_080_000, 800_080, -1_802_200_400, 120_000),
@@ -129,6 +136,7 @@ RESIDUAL = 120_000
 
 
 def _partial(mu: int = 0) -> tuple[list, list, object]:
+    """Run the case (c) fixed schedule on the thin tape with ``residual_mu`` set to ``mu``."""
     spec = worksheet_spec(side=1, residual_mu=mu)
     market = worksheet_tape(totals=[row[0] for row in PARTIAL_TABLE])
     states, results = rollout(spec, market, schedule_policy(100_000))
@@ -155,12 +163,13 @@ def test_example_c_cap_binds_and_the_horizon_ends_with_residual() -> None:
 
 
 def test_example_c_residual_rules_reproduce_the_table() -> None:
-    # R1 forced buy of 120,000 at P_T + kappa = 10,020 with fees
+    # Rule R1: forced buy of the 120,000 residual at terminal mark + kappa = 10,020, with fees.
     assert residual_forced_liquidation(1, P0, P_T, RESIDUAL, kappa=10, fee_bps=10) == 3_602_400
-    # R2 Perold opportunity cost, mu = 0 / mu = 20
+    # Rule R2: the Perold residual term (the residual-inventory term of the
+    # implementation-shortfall decomposition) with ``mu`` 0 and 20.
     assert residual_perold(1, P0, P_T, RESIDUAL, mu=0) == 1_200_000
     assert residual_perold(1, P0, P_T, RESIDUAL, mu=20) == 3_600_000
-    # R3 fixed penalty only
+    # Rule R3: a fixed penalty per residual tick only.
     assert residual_fixed_penalty(RESIDUAL, mu=20) == 2_400_000
     totals = {
         "R1": IS_FILLED + 3_602_400,
@@ -184,7 +193,11 @@ def test_example_c_accepted_rule_is_perold_with_mu() -> None:
 
 
 def test_example_c_falling_terminal_price_rewards_inaction_when_mu_is_zero() -> None:
-    """Documented incentive, not a bug: with P_T = 9,990 and mu = 0 the IS drops below IS_filled."""
+    """A terminal mark of 9,990 with ``residual_mu`` 0 pushes the shortfall below the filled value.
+
+    This is the documented incentive of the residual rule, not a defect: a zero
+    ``residual_mu`` rewards leaving quantity unfilled when the price falls.
+    """
     spec = worksheet_spec(side=1, residual_mu=0)
     market = worksheet_tape(totals=[row[0] for row in PARTIAL_TABLE], after=[(DEEP, 9_990)])
     states, results = rollout(spec, market, schedule_policy(100_000))
@@ -199,7 +212,7 @@ def test_shortfall_with_residual_needs_a_terminal_price() -> None:
         implementation_shortfall(states[-1], spec)
 
 
-# --- (e) zero-liquidity and sub-tick-liquidity buckets --------------------------
+# --- case (e): zero-liquidity and sub-tick-liquidity buckets --------------------
 
 
 def test_example_e_invalid_bucket_consumes_the_decision_without_a_fill() -> None:
@@ -231,10 +244,10 @@ def test_example_e_sub_tick_liquidity_fee_rounds_up_to_5003() -> None:
     assert tiny.fill_qty_ticks == 500
     assert tiny.fill_price_ticks == 10_005
     assert tiny.notional_ticks == 5_002_500
-    assert tiny.fee_ticks == 5_003  # ceil(5,002.5); floor would give 5,002
+    assert tiny.fee_ticks == 5_003  # ceil(5,002.5); floor would give 5,002.
 
 
-# --- baselines as tests ---------------------------------------------------------
+# --- reference policies on the case (a) tape ------------------------------------
 
 
 def test_twap_baseline_gives_the_tabulated_shortfall() -> None:
@@ -244,7 +257,11 @@ def test_twap_baseline_gives_the_tabulated_shortfall() -> None:
 
 
 def test_immediate_baseline_fills_as_fast_as_the_cap_allows() -> None:
-    """Submit everything: 200,000 (the 10 % cap) at 10,002, then the last 100,000 at 10,005."""
+    """Submitting everything fills 200,000 (the 10 % cap) at 10,002, then 100,000 at 10,005.
+
+    The fully filled shortfall exceeds the TWAP shortfall on this tape, and a
+    further step after termination raises ``EpisodeOver``.
+    """
     spec, market = worksheet_spec(side=1), worksheet_tape()
     states, results = rollout(spec, market, immediate_policy)
     assert [r.submitted_qty_ticks for r in results] == [300_000, 100_000]
@@ -255,7 +272,7 @@ def test_immediate_baseline_fills_as_fast_as_the_cap_allows() -> None:
     fully_filled_is = (3_000_900_000 - P0 * Q_STAR) + 3_000_900
     assert fully_filled_is == 3_900_900
     assert implementation_shortfall(states[-1], spec) == fully_filled_is
-    assert fully_filled_is > BUY_IS  # paying for speed on this tape
+    assert fully_filled_is > BUY_IS  # Speed costs more than patience on this tape.
     with pytest.raises(EpisodeOver):
         step(states[-1], 1.0, market, spec)
 

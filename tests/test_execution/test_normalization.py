@@ -1,4 +1,10 @@
-"""Normalisation statistics come from the training split only."""
+"""Tests for tapeforge.execution.normalization: observation statistics are computed from training
+draws only, ``normalize`` centres and scales with a unit divisor for constant fields, and the
+statistics round-trip through JSON.
+
+``_splits`` builds four synthetic days whose validation and test seeds can change
+independently of the training days.
+"""
 
 from __future__ import annotations
 
@@ -25,6 +31,11 @@ DATES = ("2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04")
 
 
 def _splits(validation_seed: int = 50, test_seed: int = 60) -> Splits:
+    """Build splits over four synthetic days: two train, one validation, one test.
+
+    The validation and test seeds are parameters so their data can change while
+    the training days stay fixed.
+    """
     days = [
         synthetic_day(1, DATES[0], 80, start_us=0),
         synthetic_day(2, DATES[1], 80, start_us=80 * W),
@@ -121,7 +132,7 @@ def test_normalized_training_observations_have_zero_mean_and_unit_variance() -> 
     np.testing.assert_allclose(matrix.mean(axis=0), 0.0, atol=1e-9)
     varying = np.array(stats.std) > 0
     np.testing.assert_allclose(matrix.std(axis=0)[varying], 1.0, atol=1e-9)
-    assert varying.sum() >= 5   # most fields vary across the sampled episodes
+    assert varying.sum() >= 5   # Most fields vary across the sampled episodes.
 
 
 def test_a_constant_tape_gives_zero_std_everywhere_but_time() -> None:

@@ -1,20 +1,24 @@
-"""Immutable data carried through an episode: the tape slice, the state, a step.
+"""Immutable data carried through an episode: the tape slice, the state and a step record.
 
 ``MarketSlice`` holds the per-bucket features of exactly the buckets one
-episode may touch, indexed relative to the episode start ``t_0``:
+episode may touch, indexed relative to the episode's first decision bucket::
 
     array index i  <->  episode bucket b = i - origin
 
 Buckets ``b < 0`` precede the first decision (reference volume, arrival
-price), buckets ``0 <= b < H`` are the decision buckets, and buckets ``b >= H``
-hold latency fills and the terminal mark. All integer fields are int64 ticks;
-``vwap_ticks`` is the bucket VWAP rounded half-up to a price tick by
-``vwap_ticks_from_numerators`` (exact integer arithmetic, no floating point).
+price), buckets ``0 <= b < horizon_buckets`` are the decision buckets, and
+buckets ``b >= horizon_buckets`` hold latency fills and the terminal mark.
 
-``State`` and ``StepResult`` are frozen dataclasses of Python ``int`` so that
-``==`` is exact equality of the accounting and a replayed episode is
-byte-identical to the original. Nothing here is mutated; ``simulator.step``
-returns new objects.
+Data contract:
+    All integer fields are int64 ticks. ``vwap_ticks`` is the bucket VWAP
+    rounded half-up to a price tick by ``vwap_ticks_from_numerators`` using
+    exact integer arithmetic; no floating point enters the slice.
+
+Invariants:
+    ``State`` and ``StepResult`` are frozen dataclasses of Python ``int``, so
+    ``==`` is exact equality of the accounting and a replayed episode is
+    byte-identical to the original. Nothing in this module is mutated;
+    ``simulator.step`` returns new objects.
 """
 
 from __future__ import annotations
@@ -35,19 +39,28 @@ __all__ = [
 
 
 def vwap_ticks_from_numerators(numerators: np.ndarray, total_quantity: np.ndarray) -> np.ndarray:
-    """Bucket VWAP in whole price ticks: ``round_half_up(numerator / total)``.
+    """Return each bucket's VWAP in whole price ticks, rounded half-up.
 
-    ``numerators`` is the exact int64 ``sum(price_ticks * quantity_ticks)`` per
-    bucket (``reference.vwap_numerators``) and ``total_quantity`` the exact
-    quantity sum. Buckets with zero quantity map to 0, matching the engine's
-    ``vwap == 0.0`` convention. The rounding is done with integer arithmetic
-    only, ``(2 * numerator + total) // (2 * total)``, so the result does not
-    depend on floating-point evaluation order and a half-tick VWAP always
-    rounds up. This quantisation is part of the synthetic fill assumption: a
-    fill price must lie on the exchange tick grid.
+    ``numerators`` is the exact int64 ``sum(price_ticks * quantity_ticks)``
+    per bucket (``reference.vwap_numerators``) and ``total_quantity`` the
+    exact quantity sum. Buckets with zero quantity map to 0, matching the
+    feature engine's ``vwap == 0.0`` convention. The rounding uses integer
+    arithmetic only, ``(2 * numerator + total) // (2 * total)``, so the result
+    does not depend on floating-point evaluation order and a half-tick VWAP
+    always rounds up. The quantisation is part of the synthetic fill
+    assumption: a fill price must lie on the exchange tick grid.
+
+    Args:
+        numerators: 1-D int64 array of per-bucket VWAP numerators.
+        total_quantity: 1-D int64 array of per-bucket total quantity, in
+            quantity ticks, with the same length as ``numerators``.
+
+    Returns:
+        1-D int64 array of price ticks, one per bucket.
 
     Raises:
-        ValueError: shape or dtype mismatch, or a negative input.
+        ValueError: The arrays differ in shape, are not 1-D, are not int64, or
+            contain a negative value.
     """
     numerators = np.asarray(numerators)
     total_quantity = np.asarray(total_quantity)
@@ -68,6 +81,7 @@ def vwap_ticks_from_numerators(numerators: np.ndarray, total_quantity: np.ndarra
 
 
 def _read_only_int64(values: np.ndarray, name: str) -> np.ndarray:
+    """Return a read-only int64 copy of ``values``, which must be 1-D (``ValueError``)."""
     array = np.array(values, dtype=np.int64, copy=True)
     if array.ndim != 1:
         raise ValueError(f"{name} must be 1-D, got shape {array.shape}")
@@ -77,28 +91,42 @@ def _read_only_int64(values: np.ndarray, name: str) -> np.ndarray:
 
 @dataclass(frozen=True, eq=False)
 class MarketSlice:
-    """Features of the buckets one episode may read, relative to ``origin``.
+    """Per-bucket features of the buckets one episode may read, relative to ``origin``.
 
-    ``origin`` is the number of buckets before the first decision bucket, so
-    episode bucket ``b`` lives at array index ``b + origin``. Arrays are
-    copied and made read-only at construction; invalid buckets must be all
-    zeros, exactly as the feature engine emits them.
+    Arrays are copied and made read-only at construction, and the instance is
+    frozen, so a slice can be shared between episodes and replays. Invalid
+    buckets must be all zeros, exactly as the feature engine emits them.
+    Equality is identity (``eq=False``); compare the arrays directly.
+
+    Attributes:
+        event_count: int64, records per bucket.
+        total_quantity: int64 quantity ticks traded in the bucket.
+        signed_quantity: int64 quantity ticks, taker-signed; its magnitude
+            never exceeds ``total_quantity``.
+        vwap_ticks: int64 price ticks; 0 where no quantity traded.
+        valid: bool, ``True`` exactly where ``event_count > 0``.
+        origin: Number of buckets before the first decision bucket, so
+            episode bucket ``b`` lives at array index ``b + origin``. In
+            ``[0, n_buckets]``.
     """
 
-    event_count: np.ndarray      # int64, records per bucket
-    total_quantity: np.ndarray   # int64 quantity ticks
-    signed_quantity: np.ndarray  # int64 quantity ticks, taker-signed
-    vwap_ticks: np.ndarray       # int64 price ticks, 0 where no quantity traded
-    valid: np.ndarray            # bool, False for an empty bucket
+    event_count: np.ndarray      # int64; records per bucket.
+    total_quantity: np.ndarray   # int64 quantity ticks.
+    signed_quantity: np.ndarray  # int64 quantity ticks, taker-signed.
+    vwap_ticks: np.ndarray       # int64 price ticks; 0 where no quantity traded.
+    valid: np.ndarray            # bool; False for an empty bucket.
     origin: int
 
     def __post_init__(self) -> None:
         """Copy, freeze and validate the arrays.
 
         Raises:
-            ValueError: ragged lengths, wrong dtypes, a negative value, an
-                ``origin`` outside ``[0, n_buckets]``, or an invalid bucket
-                carrying non-zero features.
+            TypeError: ``origin`` is not an integer.
+            ValueError: Ragged lengths, wrong dtypes, a negative value, an
+                ``origin`` outside ``[0, n_buckets]``, ``valid`` disagreeing
+                with ``event_count > 0``, an invalid bucket carrying non-zero
+                features, ``|signed_quantity| > total_quantity``, or a
+                zero-quantity bucket with a non-zero VWAP.
         """
         n = len(self.event_count)
         for name in ("event_count", "total_quantity", "signed_quantity", "vwap_ticks"):
@@ -136,12 +164,17 @@ class MarketSlice:
 
     @classmethod
     def from_features(cls, features: Features, numerators: np.ndarray, origin: int) -> MarketSlice:
-        """Build from the feature engine's output plus the exact VWAP numerators.
+        """Build a slice from the feature engine's output and the exact VWAP numerators.
 
-        ``features`` is ``reference.aggregate_reference(trades, offsets)`` and
-        ``numerators`` is ``reference.vwap_numerators(trades, offsets)`` on
-        the same inputs; the float ``features.vwap`` is not used, so the slice
-        never depends on floating-point rounding.
+        Args:
+            features: ``reference.aggregate_reference(trades, offsets)``.
+            numerators: ``reference.vwap_numerators(trades, offsets)`` on the
+                same inputs. The float ``features.vwap`` is not used, so the
+                slice never depends on floating-point rounding.
+            origin: Number of buckets before the first decision bucket.
+
+        Returns:
+            A validated, read-only ``MarketSlice``.
         """
         return cls(
             event_count=features.event_count,
@@ -154,23 +187,23 @@ class MarketSlice:
 
     @property
     def n_buckets(self) -> int:
-        """Buckets in the slice, before and after ``t_0`` together."""
+        """Return the number of buckets in the slice, before and after the first decision."""
         return int(self.event_count.size)
 
     @property
     def n_after(self) -> int:
-        """Buckets at or after the first decision bucket (``b >= 0``)."""
+        """Return the number of buckets at or after the first decision bucket (``b >= 0``)."""
         return self.n_buckets - self.origin
 
     def has_bucket(self, bucket: int) -> bool:
-        """Whether episode bucket ``bucket`` (relative to ``t_0``) is in the slice."""
+        """Return whether episode bucket ``bucket`` lies inside the slice."""
         return -self.origin <= bucket < self.n_after
 
     def index(self, bucket: int) -> int:
-        """Array index of episode bucket ``bucket``.
+        """Return the array index of episode bucket ``bucket``.
 
         Raises:
-            IndexError: the bucket is not in the slice.
+            IndexError: The bucket is not in the slice.
         """
         if not self.has_bucket(bucket):
             raise IndexError(
@@ -179,7 +212,7 @@ class MarketSlice:
         return bucket + self.origin
 
     def vwap(self, bucket: int) -> float:
-        """VWAP of a bucket in quote units, for display only (never for accounting)."""
+        """Return a bucket's VWAP in quote units, for display only (never for accounting)."""
         return int(self.vwap_ticks[self.index(bucket)]) / PRICE_SCALE
 
     def with_bucket(
@@ -191,10 +224,15 @@ class MarketSlice:
         signed_quantity: int | None = None,
         vwap_ticks: int | None = None,
     ) -> MarketSlice:
-        """Return a copy with one bucket's fields replaced (tests perturb tapes this way).
+        """Return a copy with one bucket's fields replaced.
 
-        ``valid`` is recomputed from ``event_count``. Fields left ``None`` keep
-        their value; the result is validated like any other slice.
+        Tests perturb tapes this way. ``valid`` is recomputed from
+        ``event_count``. Fields left ``None`` keep their value; the result is
+        validated like any other slice.
+
+        Raises:
+            IndexError: ``bucket`` is not in the slice.
+            ValueError: The replacement violates a slice invariant.
         """
         i = self.index(bucket)
         columns = {
@@ -220,46 +258,89 @@ class State:
     """Accounting state after ``step`` decisions. Every field is a Python ``int``.
 
     ``cash_ticks`` falls by ``side * notional + fee`` on every fill and
-    ``inventory_ticks`` rises by ``side * fill``; ``exec_notional_ticks``,
-    ``filled_qty_ticks`` and ``fees_ticks`` accumulate the same fills so the
+    ``inventory_ticks`` rises by ``side * fill``. ``exec_notional_ticks``,
+    ``filled_qty_ticks`` and ``fees_ticks`` accumulate the same fills, so the
     implementation shortfall can be read without replaying. The mark price is
-    the VWAP of the newest *valid* bucket the agent has been allowed to see,
-    and ``mark_age`` counts how many visible buckets have passed since it (0
-    when the newest visible bucket is itself valid).
+    the VWAP of the newest *priced* bucket (valid, with quantity) the policy
+    has been allowed to see, and ``mark_age`` counts how many visible buckets
+    have passed since it (0 when the newest visible bucket is itself priced).
+
+    Attributes:
+        step: Decisions taken so far, in ``[0, horizon_buckets]``.
+        inventory_ticks: Signed position, in quantity ticks.
+        cash_ticks: Signed cash balance, in cash ticks; zero at reset.
+        fees_ticks: Cumulative fees paid, in cash ticks.
+        filled_qty_ticks: Cumulative filled quantity, in quantity ticks;
+            never negative.
+        exec_notional_ticks: Cumulative ``sum(fill_price * fill_qty)``, in
+            cash ticks.
+        arrival_price_ticks: Arrival price in price ticks, fixed at reset.
+        mark_price_ticks: VWAP of the newest priced visible bucket, in price
+            ticks.
+        mark_age: Visible buckets since the mark bucket closed.
     """
 
-    step: int                     # decisions taken so far, 0 .. H
-    inventory_ticks: int          # signed position, quantity ticks
-    cash_ticks: int               # signed, cash ticks
-    fees_ticks: int               # cumulative fees paid, cash ticks
-    filled_qty_ticks: int         # cumulative filled quantity, >= 0
-    exec_notional_ticks: int      # cumulative sum(fill_price * fill_qty), cash ticks
-    arrival_price_ticks: int      # P_0, fixed at reset
-    mark_price_ticks: int         # last valid visible VWAP, price ticks
-    mark_age: int                 # visible buckets since the mark bucket closed
+    step: int                     # Decisions taken so far, 0 .. horizon_buckets.
+    inventory_ticks: int          # Signed position, quantity ticks.
+    cash_ticks: int               # Signed, cash ticks.
+    fees_ticks: int               # Cumulative fees paid, cash ticks.
+    filled_qty_ticks: int         # Cumulative filled quantity, >= 0.
+    exec_notional_ticks: int      # Cumulative sum(fill_price * fill_qty), cash ticks.
+    arrival_price_ticks: int      # Arrival price, fixed at reset.
+    mark_price_ticks: int         # Newest priced visible VWAP, price ticks.
+    mark_age: int                 # Visible buckets since the mark bucket closed.
 
 
 @dataclass(frozen=True)
 class StepResult:
-    """What one decision did, with the reward split into its three terms.
+    """Record of one decision, with the reward split into its three terms.
 
-    Signs: ``cost_component`` is ``side * (notional - P_0 * fill) + fee``
+    Signs: ``cost_component`` is
+    ``side * (notional_ticks - arrival_price_ticks * fill_qty_ticks) + fee_ticks``
     (positive is a cost for both sides), ``risk_component`` is
-    ``lambda * remaining_after`` (``>= 0``) and ``terminal_component`` is the
-    residual term at the horizon (zero before it and when nothing is left).
-    ``reward_ticks == -(cost_component + risk_component + terminal_component)``
-    exactly, so over a terminated episode
-    ``sum(reward) == -IS - lambda * sum(remaining_after)``.
+    ``risk_lambda * remaining_after`` (``>= 0``) and ``terminal_component`` is
+    the residual term at the horizon (zero before it and when nothing is
+    left). ``reward_ticks == -(cost_component + risk_component +
+    terminal_component)`` exactly, so over a terminated episode
+    ``sum(reward_ticks) == -shortfall - risk_lambda * sum(remaining_after)``,
+    with ``shortfall`` the implementation shortfall.
 
     ``terminated`` and ``truncated`` are never both set. ``fill_price_ticks``
     and ``terminal_price_ticks`` are 0 when there was no fill or no terminal
     mark was needed or available.
+
+    Attributes:
+        step: The decision index ``t``, in ``[0, horizon_buckets)``.
+        fill_bucket: ``step + latency_buckets``; the bucket the order
+            executed in.
+        submitted_qty_ticks: ``floor(action * remaining_before)``, in
+            quantity ticks.
+        cap_qty_ticks: Liquidity cap of the fill bucket, in quantity ticks
+            (0 when the bucket is not priced).
+        fill_qty_ticks: Quantity filled, ``min(submitted, cap)``.
+        fill_price_ticks: Fill price in price ticks, including slippage; 0
+            without a fill.
+        notional_ticks: ``fill_price_ticks * fill_qty_ticks``, in cash ticks.
+        fee_ticks: Taker fee on the notional, in cash ticks.
+        cost_component: Shortfall of this fill against the arrival price plus
+            the fee, in cash ticks.
+        risk_component: ``risk_lambda * remaining_after``, in cash ticks.
+        terminal_component: Residual term charged at the horizon, in cash
+            ticks; zero otherwise.
+        terminal_price_ticks: Terminal mark used for the residual term; 0
+            when none was needed or available.
+        reward_ticks: ``-(cost_component + risk_component +
+            terminal_component)``.
+        terminated: The target was filled or the horizon was reached, with a
+            terminal mark available if one was needed.
+        truncated: The fill bucket or a needed terminal mark lies outside the
+            slice.
     """
 
-    step: int                     # the decision index t, 0 .. H - 1
-    fill_bucket: int              # t + latency; the bucket the order executed in
-    submitted_qty_ticks: int      # floor(action * remaining_before)
-    cap_qty_ticks: int            # liquidity cap of the fill bucket (0 when invalid)
+    step: int                     # The decision index t, 0 .. horizon_buckets - 1.
+    fill_bucket: int              # step + latency_buckets; the bucket the order executed in.
+    submitted_qty_ticks: int      # floor(action * remaining_before).
+    cap_qty_ticks: int            # Liquidity cap of the fill bucket (0 when not priced).
     fill_qty_ticks: int
     fill_price_ticks: int
     notional_ticks: int

@@ -1,4 +1,9 @@
-"""Package imports and data contract checks."""
+"""Tests for package import and the data contract.
+
+Covers module imports (with and without torch/triton installed), the sign
+convention, the trade dtype and the int64 overflow bound at measured BTCUSDT
+magnitudes.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +18,7 @@ def test_package_imports_with_version() -> None:
 
 
 def test_every_module_imports() -> None:
-    """A stub must still import: the harness depends on it."""
+    """Every module imports even while it is a stub, because the harness imports all of them."""
     for name in (
         "contract",
         "generate",
@@ -46,12 +51,11 @@ def test_trade_dtype_carries_the_documented_fields() -> None:
 
 
 def test_scaled_integer_products_fit_in_int64_at_real_magnitudes() -> None:
-    """The contract's overflow bound, asserted against measured data, not unit values.
+    """The int64 overflow bound holds at measured BTCUSDT magnitudes, not at unit values.
 
-    The original version of this test multiplied PRICE_SCALE by
-    QUANTITY_SCALE -- a price of 1.0 and a quantity of 1.0 -- and so passed
-    happily while the committed scales overflowed int64 on a single row of
-    real BTCUSDT data. See planning/experiments.md E-002.
+    Multiplying ``PRICE_SCALE`` by ``QUANTITY_SCALE`` only checks a price of 1.0
+    and a quantity of 1.0, which passes for scales that overflow int64 on a
+    single row of real BTCUSDT data. The assertions use measured extremes.
     """
     max_i64 = np.iinfo(np.int64).max
 
@@ -70,13 +74,13 @@ def test_scaled_integer_products_fit_in_int64_at_real_magnitudes() -> None:
 
 
 def test_scales_match_the_precision_the_canonical_day_actually_uses() -> None:
-    """BTCUSDT: 2 price decimals, 5 quantity decimals (measured)."""
+    """BTCUSDT uses 2 price decimals and 5 quantity decimals, as measured on the canonical day."""
     assert contract.PRICE_SCALE == 10**2
     assert contract.QUANTITY_SCALE == 10**5
 
 
 def test_package_imports_without_torch_or_triton() -> None:
-    """CI installs no torch; every module must still import (GPU code is guarded)."""
+    """Every module imports with torch and triton absent, as in CI; GPU code paths are guarded."""
     import subprocess
     import sys
 

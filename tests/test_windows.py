@@ -1,4 +1,9 @@
-"""Packed window indexing and bucket boundaries."""
+"""Tests for ``tapeforge.windows``: packed offsets, bucket edges and lengths, validation.
+
+Oracles are the documented offsets example, ``_naive_offsets`` (a plain
+double loop with no ``searchsorted``), the committed BTCUSDT fixture and a
+Hypothesis property over arbitrary sorted timestamps.
+"""
 
 from __future__ import annotations
 
@@ -13,13 +18,14 @@ SEC = contract.US_PER_SECOND
 
 
 def test_documented_offsets_example() -> None:
-    """The documented example: offsets [0, 2, 2, 7] -- bucket 1 is empty."""
+    """The documented example gives offsets ``[0, 2, 2, 7]``; bucket 1 is empty."""
     ts = np.array([0, 0, 2, 2, 2, 2, 2], dtype=np.int64) * SEC
     offsets = windows.build_offsets(ts, 0, 3, SEC)
     np.testing.assert_array_equal(offsets, np.array([0, 2, 2, 7]))
 
 
 def test_offsets_length_is_n_buckets_plus_one() -> None:
+    """Offsets carry one sentinel entry beyond the last bucket."""
     ts = np.arange(10, dtype=np.int64) * SEC
     assert windows.build_offsets(ts, 0, 10, SEC).shape == (11,)
 
@@ -35,7 +41,7 @@ def test_offsets_are_monotonic_and_cover_every_record() -> None:
 def test_records_outside_the_window_are_excluded() -> None:
     ts = np.array([-5, 1, 2, 99], dtype=np.int64) * SEC
     offsets = windows.build_offsets(ts, 0, 3, SEC)
-    assert offsets[-1] - offsets[0] == 2  # only t=1s and t=2s are inside
+    assert offsets[-1] - offsets[0] == 2  # Only t=1s and t=2s fall inside [0s, 3s).
 
 
 def test_bucket_edges_are_exact_multiples_of_width() -> None:
@@ -44,7 +50,7 @@ def test_bucket_edges_are_exact_multiples_of_width() -> None:
 
 
 def test_offsets_are_indices_into_the_input_not_a_compacted_copy() -> None:
-    """offsets[0] is nonzero when records precede the window. Documented, tested."""
+    """``offsets[0]`` is nonzero when records precede the window; offsets index the input."""
     ts = np.array([-5, -3, 1, 2], dtype=np.int64) * SEC
     offsets = windows.build_offsets(ts, 0, 3, SEC)
     assert offsets[0] == 2
@@ -52,6 +58,7 @@ def test_offsets_are_indices_into_the_input_not_a_compacted_copy() -> None:
 
 
 def test_a_window_entirely_after_the_data_is_all_empty() -> None:
+    """A window past every record has zero-length buckets throughout."""
     ts = np.array([0, 1], dtype=np.int64) * SEC
     offsets = windows.build_offsets(ts, 100 * SEC, 5, SEC)
     np.testing.assert_array_equal(windows.bucket_lengths(offsets), np.zeros(5, dtype=np.int64))
@@ -65,6 +72,7 @@ def test_empty_input_gives_all_zero_offsets() -> None:
 # --- bucket_lengths ------------------------------------------------------
 
 def test_bucket_lengths_matches_the_documented_example() -> None:
+    """``bucket_lengths`` is the first difference of the documented offsets."""
     np.testing.assert_array_equal(
         windows.bucket_lengths(np.array([0, 2, 2, 7], dtype=np.int64)), [2, 0, 5]
     )
@@ -78,6 +86,7 @@ def test_bucket_lengths_rejects_a_degenerate_offsets_array() -> None:
 # --- validation ----------------------------------------------------------
 
 def test_non_monotonic_input_names_the_offending_record() -> None:
+    """Unsorted timestamps are rejected with the index and value of the offending record."""
     ts = np.array([0, 5, 3], dtype=np.int64) * SEC
     with pytest.raises(ValueError, match=r"record 2 \(3000000\) precedes record 1"):
         windows.build_offsets(ts, 0, 10, SEC)
@@ -101,10 +110,14 @@ def test_degenerate_geometry_is_rejected() -> None:
         windows.build_offsets(ts, 0, 2, 0)
 
 
-# --- cross-check against an independent brute-force implementation -------
+# --- cross-check against an independent brute-force oracle ----------------
 
 def _naive_offsets(ts: np.ndarray, start: int, n_buckets: int, width: int) -> list[int]:
-    """Deliberately dumb oracle: a plain loop, no searchsorted, no numpy tricks."""
+    """Count records before each bucket edge with a plain loop.
+
+    Deliberately shares nothing with ``build_offsets``: no ``searchsorted``
+    and no NumPy vectorization, so the two cannot fail the same way.
+    """
     out = []
     for b in range(n_buckets + 1):
         edge = start + b * width
@@ -118,6 +131,7 @@ def _naive_offsets(ts: np.ndarray, start: int, n_buckets: int, width: int) -> li
 
 @pytest.mark.parametrize("profile", ["sparse", "uniform", "burst"])
 def test_matches_a_brute_force_oracle_on_generated_data(profile: str) -> None:
+    """Generated workloads of every profile agree with the plain-loop oracle."""
     from tapeforge import generate
 
     trades = generate.generate_trades(seed=21, n_buckets=40, profile=profile)
@@ -126,7 +140,7 @@ def test_matches_a_brute_force_oracle_on_generated_data(profile: str) -> None:
 
 
 def test_matches_a_brute_force_oracle_on_the_real_fixture() -> None:
-    """Real archive rows, not just synthetic ones."""
+    """The committed archive fixture agrees with the plain-loop oracle."""
     from pathlib import Path
 
     from tapeforge import ingest
@@ -136,7 +150,7 @@ def test_matches_a_brute_force_oracle_on_the_real_fixture() -> None:
     start = int(trades["timestamp"][0]) // SEC * SEC
     offsets = windows.build_offsets(trades["timestamp"], start, 4, SEC)
     assert offsets.tolist() == _naive_offsets(trades["timestamp"], start, 4, SEC)
-    # The fixture was built with second 1 empty on purpose.
+    # The fixture deliberately leaves second 1 empty.
     np.testing.assert_array_equal(windows.bucket_lengths(offsets), [3, 0, 2, 0])
 
 
@@ -151,16 +165,17 @@ def test_matches_a_brute_force_oracle_on_the_real_fixture() -> None:
 def test_properties_hold_for_arbitrary_input(
     raw: list[int], n_buckets: int, width_s: int
 ) -> None:
+    """Shape, monotonicity, coverage and bucket membership hold for arbitrary sorted input."""
     ts = np.sort(np.array(raw, dtype=np.int64)) * SEC
     width = width_s * SEC
     offsets = windows.build_offsets(ts, 0, n_buckets, width)
     lengths = windows.bucket_lengths(offsets)
 
     assert offsets.shape == (n_buckets + 1,)
-    assert np.all(lengths >= 0)                       # monotonic offsets
-    assert offsets[-1] <= ts.size                     # never past the end
+    assert np.all(lengths >= 0)                       # Offsets are monotonic.
+    assert offsets[-1] <= ts.size                     # Never past the end.
     in_window = int(np.sum((ts >= 0) & (ts < n_buckets * width)))
-    assert int(lengths.sum()) == in_window            # covers every in-window record
+    assert int(lengths.sum()) == in_window            # Covers every in-window record.
 
     # Every record in a bucket's slice really belongs to that bucket.
     for b in range(n_buckets):

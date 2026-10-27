@@ -1,28 +1,29 @@
-"""Seeded synthetic trade generation.
+"""Seeded synthetic trade generation for tests, fixtures and benchmarks.
 
-Deterministic fixtures: the same seed always reproduces byte-identical
-``TRADE_DTYPE`` records (int64 microsecond timestamps, int64 price and
-quantity ticks, the raw ``buyer_is_maker`` flag, increasing ids). Covers the
-shapes that break naive implementations -- empty windows, duplicate
-timestamps, and large bursts. Prices follow a random walk around 100.00, so
-synthetic tapes say nothing about real market behaviour.
+``generate_trades`` is deterministic: the same seed and arguments always
+reproduce byte-identical ``TRADE_DTYPE`` records (int64 microsecond
+timestamps, int64 price and quantity ticks, the raw ``buyer_is_maker`` flag,
+increasing ids). The profiles cover the shapes that break naive
+implementations: empty windows, duplicate timestamps and large bursts.
+Prices follow a random walk around 100.00, so synthetic tapes carry no
+information about real market behaviour.
 
-Why the shapes matter
----------------------
-``sparse``   mean 0.5 records per bucket, so most buckets are empty. Catches
-             implementations that assume every bucket has data, and any
-             division by a zero record count.
-``uniform``  mean 50 records per bucket. The easy case, used as the baseline
-             when comparing against padded implementations.
-``burst``    mean 50, but a small fraction of buckets are Pareto-amplified
-             into thousands of records. This is the distribution that makes
-             padding to the longest bucket wasteful, and the one that forces
-             the two-pass reduction path on the GPU.
+Profiles:
+    ``sparse``   Mean 0.5 records per bucket, so most buckets are empty.
+                 Exposes implementations that assume every bucket has data,
+                 and any division by a zero record count.
+    ``uniform``  Mean 50 records per bucket. The easy case, used as the
+                 baseline when comparing against padded implementations.
+    ``burst``    Mean 50, but a small fraction of buckets are Pareto-amplified
+                 into thousands of records. This distribution makes padding
+                 to the longest bucket wasteful and forces the two-pass
+                 reduction path on the GPU.
 
-Event timestamps are quantized to ``EVENT_TIME_TICK_US`` (1 ms) inside each
-bucket, because an aggTrades row already aggregates fills that share a
-millisecond. That makes duplicate timestamps the norm rather than a rare
-edge case, which is what the real archive looks like.
+Data contract:
+    Event timestamps are quantized to ``EVENT_TIME_TICK_US`` (1 ms) inside
+    each bucket, because an aggTrades row already aggregates fills that share
+    a millisecond. Duplicate timestamps are therefore the norm rather than a
+    rare edge case, which matches the real archive.
 
 CLI:
     python -m tapeforge.generate --seed 7 --seconds 10 --profile burst
@@ -44,35 +45,35 @@ from tapeforge.contract import (
 )
 
 Profile = Literal["sparse", "uniform", "burst"]
-PROFILE_RATES: Final[dict[str, float]] = {
+PROFILE_RATES: Final[dict[str, float]] = {  # Poisson mean records per bucket.
     "sparse": 0.5,
     "uniform": 50.0,
     "burst": 50.0,
 }
 
-# Burst shape: what fraction of buckets erupt, and how hard.
-BURST_FRACTION: Final[float] = 0.02
-BURST_PARETO_SHAPE: Final[float] = 1.5
-BURST_MIN_MULTIPLIER: Final[int] = 20
+# Burst shape: the fraction of buckets that erupt, and how strongly.
+BURST_FRACTION: Final[float] = 0.02       # Probability that a bucket erupts.
+BURST_PARETO_SHAPE: Final[float] = 1.5    # Pareto tail index of the multiplier.
+BURST_MIN_MULTIPLIER: Final[int] = 20     # Smallest count multiplier of an erupting bucket.
 
-# Timestamp resolution within a bucket. 1 ms, matching aggTrades aggregation.
+# Timestamp resolution within a bucket: 1 ms, matching aggTrades aggregation.
 EVENT_TIME_TICK_US: Final[int] = 1_000
 
-# Price random walk, in price ticks. Starts at 100.0 and moves by a few cents.
+# Price random walk, in price ticks: starts at 100.00 and moves by one cent per step.
 START_PRICE_TICKS: Final[int] = 100 * PRICE_SCALE
-PRICE_STEP_TICKS: Final[int] = PRICE_SCALE // 100  # one cent
+PRICE_STEP_TICKS: Final[int] = PRICE_SCALE // 100  # One cent, in price ticks.
 
 # Quantity: lognormal around 1.0 unit, floored at one tick so it is positive.
 QUANTITY_LOG_MEAN: Final[float] = 0.0
 QUANTITY_LOG_SIGMA: Final[float] = 1.0
 
-AGG_TRADE_ID_START: Final[int] = 1
+AGG_TRADE_ID_START: Final[int] = 1  # First ``agg_trade_id``; ids increase by one.
 
 
 def _bucket_counts(
     rng: np.random.Generator, n_buckets: int, profile: Profile
 ) -> np.ndarray:
-    """Records per bucket, int64, shape ``(n_buckets,)``."""
+    """Draw the records per bucket as int64 of shape ``(n_buckets,)``."""
     counts = rng.poisson(PROFILE_RATES[profile], size=n_buckets).astype(np.int64)
     if profile != "burst":
         return counts
@@ -92,11 +93,21 @@ def generate_trades(
 ) -> np.ndarray:
     """Return a timestamp-sorted structured array of ``TRADE_DTYPE`` records.
 
-    Deterministic in ``seed`` alone, given identical other arguments.
+    Output is a deterministic function of ``seed`` given identical other
+    arguments.
+
+    Args:
+        seed: Seed for ``numpy.random.default_rng``.
+        n_buckets: Number of buckets to populate; must be positive.
+        profile: One of ``PROFILE_RATES``.
+        start_us: Timestamp of the first bucket edge, in microseconds.
+        width_us: Bucket width in microseconds; must be a positive multiple
+            of ``EVENT_TIME_TICK_US``.
 
     Raises:
-        ValueError: on a non-positive bucket count or width, or an unknown
-            profile -- fail fast rather than returning a degenerate array.
+        ValueError: ``n_buckets`` or ``width_us`` is not positive,
+            ``width_us`` is not a multiple of the event tick, or ``profile``
+            is unknown. Failing fast avoids returning a degenerate array.
     """
     if profile not in PROFILE_RATES:
         raise ValueError(f"unknown profile {profile!r}; expected one of {tuple(PROFILE_RATES)}")
@@ -117,14 +128,14 @@ def generate_trades(
     if n == 0:
         return trades
 
-    # Bucket start for each record, then a quantized offset inside the bucket.
+    # Each record gets its bucket's start plus a quantized offset inside the bucket.
     bucket_index = np.repeat(np.arange(n_buckets, dtype=np.int64), counts)
     ticks_per_bucket = width_us // EVENT_TIME_TICK_US
     offset_ticks = rng.integers(0, ticks_per_bucket, size=n, dtype=np.int64)
     timestamps = start_us + bucket_index * width_us + offset_ticks * EVENT_TIME_TICK_US
 
-    # Sort within buckets. bucket_index is already non-decreasing, so a stable
-    # sort on the timestamp alone leaves every record in its own bucket.
+    # Records are sorted within buckets. bucket_index is already non-decreasing,
+    # so a stable sort on the timestamp alone leaves every record in its bucket.
     order = np.argsort(timestamps, kind="stable")
 
     walk = rng.integers(-1, 2, size=n, dtype=np.int64).cumsum() * PRICE_STEP_TICKS
@@ -145,7 +156,11 @@ def generate_trades(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entry point: write a reproducible sample to disk as .npy."""
+    """Write a reproducible sample tape to disk as ``.npy`` and print its shape.
+
+    Returns:
+        Process exit status; 0 on success.
+    """
     parser = argparse.ArgumentParser(prog="python -m tapeforge.generate")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--seconds", type=int, default=10, help="number of 1s buckets")

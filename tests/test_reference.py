@@ -1,4 +1,11 @@
-"""CPU reference features checked against hand calculations and an independent loop."""
+"""Tests for ``tapeforge.reference``: CPU features against derived values and a plain loop.
+
+Oracles are the two-record reference example, closed-form values derived in
+each test body, independent arithmetic on the committed 5-row BTCUSDT fixture,
+and ``reference.aggregate_reference_naive``, which shares no vectorization with
+``reference.aggregate_reference``. The ``np.add.reduceat`` edge cases (window
+clipping, trailing empty buckets) are pinned individually.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +16,11 @@ from tapeforge import contract, reference, windows
 
 
 def _trades(rows: list[tuple[int, float, float, bool]]) -> np.ndarray:
-    """Build a TRADE_DTYPE array from (second, price, quantity, buyer_is_maker)."""
+    """Build a ``TRADE_DTYPE`` array from ``(second, price, quantity, buyer_is_maker)`` tuples.
+
+    Prices and quantities are given in real units and scaled to ticks; the
+    record index doubles as ``agg_trade_id``.
+    """
     out = np.zeros(len(rows), dtype=contract.TRADE_DTYPE)
     for i, (second, price, qty, bim) in enumerate(rows):
         out[i] = (
@@ -23,7 +34,7 @@ def _trades(rows: list[tuple[int, float, float, bool]]) -> np.ndarray:
 
 
 def test_toy_example() -> None:
-    """The hand-calculated toy example: 2 records, total 3, signed +1, vwap 100.666..."""
+    """The two-record reference example: count 2, total 3, signed +1, vwap 100.666..."""
     trades = _trades([(1, 100.0, 2.0, False), (1, 102.0, 1.0, True)])
     offsets = windows.build_offsets(
         trades["timestamp"],
@@ -43,6 +54,7 @@ def test_toy_example() -> None:
 
 
 def test_empty_bucket_is_invalid_and_zeroed() -> None:
+    """A bucket with no records is flagged invalid and every count and sum reads zero."""
     trades = _trades([(0, 100.0, 1.0, False), (2, 100.0, 1.0, False)])
     offsets = windows.build_offsets(
         trades["timestamp"], 0, 3, contract.DEFAULT_BUCKET_WIDTH_US
@@ -56,7 +68,7 @@ def test_empty_bucket_is_invalid_and_zeroed() -> None:
 
 
 def test_taker_sign_follows_buyer_is_maker() -> None:
-    """buyer_is_maker=True means the seller was the aggressor -> -1."""
+    """``buyer_is_maker=True`` means the seller was the aggressor, so the sign is -1."""
     signs = reference.taker_sign(np.array([True, False]))
     assert signs[0] == contract.SIGN_SELL_INITIATED
     assert signs[1] == contract.SIGN_BUY_INITIATED
@@ -72,6 +84,7 @@ def test_all_sell_initiated_gives_negative_signed_quantity() -> None:
 
 
 def test_zero_quantity_rows_do_not_produce_nan_vwap() -> None:
+    """A bucket whose only record has zero quantity reports a finite VWAP, not NaN."""
     trades = _trades([(0, 100.0, 0.0, False)])
     offsets = windows.build_offsets(
         trades["timestamp"], 0, 1, contract.DEFAULT_BUCKET_WIDTH_US
@@ -82,6 +95,7 @@ def test_zero_quantity_rows_do_not_produce_nan_vwap() -> None:
 
 
 def test_identical_timestamps_stay_in_one_bucket() -> None:
+    """Records sharing one timestamp all land in that timestamp's bucket."""
     trades = _trades([(5, 100.0, 1.0, False)] * 100)
     offsets = windows.build_offsets(
         trades["timestamp"], 0, 10, contract.DEFAULT_BUCKET_WIDTH_US
@@ -92,6 +106,7 @@ def test_identical_timestamps_stay_in_one_bucket() -> None:
 
 
 def test_burst_of_100_records_matches_closed_form() -> None:
+    """A 100-record bucket with unit quantities has a VWAP equal to the mean price."""
     rows = [(3, 100.0 + i, 1.0, i % 2 == 1) for i in range(100)]
     trades = _trades(rows)
     offsets = windows.build_offsets(
@@ -101,7 +116,7 @@ def test_burst_of_100_records_matches_closed_form() -> None:
 
     assert f.event_count[3] == 100
     assert f.total_quantity[3] == 100 * contract.QUANTITY_SCALE
-    assert f.signed_quantity[3] == 0  # 50 buys, 50 sells, equal size
+    assert f.signed_quantity[3] == 0  # 50 buys and 50 sells of equal size cancel.
     expected_vwap = float(np.mean([100.0 + i for i in range(100)]))
     assert f.vwap[3] == pytest.approx(expected_vwap, rel=contract.VWAP_RTOL)
 
@@ -111,14 +126,14 @@ def test_burst_of_100_records_matches_closed_form() -> None:
 # offending_record. The reference never sees unsorted records.
 
 
-# --- the np.add.reduceat traps, pinned as regressions --------------------
+# --- np.add.reduceat edge cases ------------------------------------------
 
 def test_last_bucket_running_to_the_end_of_the_array_keeps_every_record() -> None:
-    """Regression: clipping the final offset silently dropped one record.
+    """A final bucket ending exactly at ``len(trades)`` keeps every record.
 
-    A bucket whose slice ends exactly at len(trades), with empty buckets
-    after it, is the case where reduceat needs a sentinel rather than a
-    clamped index.
+    With empty buckets after it, this is the case where ``reduceat`` needs a
+    sentinel rather than a clamped index; clamping the final offset drops
+    one record.
     """
     trades = _trades([(3, 100.0, 1.0, False)] * 100)
     offsets = windows.build_offsets(trades["timestamp"], 0, 5, contract.DEFAULT_BUCKET_WIDTH_US)
@@ -129,6 +144,7 @@ def test_last_bucket_running_to_the_end_of_the_array_keeps_every_record() -> Non
 
 
 def test_empty_bucket_between_two_full_ones() -> None:
+    """An empty bucket between two occupied ones is invalid with a zero VWAP."""
     trades = _trades([(0, 100.0, 1.0, False), (2, 200.0, 2.0, False)])
     offsets = windows.build_offsets(trades["timestamp"], 0, 3, contract.DEFAULT_BUCKET_WIDTH_US)
     f = reference.aggregate_reference(trades, offsets)
@@ -138,7 +154,7 @@ def test_empty_bucket_between_two_full_ones() -> None:
 
 
 def test_records_before_the_window_are_not_counted() -> None:
-    """offsets[0] > 0: the reduction must start at the window, not at index 0."""
+    """With ``offsets[0] > 0`` the reduction starts at the window, not at index 0."""
     trades = _trades([(0, 500.0, 9.0, False), (5, 100.0, 1.0, False)])
     offsets = windows.build_offsets(
         trades["timestamp"], 5 * contract.US_PER_SECOND, 1, contract.DEFAULT_BUCKET_WIDTH_US
@@ -151,7 +167,7 @@ def test_records_before_the_window_are_not_counted() -> None:
 
 
 def test_records_after_the_window_are_not_counted() -> None:
-    """offsets[-1] < len(trades): the tail must not leak into the last bucket."""
+    """With ``offsets[-1] < len(trades)`` the tail does not leak into the last bucket."""
     trades = _trades([(0, 100.0, 1.0, False), (9, 999.0, 50.0, False)])
     offsets = windows.build_offsets(trades["timestamp"], 0, 2, contract.DEFAULT_BUCKET_WIDTH_US)
     assert offsets[-1] == 1
@@ -161,6 +177,7 @@ def test_records_after_the_window_are_not_counted() -> None:
 
 
 def test_every_bucket_empty_is_handled() -> None:
+    """A window with records only after it yields all-invalid buckets."""
     trades = _trades([(50, 100.0, 1.0, False)])
     offsets = windows.build_offsets(trades["timestamp"], 0, 5, contract.DEFAULT_BUCKET_WIDTH_US)
     f = reference.aggregate_reference(trades, offsets)
@@ -169,6 +186,7 @@ def test_every_bucket_empty_is_handled() -> None:
 
 
 def test_no_records_at_all_is_handled() -> None:
+    """Zero records still produce one feature entry per bucket."""
     empty = np.zeros(0, dtype=contract.TRADE_DTYPE)
     offsets = windows.build_offsets(empty["timestamp"], 0, 3, contract.DEFAULT_BUCKET_WIDTH_US)
     f = reference.aggregate_reference(empty, offsets)
@@ -176,9 +194,10 @@ def test_no_records_at_all_is_handled() -> None:
     assert not f.valid.any()
 
 
-# --- the vectorized implementation against the naive loop ----------------
+# --- vectorized implementation against the naive loop --------------------
 
 def _assert_same(a: reference.Features, b: reference.Features) -> None:
+    """Assert counts, sums and validity exactly and VWAP within the contract tolerances."""
     np.testing.assert_array_equal(a.event_count, b.event_count)
     np.testing.assert_array_equal(a.total_quantity, b.total_quantity)
     np.testing.assert_array_equal(a.signed_quantity, b.signed_quantity)
@@ -191,6 +210,7 @@ def _assert_same(a: reference.Features, b: reference.Features) -> None:
 @pytest.mark.parametrize("profile", ["sparse", "uniform", "burst"])
 @pytest.mark.parametrize("seed", [1, 2, 3])
 def test_vectorized_matches_the_naive_loop(profile: str, seed: int) -> None:
+    """Generated workloads of every profile agree between the two reference implementations."""
     from tapeforge import generate
 
     trades = generate.generate_trades(seed=seed, n_buckets=60, profile=profile)
@@ -202,6 +222,7 @@ def test_vectorized_matches_the_naive_loop(profile: str, seed: int) -> None:
 
 
 def test_vectorized_matches_the_naive_loop_on_real_archive_rows() -> None:
+    """The committed BTCUSDT fixture agrees between the two reference implementations."""
     from pathlib import Path
 
     from tapeforge import ingest
@@ -217,7 +238,9 @@ def test_vectorized_matches_the_naive_loop_on_real_archive_rows() -> None:
 
 
 def test_hand_calculated_values_for_the_real_fixture() -> None:
-    """Independent arithmetic on the committed 5-row fixture.
+    """Independent arithmetic on the committed 5-row BTCUSDT fixture.
+
+    Window buckets start at the first record's second; buckets 1 and 3 are empty.
 
     bucket 0: 94591.78 x 2.0 (buy), 94591.78 x 0.5 (sell), 94591.79 x 1.25 (buy)
       count 3, total 3.75, signed 2.0 - 0.5 + 1.25 = 2.75
@@ -251,6 +274,7 @@ def test_hand_calculated_values_for_the_real_fixture() -> None:
 # --- sign convention and validation --------------------------------------
 
 def test_signed_quantity_never_exceeds_total_quantity_in_magnitude() -> None:
+    """``|signed_quantity| <= total_quantity`` holds in every bucket of a burst workload."""
     from tapeforge import generate
 
     trades = generate.generate_trades(seed=31, n_buckets=100, profile="burst")

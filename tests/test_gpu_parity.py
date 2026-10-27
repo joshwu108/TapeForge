@@ -1,17 +1,18 @@
-"""The GPU engine must agree with the CPU reference on both kernel paths.
+"""Tests for the CUDA path of ``tapeforge.ops`` and ``tapeforge.kernels``: CPU parity.
 
 Every test drives the real code path -- ``ops.aggregate`` on CUDA tensors or
 ``kernels.launch_aggregate`` -- and compares against
 ``reference.aggregate_reference_naive``, the plain-loop oracle, so the GPU is
 never checked against code that shares its vectorization tricks.
 
-Skips only for genuine hardware/software absence (no torch, no CUDA device,
-no Triton), via the ``gpu_ready`` fixture. Nothing is skipped or expected to
-fail for missing functionality: buckets beyond the one-pass tile dispatch to
-the two-pass path and are held to the same parity rule. Each test that
-depends on a particular path asserts the path through ``kernels.plan_dispatch``
-on the fixture's longest bucket, so a large fixture cannot silently take the
-other path. The focused two-pass suite is test_two_pass.py.
+Tests skip only for genuine hardware/software absence (no torch, no CUDA
+device, no Triton), via the ``gpu_ready`` fixture. Nothing is skipped or
+expected to fail for missing functionality: buckets beyond the one-pass tile
+dispatch to the two-pass path and are held to the same parity rule. Each test
+that depends on a particular path asserts the path through
+``kernels.plan_dispatch`` on the fixture's longest bucket, so a large fixture
+cannot silently take the other path. The focused two-pass suite is
+test_two_pass.py.
 
 Parity rule: counts and quantity sums exactly; VWAP within
 contract.VWAP_RTOL / VWAP_ATOL; identical dtypes.
@@ -38,11 +39,17 @@ _assert_parity = assert_gpu_parity
 
 
 def _workload(profile: str, seed: int, n_buckets: int) -> tuple[np.ndarray, np.ndarray]:
+    """Generate ``n_buckets`` buckets of ``profile`` trades and offsets spanning all of them."""
     trades = generate.generate_trades(seed=seed, n_buckets=n_buckets, profile=profile)
     return trades, windows.build_offsets(trades["timestamp"], 0, n_buckets, W)
 
 
 def _rows(rows: list[tuple[int, float, float, bool]]) -> np.ndarray:
+    """Build trade records from ``(second, price, quantity, buyer_is_maker)`` tuples.
+
+    Prices and quantities are given in real units and scaled to ticks; the
+    record index doubles as ``agg_trade_id``.
+    """
     out = np.zeros(len(rows), dtype=contract.TRADE_DTYPE)
     for i, (second, price, qty, bim) in enumerate(rows):
         out[i] = (second * contract.US_PER_SECOND, round(price * P), round(qty * Q), bim, i)
@@ -50,6 +57,7 @@ def _rows(rows: list[tuple[int, float, float, bool]]) -> np.ndarray:
 
 
 def _one_bucket(n: int) -> tuple[np.ndarray, np.ndarray]:
+    """Build ``n`` records in a single bucket with varied prices, quantities and sides."""
     trades = np.zeros(n, dtype=contract.TRADE_DTYPE)
     trades["price"] = 100 * P + np.arange(n) % 97
     trades["quantity"] = 1 + np.arange(n) % 1009
@@ -63,6 +71,7 @@ def _one_bucket(n: int) -> tuple[np.ndarray, np.ndarray]:
 @pytest.mark.parametrize("profile", ["sparse", "uniform"])
 @pytest.mark.parametrize("seed", [1, 2, 3])
 def test_gpu_matches_cpu_reference(gpu_ready: None, profile: str, seed: int) -> None:
+    """Sparse and uniform workloads stay within the one-pass tile and match the oracle."""
     trades, offsets = _workload(profile, seed, 1000)
     _assert_parity(ops.aggregate(*_cuda(trades, offsets)), trades, offsets)
 
@@ -71,6 +80,7 @@ def test_gpu_matches_cpu_reference(gpu_ready: None, profile: str, seed: int) -> 
 def test_gpu_matches_cpu_reference_on_burst_within_one_pass_limit(
     gpu_ready: None, seed: int
 ) -> None:
+    """Burst buckets larger than one block but within the one-pass tile match the oracle."""
     trades, offsets = _workload("burst", seed, 200)
     longest = int(np.diff(offsets).max())
     assert 1024 < longest <= LIMIT, f"workload no longer exercises large tiles ({longest})"
@@ -79,11 +89,10 @@ def test_gpu_matches_cpu_reference_on_burst_within_one_pass_limit(
 
 @pytest.mark.parametrize("seed", [1, 2, 3])
 def test_gpu_matches_cpu_reference_on_full_burst(gpu_ready: None, seed: int) -> None:
-    """Burst workloads whose busiest bucket exceeds the one-pass tile: two-pass parity.
+    """Burst workloads whose busiest bucket exceeds the one-pass tile match on the two-pass path.
 
-    The same workloads the automatic dispatch used to reject; now an
-    independent CPU/GPU parity check through the public API, with the path
-    asserted so the fixture is known to exercise the two-pass kernels.
+    Parity is checked through the public API with the dispatch path asserted,
+    so the fixture is known to exercise the two-pass kernels.
     """
     trades, offsets = _workload("burst", seed, 1000)
     longest = int(np.diff(offsets).max())
@@ -93,7 +102,7 @@ def test_gpu_matches_cpu_reference_on_full_burst(gpu_ready: None, seed: int) -> 
 
 
 def test_oversized_bucket_takes_the_two_pass_path(gpu_ready: None) -> None:
-    """One bucket several tiles long, with a ragged final tile."""
+    """One bucket several tiles long, with a ragged final tile, matches the oracle."""
     trades, offsets = _one_bucket(3 * LIMIT + 17)
     assert kernels.plan_dispatch(3 * LIMIT + 17).path == "two_pass"
     _assert_parity(ops.aggregate(*_cuda(trades, offsets)), trades, offsets)
@@ -103,6 +112,7 @@ def test_oversized_bucket_takes_the_two_pass_path(gpu_ready: None) -> None:
 
 
 def test_bucket_of_exactly_the_one_pass_limit_is_exact(gpu_ready: None) -> None:
+    """A bucket of exactly ``MAX_ONE_PASS_BUCKET`` records still takes the one-pass path."""
     trades, offsets = _one_bucket(LIMIT)
     assert kernels.plan_dispatch(LIMIT).path == "one_pass"
     _assert_parity(ops.aggregate(*_cuda(trades, offsets)), trades, offsets)
@@ -123,6 +133,7 @@ def test_bucket_one_past_the_limit_is_not_truncated(gpu_ready: None) -> None:
 
 
 def test_explicit_block_size_boundary(gpu_ready: None) -> None:
+    """With an explicit ``block_size``, a bucket of that size fits and one more is rejected."""
     trades, offsets = _one_bucket(1024)
     _assert_parity(kernels.launch_aggregate(*_cuda(trades, offsets), block_size=1024),
                    trades, offsets)
@@ -135,6 +146,9 @@ def test_explicit_block_size_boundary(gpu_ready: None) -> None:
 
 
 def test_toy_example(gpu_ready: None) -> None:
+    """The two-record reference example produces the shared expected numbers on CUDA."""
+    # Bucket 0: buy 100 x 2 and sell 102 x 1 give total 3, signed +1 and
+    # VWAP (100 * 2 + 102) / 3 = 100.666...; bucket 1 is empty.
     trades = _rows([(1, 100.0, 2.0, False), (1, 102.0, 1.0, True)])
     offsets = np.array([0, 2, 2], dtype=np.int64)
     got = ops.aggregate(*_cuda(trades, offsets))
@@ -157,12 +171,16 @@ def test_all_empty_buckets_do_not_crash(gpu_ready: None) -> None:
 
 
 def test_no_records_at_all(gpu_ready: None) -> None:
+    """Zero records with three empty buckets launch cleanly and yield all-invalid output."""
     empty = np.zeros(0, dtype=contract.TRADE_DTYPE)
     offsets = np.zeros(4, dtype=np.int64)
     _assert_parity(ops.aggregate(*_cuda(empty, offsets)), empty, offsets)
 
 
 def test_zero_quantity_rows(gpu_ready: None) -> None:
+    """Zero-quantity rows count as events but contribute nothing to VWAP."""
+    # Bucket 0 holds only zero-quantity rows, so its VWAP is 0.0; in bucket 1
+    # the 900.0 row has zero quantity and leaves the VWAP at 101.0.
     trades = _rows([(0, 100.0, 0.0, False), (0, 105.0, 0.0, True), (1, 101.0, 2.0, True),
                     (1, 900.0, 0.0, False)])
     offsets = windows.build_offsets(trades["timestamp"], 0, 2, W)
@@ -172,6 +190,8 @@ def test_zero_quantity_rows(gpu_ready: None) -> None:
 
 
 def test_sign_convention(gpu_ready: None) -> None:
+    """``buyer_is_maker`` rows are sell-initiated and subtract from the signed quantity."""
+    # Bucket 0: -(1 + 2); bucket 1: +1.5; bucket 2: +4 - 1.25 = 2.75.
     trades = _rows([(0, 100.0, 1.0, True), (0, 100.0, 2.0, True), (1, 100.0, 1.5, False),
                     (2, 100.0, 4.0, False), (2, 100.0, 1.25, True)])
     offsets = windows.build_offsets(trades["timestamp"], 0, 3, W)
@@ -181,6 +201,9 @@ def test_sign_convention(gpu_ready: None) -> None:
 
 
 def test_window_boundaries_exclude_records_before_and_after(gpu_ready: None) -> None:
+    """Records before the window start and at its end fall outside every bucket."""
+    # The window is [W, 3W): bucket 0 holds timestamps W and 2W - 1, bucket 1
+    # holds 2W, and the records at 0 and 3W are excluded.
     trades = np.zeros(5, dtype=contract.TRADE_DTYPE)
     trades["timestamp"] = [0, W, 2 * W - 1, 2 * W, 3 * W]
     trades["price"] = [999 * P, 100 * P, 200 * P, 300 * P, 999 * P]
@@ -193,6 +216,8 @@ def test_window_boundaries_exclude_records_before_and_after(gpu_ready: None) -> 
 
 
 def test_sums_just_inside_the_int64_bound_are_exact(gpu_ready: None) -> None:
+    """Quantity sums that approach ``INT64_MAX`` are accumulated exactly, not in float."""
+    # n * price * quantity is as close to INT64_MAX as integer division allows.
     n = 64
     trades = np.zeros(n, dtype=contract.TRADE_DTYPE)
     trades["price"] = 2**30
@@ -208,6 +233,7 @@ def test_sums_just_inside_the_int64_bound_are_exact(gpu_ready: None) -> None:
 
 
 def test_offsets_past_the_records_are_rejected_before_launch(gpu_ready: None) -> None:
+    """An offset beyond the record count is a ``ValueError`` raised before any kernel launch."""
     trades = _rows([(0, 100.0, 1.0, False)])
     columns, _ = _cuda(trades, np.array([0, 1], dtype=np.int64))
     import torch
@@ -217,6 +243,7 @@ def test_offsets_past_the_records_are_rejected_before_launch(gpu_ready: None) ->
 
 
 def test_strided_cuda_column_is_rejected(gpu_ready: None) -> None:
+    """Non-contiguous CUDA columns are rejected rather than read with the wrong stride."""
     trades = _rows([(0, 100.0, 1.0, False)] * 4)
     columns, offsets = _cuda(trades, np.array([0, 2], dtype=np.int64))
     columns = {k: v[::2] for k, v in columns.items()}
@@ -225,6 +252,7 @@ def test_strided_cuda_column_is_rejected(gpu_ready: None) -> None:
 
 
 def test_mixed_cpu_and_cuda_inputs_are_rejected(gpu_ready: None) -> None:
+    """Columns and offsets on different devices are rejected with one clear message."""
     trades = _rows([(0, 100.0, 1.0, False)])
     columns, offsets = _cuda(trades, np.array([0, 1], dtype=np.int64))
     columns["price"] = columns["price"].cpu()

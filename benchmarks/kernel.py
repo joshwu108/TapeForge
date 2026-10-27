@@ -1,9 +1,8 @@
 """Scope 1: kernel-only latency on already-resident tensors.
 
-Inputs are moved to the device *before* timing starts. This number answers
-"how fast is the reduction", and must never be compared against a CPU
-pipeline that also decompresses a ZIP; transfer costs are scope 2
-(``pipeline.py``).
+Inputs are moved to the device before timing starts. The figure measures the
+reduction alone and must never be compared against a CPU pipeline that also
+decompresses a ZIP; transfer costs are scope 2 (``pipeline.py``).
 
 Rows (``baselines`` in the config). Every timed region is a complete Python
 call, so each row includes Python dispatch and kernel-launch overhead; what
@@ -13,7 +12,7 @@ differs is which host-side work sits inside the region:
   before they are timed:
 
     tapeforge_triton         tapeforge.ops.aggregate on CUDA tensors, as a
-                             user calls it: validation (one host sync),
+                             caller uses it: validation (one host sync),
                              dispatch planning, output allocation, on the
                              two-pass path also chunk-metadata construction
                              (one more host sync) and scratch allocation,
@@ -74,7 +73,9 @@ environment and the snapshot/commit.
 
 Without CUDA the script runs the CPU-capable rows as a smoke test and
 records nothing. No speedup is computed here; the rows are the evidence.
+The exit status is 1 when any row is incorrect or errored, otherwise 0.
 
+Usage:
     python benchmarks/kernel.py --config benchmarks/configs/kernel_sweep.toml
     python benchmarks/kernel.py --sizes 100000 --seeds 1 --no-record   # quick run
     python benchmarks/kernel.py --timing cuda_events --sizes 1000000 --no-record
@@ -116,26 +117,42 @@ STAGE_ROWS = (
     "tapeforge_stage_prepare",
 )
 ALL_ROWS = FEATURE_ROWS + STAGE_ROWS
+# Every tapeforge_* row needs the Triton launcher, so none of them runs on CPU.
 CUDA_ONLY_ROWS = tuple(name for name in ALL_ROWS if name.startswith("tapeforge_"))
 
 
 @dataclass(frozen=True)
 class Row:
-    """One timed implementation and what its timed region includes."""
+    """One timed implementation and a description of what its timed region includes.
+
+    Attributes:
+        fn: The timed callable.
+        includes: Human-readable description of the timed region, recorded
+            with the result.
+        gate: Callable producing the features for the correctness gate;
+            ``None`` marks a stage row, which produces no features and is
+            not gated.
+        path: Kernel dispatch path the row exercises, when applicable.
+        n_chunks: Pass-1 chunk count on the two-pass path, when applicable.
+        host: The row runs on the host and is never synchronised.
+    """
 
     fn: Callable[[], Any]
     includes: str
-    gate: Callable[[], Any] | None  # produces features for the correctness gate; None = stage row
+    gate: Callable[[], Any] | None
     path: str | None = None
     n_chunks: int | None = None
-    host: bool = False  # runs on the host; never synchronize
+    host: bool = False
 
 
 def _numpy_reference(trades: Any, offsets: Any) -> dict[str, Any]:
+    """Return the host reference features in the dict shape ``ops.aggregate`` returns."""
     return features_dict(reference.aggregate_reference(trades, offsets))
 
 
 def _raise(reason: str) -> Callable[[], Any]:
+    """Return a callable that raises ``RuntimeError(reason)``, for rows whose setup failed."""
+
     def fail() -> None:
         raise RuntimeError(reason)
 
@@ -145,7 +162,20 @@ def _raise(reason: str) -> Callable[[], Any]:
 def _triton_rows(
     names: list[str], columns: dict[str, Any], offsets: Any, info: WorkloadInfo
 ) -> dict[str, Row]:
-    """Rows that need the Triton launcher. Preparation happens here, untimed."""
+    """Build the rows that need the Triton launcher; preparation happens here, untimed.
+
+    Args:
+        names: Requested row names; only those present are built.
+        columns: Device-resident input columns.
+        offsets: Device-resident bucket boundaries.
+        info: Workload description, used for chunk counts and bucket counts.
+
+    Returns:
+        Row name to ``Row``. Rows that do not apply to the workload's dispatch
+        path (``tapeforge_pass1_only`` and ``tapeforge_pass2_only`` on
+        one-pass workloads, ``tapeforge_two_pass_forced`` on two-pass
+        workloads) are left out.
+    """
     from tapeforge import prepared
     from tapeforge.validation import validate_columns
 
@@ -188,8 +218,8 @@ def _triton_rows(
             launch, "unchecked launcher(s) only; no sync", gate=launch_then_features, **base
         )
     if "tapeforge_pass1_only" in names and two_pass:
-        # Pass 1 alone produces no features; its gate is the full execute,
-        # which includes the same pass 1 (recorded in "correctness").
+        # Pass 1 alone produces no features, so its gate is the full execute,
+        # which runs the same pass 1; the result row records this inheritance.
         rows["tapeforge_pass1_only"] = Row(
             ready.run_pass_1,
             "pass 1 launch only (partials); correctness inherited from execute",
@@ -199,7 +229,7 @@ def _triton_rows(
     if "tapeforge_pass2_only" in names and two_pass:
 
         def pass_2_then_features() -> dict[str, Any]:
-            ready.run_pass_1()  # partials must exist before pass 2 is checked alone
+            ready.run_pass_1()  # Pass 2 reads the partials, so pass 1 must run first.
             ready.run_pass_2()
             return ready.features
 
@@ -259,6 +289,13 @@ def _triton_rows(
 def _rows(
     names: list[str], device: str, trades: Any, offsets: Any, info: WorkloadInfo
 ) -> dict[str, Row]:
+    """Build every requested row that can run on ``device``.
+
+    When Triton preparation fails on CUDA, every requested ``CUDA_ONLY_ROWS``
+    entry becomes a row that raises the preparation error, so the failure is
+    recorded per row rather than aborting the sweep. On CPU the Triton rows
+    are absent.
+    """
     import torch
 
     columns = {k: v.to(device) for k, v in host_columns(trades).items()}
@@ -293,6 +330,15 @@ def _measure(
     on_cuda: bool,
     method: str,
 ) -> dict[str, Any]:
+    """Gate ``row`` against ``expected`` and, if it passes, time it.
+
+    Returns:
+        The metrics dict for the result record. ``status`` is ``"incorrect"``
+        when the gate fails, ``"error"`` when the gate or stage call raises,
+        and ``"ok"`` with the timing fields otherwise; ``correct`` is ``None``
+        for stage rows. Host rows are always timed with the wall method and
+        without synchronisation.
+    """
     metrics: dict[str, Any] = {
         "includes": row.includes,
         "path": row.path,
@@ -302,7 +348,7 @@ def _measure(
         if row.gate is not None:
             check_features(row.gate(), expected)
         else:
-            row.fn()  # stage rows have no features to check; make sure they run
+            row.fn()  # Stage rows produce no features; the call still has to succeed.
     except AssertionError as exc:
         return {**metrics, "status": "incorrect", "reason": str(exc)[:500]}
     except Exception as exc:  # noqa: BLE001 - e.g. torch.compile backend missing
@@ -325,10 +371,14 @@ def _measure(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the configured sweep; print one JSON line per row; exit 1 if any row is wrong.
+    """Run the configured sweep and print one JSON line per row.
 
-    Records to ``benchmarks/results.json`` only on CUDA and without
-    ``--no-record``. Without CUDA the CPU-capable rows run as a smoke test.
+    Results are recorded to ``benchmarks/results.json`` only on CUDA and
+    without ``--no-record``; rows that do not apply are recorded with status
+    ``not_applicable``. Without CUDA the CPU-capable rows run as a smoke test.
+
+    Returns:
+        1 if any row is incorrect or errored, otherwise 0.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="benchmarks/configs/kernel_sweep.toml")

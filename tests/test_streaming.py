@@ -1,9 +1,10 @@
-"""The streaming CPU aggregator must equal the batch reference for any chunking.
+"""Tests for ``tapeforge.streaming``: chunked CPU aggregation equals the batch reference.
 
-Oracles: hand-calculated values, ``reference.aggregate_reference_naive`` (a
-plain loop) and ``reference.aggregate_reference`` (the batch path). Parity is
+Oracles: values derived in the test bodies, ``reference.aggregate_reference_naive``
+(a plain loop) and ``reference.aggregate_reference`` (the batch path). Parity is
 asserted bitwise for every output, including ``vwap``, because the streaming
 path performs the one floating-point division in the same operation order.
+Hypothesis properties cover arbitrary chunkings and window geometries.
 """
 
 from __future__ import annotations
@@ -23,7 +24,11 @@ EMPTY = np.zeros(0, dtype=contract.TRADE_DTYPE)
 
 
 def _trades(rows: list[tuple[int, float, float, bool]]) -> np.ndarray:
-    """TRADE_DTYPE array from (second, price, quantity, buyer_is_maker)."""
+    """Build a ``TRADE_DTYPE`` array from ``(second, price, quantity, buyer_is_maker)`` tuples.
+
+    Prices and quantities are given in real units and scaled to ticks; the
+    record index doubles as ``agg_trade_id``.
+    """
     out = np.zeros(len(rows), dtype=contract.TRADE_DTYPE)
     for i, (second, price, qty, bim) in enumerate(rows):
         out[i] = (second * contract.US_PER_SECOND, round(price * P), round(qty * Q), bim, i)
@@ -33,11 +38,13 @@ def _trades(rows: list[tuple[int, float, float, bool]]) -> np.ndarray:
 def _batch(
     trades: np.ndarray, start_us: int, n_buckets: int, width_us: int = W
 ) -> reference.Features:
+    """Run the batch reference over the window ``[start_us, start_us + n_buckets * width_us)``."""
     offsets = windows.build_offsets(trades["timestamp"], start_us, n_buckets, width_us)
     return reference.aggregate_reference(trades, offsets)
 
 
 def _assert_bitwise(got: reference.Features, expected: reference.Features) -> None:
+    """Assert every feature, including ``vwap``, is bitwise equal with matching dtype."""
     for name in contract.FEATURE_NAMES:
         actual, target = getattr(got, name), getattr(expected, name)
         assert actual.dtype == target.dtype, (name, actual.dtype, target.dtype)
@@ -45,13 +52,15 @@ def _assert_bitwise(got: reference.Features, expected: reference.Features) -> No
 
 
 def _chunks(trades: np.ndarray, cuts: list[int]) -> list[np.ndarray]:
+    """Split ``trades`` into contiguous chunks at the given record indices."""
     return [np.ascontiguousarray(part) for part in np.split(trades, sorted(cuts))]
 
 
-# --- hand-calculated semantics -------------------------------------------
+# --- derived-value semantics ---------------------------------------------
 
 
 def test_toy_example_in_one_chunk() -> None:
+    """The two-record reference example streamed as a single chunk gives the shared numbers."""
     trades = _trades([(1, 100.0, 2.0, False), (1, 102.0, 1.0, True)])
     got = aggregate_stream([trades], contract.US_PER_SECOND, 1)
     assert got.event_count.tolist() == [2]
@@ -62,6 +71,7 @@ def test_toy_example_in_one_chunk() -> None:
 
 
 def test_toy_example_one_record_per_chunk() -> None:
+    """The two-record reference example streamed one record at a time equals the batch result."""
     trades = _trades([(1, 100.0, 2.0, False), (1, 102.0, 1.0, True)])
     per_event = [trades[i : i + 1] for i in range(trades.size)]
     _assert_bitwise(aggregate_stream(per_event, contract.US_PER_SECOND, 1),
@@ -74,7 +84,7 @@ def test_bucket_spanning_three_chunks_is_emitted_once_complete() -> None:
     agg = StreamingAggregator(0, 5)
 
     first = agg.push(trades[:30])
-    # Seeing second 3 proves seconds 0-2 are over: three empty buckets close.
+    # A record in second 3 proves seconds 0-2 are over, so three empty buckets close.
     assert first.event_count.tolist() == [0, 0, 0]
     assert not first.valid.any()
     assert agg.emitted_buckets == 3
@@ -94,9 +104,10 @@ def test_bucket_spanning_three_chunks_is_emitted_once_complete() -> None:
 
 
 def test_a_record_on_the_upper_edge_closes_the_bucket_and_belongs_to_the_next() -> None:
+    """Buckets are half-open: a record at timestamp ``W`` closes bucket 0 and opens bucket 1."""
     agg = StreamingAggregator(0, 3)
     first = _trades([(0, 100.0, 1.0, False)])
-    assert agg.push(first).event_count.size == 0  # bucket 0 still open
+    assert agg.push(first).event_count.size == 0  # Bucket 0 is still open.
 
     on_edge = np.zeros(1, dtype=contract.TRADE_DTYPE)
     on_edge["timestamp"], on_edge["price"], on_edge["quantity"] = W, 200 * P, Q
@@ -110,6 +121,7 @@ def test_a_record_on_the_upper_edge_closes_the_bucket_and_belongs_to_the_next() 
 
 
 def test_records_before_the_window_are_ignored_but_still_ordered() -> None:
+    """Records before the window contribute nothing but still advance the ordering check."""
     trades = _trades([(0, 500.0, 9.0, False), (1, 600.0, 9.0, False), (5, 100.0, 1.0, False)])
     got = aggregate_stream([trades[:2], trades[2:]], 5 * contract.US_PER_SECOND, 1)
     assert got.event_count.tolist() == [1]
@@ -118,6 +130,7 @@ def test_records_before_the_window_are_ignored_but_still_ordered() -> None:
 
 
 def test_a_record_past_the_window_closes_every_bucket() -> None:
+    """A record beyond the window end emits every remaining bucket without counting itself."""
     trades = _trades([(0, 100.0, 1.0, False), (9, 999.0, 50.0, False)])
     agg = StreamingAggregator(0, 2)
     assert agg.push(trades[:1]).event_count.size == 0
@@ -129,12 +142,14 @@ def test_a_record_past_the_window_closes_every_bucket() -> None:
 
 
 def test_empty_chunks_change_nothing() -> None:
+    """Empty chunks anywhere in the stream leave the result bitwise equal to the batch."""
     trades = _trades([(0, 100.0, 1.0, False), (2, 200.0, 2.0, True)])
     got = aggregate_stream([EMPTY, trades[:1], EMPTY, EMPTY, trades[1:], EMPTY], 0, 3)
     _assert_bitwise(got, _batch(trades, 0, 3))
 
 
 def test_no_records_at_all_gives_all_empty_buckets() -> None:
+    """An empty stream still emits one invalid, zeroed entry per bucket."""
     got = aggregate_stream([], 0, 4)
     assert got.event_count.tolist() == [0, 0, 0, 0]
     assert not got.valid.any()
@@ -143,6 +158,7 @@ def test_no_records_at_all_gives_all_empty_buckets() -> None:
 
 
 def test_finalize_is_idempotent_and_push_after_it_raises() -> None:
+    """A second ``finalize`` emits nothing, and ``push`` after it is a ``RuntimeError``."""
     agg = StreamingAggregator(0, 2)
     agg.push(_trades([(0, 100.0, 1.0, False)]))
     assert agg.finalize().event_count.tolist() == [1, 0]
@@ -152,6 +168,9 @@ def test_finalize_is_idempotent_and_push_after_it_raises() -> None:
 
 
 def test_zero_quantity_records_count_but_do_not_move_vwap() -> None:
+    """Zero-quantity records count as events and never produce a NaN VWAP."""
+    # Bucket 0: 2 units at 100 plus a zero-quantity row give VWAP 100; bucket 1
+    # holds only a zero-quantity row, so its VWAP is 0.
     trades = _trades([(0, 100.0, 2.0, False), (0, 999.0, 0.0, True), (1, 101.0, 0.0, True)])
     got = aggregate_stream([trades[:1], trades[1:2], trades[2:]], 0, 2)
     assert got.event_count.tolist() == [2, 1]
@@ -161,7 +180,11 @@ def test_zero_quantity_records_count_but_do_not_move_vwap() -> None:
 
 
 def test_averaging_trap_vwap_comes_from_integer_partials_not_chunk_means() -> None:
-    """Chunk A: 1 unit at 100. Chunk B: 3 units at 200. VWAP is 175, not mean(100, 200) = 150."""
+    """VWAP is computed from integer partial sums, never by averaging per-chunk VWAPs.
+
+    Chunk A holds 1 unit at 100 and chunk B holds 3 units at 200, so the VWAP
+    is (100 + 600) / 4 = 175, not mean(100, 200) = 150.
+    """
     chunk_a = _trades([(0, 100.0, 1.0, False)])
     chunk_b = _trades([(0, 200.0, 1.0, False)] * 3)
     got = aggregate_stream([chunk_a, chunk_b], 0, 1)
@@ -170,16 +193,18 @@ def test_averaging_trap_vwap_comes_from_integer_partials_not_chunk_means() -> No
     _assert_bitwise(got, _batch(np.concatenate([chunk_a, chunk_b]), 0, 1))
 
 
-# --- ordering is enforced, never repaired --------------------------------
+# --- ordering enforcement ------------------------------------------------
 
 
 def test_decreasing_timestamps_within_a_chunk_are_rejected() -> None:
+    """A chunk with a decreasing timestamp raises ``OutOfOrderError`` naming the record."""
     bad = _trades([(0, 100.0, 1.0, False), (5, 100.0, 1.0, False), (3, 100.0, 1.0, False)])
     with pytest.raises(OutOfOrderError, match=r"record 2 \(3000000\) precedes record 1"):
         StreamingAggregator(0, 10).push(bad)
 
 
 def test_a_chunk_starting_before_the_previous_one_ended_is_rejected_atomically() -> None:
+    """A late chunk is rejected without touching state, so the stream continues correctly."""
     first = _trades([(0, 100.0, 1.0, False), (4, 100.0, 1.0, False)])
     late = _trades([(2, 100.0, 1.0, False), (6, 100.0, 1.0, False)])
     ok = _trades([(4, 100.0, 1.0, False), (7, 100.0, 1.0, False)])
@@ -192,7 +217,7 @@ def test_a_chunk_starting_before_the_previous_one_ended_is_rejected_atomically()
     assert agg.last_timestamp == 4 * contract.US_PER_SECOND
 
     # The rejected chunk left no trace: the stream continues and matches the
-    # batch result over the chunks that were actually accepted.
+    # batch result over the accepted chunks only.
     parts.append(agg.push(ok))
     parts.append(agg.finalize())
     got = streaming.concat_features(parts)
@@ -201,6 +226,7 @@ def test_a_chunk_starting_before_the_previous_one_ended_is_rejected_atomically()
 
 
 def test_equal_timestamps_across_a_chunk_boundary_are_fine() -> None:
+    """Ordering is non-strict: a chunk may start at the previous chunk's last timestamp."""
     trades = _trades([(2, 100.0, 1.0, False)] * 6)
     _assert_bitwise(aggregate_stream([trades[:4], trades[4:]], 0, 4), _batch(trades, 0, 4))
 
@@ -236,6 +262,8 @@ def test_degenerate_geometry_is_rejected() -> None:
 
 
 def test_sums_just_inside_the_int64_bound_combine_exactly_across_chunks() -> None:
+    """Integer partials that approach ``INT64_MAX`` combine exactly across chunk boundaries."""
+    # n * price * quantity is as close to INT64_MAX as integer division allows.
     n = 64
     trades = np.zeros(n, dtype=contract.TRADE_DTYPE)
     trades["price"] = 2**30
@@ -250,31 +278,33 @@ def test_sums_just_inside_the_int64_bound_combine_exactly_across_chunks() -> Non
 
 
 def test_a_chunk_that_could_overflow_is_rejected_before_any_state_changes() -> None:
+    """An overflowing chunk raises before any record is absorbed, so earlier state survives."""
     n = 4
     price, qty = 2**30, contract.INT64_MAX // (n * 2**30) + 1
     trades = np.zeros(n, dtype=contract.TRADE_DTYPE)
     trades["price"], trades["quantity"] = price, qty
 
     agg = StreamingAggregator(0, 1)
-    agg.push(trades[:2])  # two records: bound is 2 * price * qty, still inside int64
+    agg.push(trades[:2])  # Two records: the bound is 2 * price * qty, inside int64.
     with pytest.raises(OverflowError, match="int64 accumulation bound"):
-        agg.push(trades[2:])  # a fourth record would push the bound over
+        agg.push(trades[2:])  # A fourth record pushes the bound past INT64_MAX.
     assert agg.records_seen == 2
     assert agg.finalize().total_quantity.tolist() == [2 * qty]
 
 
 def test_overflow_bound_uses_the_longest_bucket_not_the_record_count() -> None:
+    """Many short buckets with large values are fine; only per-bucket sums accumulate."""
     n = 1_000
     price, qty = 2**30, contract.INT64_MAX // (2 * 2**30)
     trades = np.zeros(n, dtype=contract.TRADE_DTYPE)
-    trades["timestamp"] = np.arange(n, dtype=np.int64) // 2 * W  # 500 buckets of 2 records
+    trades["timestamp"] = np.arange(n, dtype=np.int64) // 2 * W  # 500 buckets of 2 records each.
     trades["price"], trades["quantity"] = price, qty
     got = aggregate_stream(_chunks(trades, [333, 666]), 0, 500)
     assert (got.total_quantity == 2 * qty).all()
 
 
 def test_out_of_window_records_still_count_towards_the_bound() -> None:
-    """A huge value after the window would make the batch validation raise; so does the stream."""
+    """A value past the window that fails the batch bound check fails the streaming one too."""
     n = 4
     inside = np.zeros(n, dtype=contract.TRADE_DTYPE)
     inside["price"], inside["quantity"] = 2**30, contract.INT64_MAX // (n * 2**30)
@@ -293,6 +323,7 @@ def test_out_of_window_records_still_count_towards_the_bound() -> None:
 @pytest.mark.parametrize("profile", ["sparse", "uniform", "burst"])
 @pytest.mark.parametrize("seed", [1, 2, 3])
 def test_fixed_chunkings_match_batch(profile: str, seed: int) -> None:
+    """Single, halved, per-record and ragged chunkings are all bitwise equal to the batch."""
     n_buckets = 40
     trades = generate.generate_trades(seed=seed, n_buckets=n_buckets, profile=profile)
     expected = _batch(trades, 0, n_buckets)
@@ -310,6 +341,7 @@ def test_fixed_chunkings_match_batch(profile: str, seed: int) -> None:
 
 
 def test_per_record_chunks_match_batch_on_the_real_fixture() -> None:
+    """The committed BTCUSDT fixture streamed one record at a time matches both references."""
     from pathlib import Path
 
     from tapeforge import ingest
@@ -328,15 +360,16 @@ def test_per_record_chunks_match_batch_on_the_real_fixture() -> None:
 
 
 def test_clipped_window_with_records_on_both_sides_matches_batch() -> None:
+    """A window clipped on both sides, chunked across its edges, matches the batch."""
     trades = generate.generate_trades(seed=9, n_buckets=30, profile="uniform")
-    start, n_buckets = 7 * W, 12  # buckets 0-6 precede the window, 19-29 follow it
+    start, n_buckets = 7 * W, 12  # Buckets 0-6 precede the window and 19-29 follow it.
     expected = _batch(trades, start, n_buckets)
     assert expected.event_count.sum() < trades.size
     got = aggregate_stream(_chunks(trades, [5, 400, 401, 900]), start, n_buckets)
     _assert_bitwise(got, expected)
 
 
-# --- properties: any chunking, any window --------------------------------
+# --- properties over any chunking and any window -------------------------
 
 _profiles = st.sampled_from(["sparse", "uniform", "burst"])
 
@@ -353,6 +386,7 @@ _profiles = st.sampled_from(["sparse", "uniform", "burst"])
 def test_any_chunking_of_generated_trades_matches_batch(
     profile: str, seed: int, n_buckets: int, cuts: list[int], start_shift: int, window: int
 ) -> None:
+    """Any chunking of a generated workload over any window shift matches the batch."""
     trades = generate.generate_trades(seed=seed, n_buckets=n_buckets, profile=profile)
     chunks = _chunks(trades, [min(c, trades.size) for c in cuts])
     start = start_shift * W
@@ -378,6 +412,7 @@ def test_any_chunking_of_arbitrary_ordered_records_matches_batch(
     n_buckets: int,
     width_s: int,
 ) -> None:
+    """Any chunking of arbitrary sorted records, including zero values, matches the batch."""
     n = len(seconds)
     trades = np.zeros(n, dtype=contract.TRADE_DTYPE)
     trades["timestamp"] = np.sort(np.array(seconds, dtype=np.int64)) * contract.US_PER_SECOND
@@ -400,6 +435,7 @@ def test_any_chunking_of_arbitrary_ordered_records_matches_batch(
 def test_one_thousand_random_chunkings_of_a_burst_day_match_batch(
     seed: int, cuts: list[int]
 ) -> None:
+    """A burst day under one thousand random chunkings stays bitwise equal to the batch."""
     trades = generate.generate_trades(seed=seed, n_buckets=200, profile="burst")
     chunks = _chunks(trades, [min(c, trades.size) for c in cuts])
     _assert_bitwise(aggregate_stream(chunks, 0, 200), _batch(trades, 0, 200))

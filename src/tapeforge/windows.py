@@ -1,18 +1,24 @@
-"""Bucket window index: boundary offsets, no padding.
+"""Bucket window index: boundary offsets into a sorted trade array, without padding.
 
 For ``n_buckets`` fixed-width time buckets over a timestamp-sorted trade
 array, ``build_offsets`` returns an ``offsets`` array of length
 ``n_buckets + 1`` such that bucket ``b`` owns records
-``[offsets[b], offsets[b + 1])``. Empty buckets are a repeated offset, so
-nothing is padded to the longest bucket.
+``[offsets[b], offsets[b + 1])``. An empty bucket is a repeated offset, so
+nothing is padded to the longest bucket:
 
     offsets = [0, 2, 2, 7]
       bucket 0 -> records 0..1
       bucket 1 -> empty
       bucket 2 -> records 2..6
 
-Cost is one ``np.searchsorted`` of the ``n_buckets + 1`` edges into the
-timestamp column: O((n_buckets + 1) log n), no per-record Python work.
+Invariants:
+    Offsets are non-decreasing and lie in ``[0, n_records]``. Buckets are
+    half-open: a record exactly on an edge belongs to the bucket that edge
+    opens.
+
+Cost:
+    One ``np.searchsorted`` of the ``n_buckets + 1`` edges into the timestamp
+    column, O((n_buckets + 1) log n), with no per-record Python work.
 """
 
 from __future__ import annotations
@@ -21,14 +27,17 @@ import numpy as np
 
 
 def bucket_edges(start_us: int, n_buckets: int, width_us: int) -> np.ndarray:
-    """Return the ``n_buckets + 1`` bucket boundary timestamps (int64 microseconds).
+    """Return the ``n_buckets + 1`` bucket boundary timestamps as int64 microseconds.
 
-    Edge ``b`` opens bucket ``b``; the last edge closes the window. Buckets
-    are half-open: a record exactly on an edge belongs to the bucket the edge
-    opens.
+    Edge ``b`` opens bucket ``b``; the last edge closes the window.
+
+    Args:
+        start_us: Timestamp of the first edge, in microseconds.
+        n_buckets: Number of buckets; must be positive.
+        width_us: Bucket width in microseconds; must be positive.
 
     Raises:
-        ValueError: on a non-positive bucket count or width.
+        ValueError: ``n_buckets`` or ``width_us`` is not positive.
     """
     if n_buckets <= 0:
         raise ValueError(f"n_buckets must be positive, got {n_buckets}")
@@ -43,15 +52,20 @@ def build_offsets(
     n_buckets: int,
     width_us: int,
 ) -> np.ndarray:
-    """Return int64 offsets of shape ``(n_buckets + 1,)``.
+    """Return int64 bucket offsets of shape ``(n_buckets + 1,)``.
 
-    Preconditions are validated rather than assumed: ``timestamps`` must be a
-    1-D int64 array in non-decreasing order. Out-of-order input would produce
-    silently wrong offsets, so it is an error instead.
+    Preconditions are validated rather than assumed, because out-of-order
+    input would produce silently wrong offsets.
+
+    Args:
+        timestamps: 1-D int64 microsecond timestamps in non-decreasing order.
+        start_us: Timestamp of the first bucket edge, in microseconds.
+        n_buckets: Number of buckets; must be positive.
+        width_us: Bucket width in microseconds; must be positive.
 
     Raises:
-        ValueError: if ``timestamps`` is not 1-D int64 and non-decreasing, or
-            if the bucket geometry is degenerate.
+        ValueError: ``timestamps`` is not 1-D int64 and non-decreasing, or
+            the bucket geometry is degenerate.
     """
     if timestamps.ndim != 1:
         raise ValueError(f"timestamps must be 1-D, got shape {timestamps.shape}")
@@ -73,11 +87,14 @@ def build_offsets(
 
 
 def bucket_lengths(offsets: np.ndarray) -> np.ndarray:
-    """Records per bucket, shape ``(n_buckets,)``. Zero for empty buckets.
+    """Return the records per bucket as int64 of shape ``(n_buckets,)``; zero when empty.
 
-    The distribution of this array is what decides the one-pass vs two-pass
-    kernel dispatch threshold, so it is a first-class output rather than
-    something each caller recomputes.
+    The distribution of this array decides the one-pass versus two-pass
+    kernel dispatch, so it is a first-class output rather than something each
+    caller recomputes.
+
+    Raises:
+        ValueError: ``offsets`` is not 1-D with at least two entries.
     """
     if offsets.ndim != 1 or offsets.size < 2:
         raise ValueError(f"offsets must be 1-D with at least 2 entries, got {offsets.shape}")

@@ -1,4 +1,9 @@
-"""MarketSlice construction from the feature engine and its exact VWAP quantisation."""
+"""Tests for tapeforge.execution.state.MarketSlice: integer VWAP quantisation, construction from
+feature-engine output, origin-relative indexing, immutability and validation of inconsistent input.
+
+Generated trades through ``reference.aggregate_reference`` serve as the oracle for
+``from_features``; the rounding cases are pinned with exact integers.
+"""
 
 from __future__ import annotations
 
@@ -13,18 +18,19 @@ I64 = np.int64
 
 
 def _i64(values: list[int]) -> np.ndarray:
+    """Return ``values`` as an int64 array."""
     return np.array(values, dtype=I64)
 
 
 @pytest.mark.parametrize(
     "numerator, total, expected",
     [
-        (30_006, 3, 10_002),   # exact
-        (30_007, 3, 10_002),   # 10,002.33 rounds down
-        (30_008, 3, 10_003),   # 10,002.67 rounds up
-        (20_005, 2, 10_003),   # 10,002.5: half rounds up
-        (0, 5, 0),             # zero-quantity numerator
-        (0, 0, 0),             # no quantity at all
+        (30_006, 3, 10_002),   # Exact.
+        (30_007, 3, 10_002),   # 10,002.33 rounds down.
+        (30_008, 3, 10_003),   # 10,002.67 rounds up.
+        (20_005, 2, 10_003),   # 10,002.5: half rounds up.
+        (0, 5, 0),             # Zero-quantity numerator.
+        (0, 0, 0),             # No quantity at all.
     ],
 )
 def test_vwap_ticks_round_half_up_in_integers(numerator: int, total: int, expected: int) -> None:
@@ -86,7 +92,7 @@ def test_arrays_are_copied_and_read_only() -> None:
     assert market2.total_quantity.tolist() == [5, 0]
     with pytest.raises(ValueError, match="read-only"):
         market.total_quantity[0] = 1
-    assert market.vwap(-1) == 1.0  # 100 ticks is 1.00 quote units
+    assert market.vwap(-1) == 1.0  # 100 price ticks is 1.00 quote units.
 
 
 def test_indexing_is_relative_to_origin() -> None:
@@ -103,7 +109,7 @@ def test_with_bucket_replaces_one_bucket_and_recomputes_valid() -> None:
     market = slice_from_rows([(1, 10)], [(3, 30), None])
     emptied = market.with_bucket(0, event_count=0, total_quantity=0, vwap_ticks=0)
     assert emptied.valid.tolist() == [True, False, False]
-    assert market.valid.tolist() == [True, True, False]  # the original is untouched
+    assert market.valid.tolist() == [True, True, False]  # The original is untouched.
     filled = market.with_bucket(1, event_count=2, total_quantity=7, vwap_ticks=70)
     assert filled.valid.tolist() == [True, True, True]
     assert filled.total_quantity.tolist() == [1, 3, 7]

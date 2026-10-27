@@ -1,9 +1,10 @@
-"""``tapeforge.prepared``: validate once, launch many times.
+"""Tests for ``tapeforge.prepared``: validate once, launch many times.
 
-The prepared path must produce exactly what the checked public API
-produces, on both kernel paths, while reusing its buffers. The borrowed /
-owned distinction and the pass-level entry points are pinned here because
-the benchmark and any future training loop rely on them.
+The prepared path must produce exactly what the checked public API produces,
+on both kernel paths, while reusing its buffers. The borrowed/owned output
+distinction and the pass-level entry points are pinned here because the
+benchmark harness and training loops rely on them. GPU cases use the parity
+helpers in conftest.py against ``reference.aggregate_reference_naive``.
 """
 
 from __future__ import annotations
@@ -20,11 +21,13 @@ CHUNK = kernels.CHUNK_SIZE
 
 
 def _workload(profile: str, seed: int, n_buckets: int) -> tuple[np.ndarray, np.ndarray]:
+    """Generate ``n_buckets`` buckets of ``profile`` trades and offsets spanning all of them."""
     trades = generate.generate_trades(seed=seed, n_buckets=n_buckets, profile=profile)
     return trades, windows.build_offsets(trades["timestamp"], 0, n_buckets, W)
 
 
 def _one_bucket(n: int) -> tuple[np.ndarray, np.ndarray]:
+    """Build ``n`` records in a single bucket with varied prices, quantities and sides."""
     trades = np.zeros(n, dtype=contract.TRADE_DTYPE)
     trades["price"] = 100 * contract.PRICE_SCALE + np.arange(n) % 97
     trades["quantity"] = 1 + np.arange(n) % 1009
@@ -37,12 +40,14 @@ def _one_bucket(n: int) -> tuple[np.ndarray, np.ndarray]:
 
 @pytest.mark.skipif(kernels.TRITON_AVAILABLE, reason="triton is installed on this machine")
 def test_prepare_without_triton_raises_a_clear_error() -> None:
+    """Without Triton, ``prepare`` raises ``RuntimeError`` naming the missing dependency."""
     torch = pytest.importorskip("torch")
     with pytest.raises(RuntimeError, match="Triton is not installed"):
         prepared.prepare({}, torch.zeros(2, dtype=torch.int64))
 
 
 def test_prepared_aggregation_is_frozen() -> None:
+    """``PreparedAggregation`` is a frozen dataclass, so a prepared launch cannot be mutated."""
     import dataclasses
 
     assert dataclasses.is_dataclass(prepared.PreparedAggregation)
@@ -62,6 +67,7 @@ gpu = pytest.mark.gpu
 def test_prepared_matches_public_api_and_oracle(
     gpu_ready: None, profile: str, n_buckets: int, path: str
 ) -> None:
+    """``execute`` matches the oracle and equals the public API bit for bit on both paths."""
     import torch
 
     trades, offsets = _workload(profile, 1, n_buckets)
@@ -78,6 +84,7 @@ def test_prepared_matches_public_api_and_oracle(
 
 @gpu
 def test_execute_returns_the_same_borrowed_tensors_every_call(gpu_ready: None) -> None:
+    """``execute`` returns the borrowed output buffers, so repeated calls allocate nothing."""
     trades, offsets = _one_bucket(3 * LIMIT + 17)
     ready = prepared.prepare(*cuda_inputs(trades, offsets))
     first = ready.execute()
@@ -90,6 +97,7 @@ def test_execute_returns_the_same_borrowed_tensors_every_call(gpu_ready: None) -
 
 @gpu
 def test_execute_owned_returns_independent_copies(gpu_ready: None) -> None:
+    """``execute_owned`` returns copies that later executions cannot overwrite."""
     import torch
 
     trades, offsets = _one_bucket(LIMIT + 1)
@@ -106,7 +114,7 @@ def test_execute_owned_returns_independent_copies(gpu_ready: None) -> None:
 
 @gpu
 def test_forced_two_pass_on_a_short_bucket_matches_the_oracle(gpu_ready: None) -> None:
-    """Both paths can be run on the same input; results are identical by contract."""
+    """Both paths accept the same input and produce identical results by contract."""
     import torch
 
     trades, offsets = _workload("uniform", 2, 500)
@@ -125,6 +133,7 @@ def test_forced_two_pass_on_a_short_bucket_matches_the_oracle(gpu_ready: None) -
 
 @gpu
 def test_forced_one_pass_keeps_the_explicit_capacity_check(gpu_ready: None) -> None:
+    """Forcing one-pass or a ``block_size`` on an oversized bucket raises, as in the launcher."""
     columns, dev_offsets = cuda_inputs(*_one_bucket(LIMIT + 1))
     with pytest.raises(kernels.BucketTooLargeError, match="at most 4096"):
         prepared.prepare(columns, dev_offsets, path="one_pass")
@@ -134,6 +143,7 @@ def test_forced_one_pass_keeps_the_explicit_capacity_check(gpu_ready: None) -> N
 
 @gpu
 def test_block_size_with_forced_two_pass_is_rejected(gpu_ready: None) -> None:
+    """``block_size`` applies to the one-pass path only and is rejected with two-pass."""
     columns, dev_offsets = cuda_inputs(*_one_bucket(10))
     with pytest.raises(ValueError, match="one-pass path only"):
         prepared.prepare(columns, dev_offsets, block_size=16, path="two_pass")
@@ -141,6 +151,7 @@ def test_block_size_with_forced_two_pass_is_rejected(gpu_ready: None) -> None:
 
 @gpu
 def test_pass_1_then_pass_2_reproduces_execute(gpu_ready: None) -> None:
+    """Running the passes individually fills the same buffers as ``execute``."""
     import torch
 
     trades, offsets = _workload("burst", 3, 1000)
@@ -160,6 +171,7 @@ def test_pass_1_then_pass_2_reproduces_execute(gpu_ready: None) -> None:
 
 @gpu
 def test_pass_entry_points_are_two_pass_only(gpu_ready: None) -> None:
+    """``run_pass_1`` and ``run_pass_2`` raise on a one-pass preparation, which has no passes."""
     ready = prepared.prepare(*cuda_inputs(*_one_bucket(100)))
     assert ready.path == "one_pass"
     with pytest.raises(ValueError, match="two-pass path only"):
@@ -170,6 +182,8 @@ def test_pass_entry_points_are_two_pass_only(gpu_ready: None) -> None:
 
 @gpu
 def test_all_empty_buckets_execute_to_zeros(gpu_ready: None) -> None:
+    """A window containing no records executes to all-invalid, zeroed features."""
+    # Both records fall outside the window [10W, 15W), so every offset is 1.
     trades = np.zeros(2, dtype=contract.TRADE_DTYPE)
     trades["timestamp"] = [0, 50 * W]
     trades["quantity"] = 1
@@ -183,6 +197,7 @@ def test_all_empty_buckets_execute_to_zeros(gpu_ready: None) -> None:
 
 @gpu
 def test_prepare_rejects_cpu_tensors(gpu_ready: None) -> None:
+    """``prepare`` is CUDA-only and rejects CPU tensors instead of moving them."""
     import torch
 
     trades, offsets = _one_bucket(10)
@@ -193,6 +208,7 @@ def test_prepare_rejects_cpu_tensors(gpu_ready: None) -> None:
 
 @gpu
 def test_prepare_validates_like_the_public_api(gpu_ready: None) -> None:
+    """``prepare`` runs the same offset and contiguity validation as ``ops.aggregate``."""
     import torch
 
     trades, offsets = _one_bucket(4)

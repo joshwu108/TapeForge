@@ -1,9 +1,10 @@
-# Kernel-only benchmark sweep (scope 1). Versioned so a results.json entry can
-# name the configuration that produced it.
+# Kernel-only benchmark sweep (scope 1). Versioned so that a results.json entry
+# can name the configuration that produced it.
 name = "kernel_sweep"
 scope = "kernel"
 
-# Aggregate-trade record counts. 48M only if it fits in device memory.
+# Aggregate-trade record counts per workload. A 48M size is valid only when it
+# fits in device memory.
 sizes = [100_000, 1_000_000, 10_000_000]
 profiles = ["sparse", "uniform", "burst"]
 seeds = [1, 2, 3]
@@ -13,9 +14,9 @@ warmup = 25
 repeats = 200
 synchronize = true
 
-# Row names are documented in benchmarks/kernel.py. Feature rows are gated
-# on correctness; the tapeforge_stage_* rows are preparation costs and are
-# not summable with the end-to-end rows.
+# Row names are documented in benchmarks/kernel.py. Feature rows are gated on
+# correctness; the tapeforge_stage_* rows are preparation costs that overlap
+# with the end-to-end rows and must not be summed with them.
 baselines = [
   "tapeforge_triton",
   "tapeforge_prepared",

@@ -1,8 +1,10 @@
-"""Shared tape builders for the execution simulator tests.
+"""Shared tape and spec builders for the execution simulator tests.
 
-The worksheet's worked examples are the specification: every tape here is
-written as literal per-bucket rows ``(total_quantity, vwap_ticks)`` so a test
-reads like the table it checks. ``None`` is an empty (invalid) bucket.
+Every tape is written as literal per-bucket rows ``(total_quantity, vwap_ticks)``
+so a test reads like the table it checks. ``None`` is an empty (invalid)
+bucket. The default tape and spec reproduce the hand-verified reference
+fixture whose fills, fees and shortfalls are asserted exactly in
+``test_oracles``.
 """
 
 from __future__ import annotations
@@ -17,20 +19,28 @@ from tapeforge.execution.state import MarketSlice
 
 Row = tuple[int, int] | None
 
-# Worksheet conventions: P_0 = 10,000 ticks, 10 bps taker fee, ceil rounding,
-# 10 % participation cap, d = 0, l = 0. Execution VWAPs 10,002 / 10,005 / 10,001.
-P0 = 10_000
+# Reference-fixture conventions: arrival price 10,000 ticks, 10 bps taker fee with
+# ceiling rounding, 10 % participation cap, zero data delay and zero latency.
+# Execution VWAPs are 10,002 / 10,005 / 10,001.
+P0 = 10_000  # Arrival price, in price ticks.
 EXEC_VWAPS = (10_002, 10_005, 10_001)
-DEEP = 2_000_000  # 20 BTC per bucket: the 10 % cap (200,000) never binds for TWAP
-Q_STAR = 300_000  # 3.00000 BTC
-P_T = 10_010
+DEEP = 2_000_000  # 20 BTC per bucket: the 10 % cap (200,000) never binds for TWAP.
+Q_STAR = 300_000  # Target quantity, 3.00000 BTC in quantity ticks.
+P_T = 10_010  # Terminal mark, in price ticks.
 
 
 def slice_from_rows(before: Sequence[Row], after: Sequence[Row]) -> MarketSlice:
-    """Slice with ``before`` as buckets ``-len(before) .. -1`` and ``after`` as ``0 ..``.
+    """Build a slice with ``before`` as buckets ``-len(before) .. -1`` and ``after`` as ``0 ..``.
 
     Every non-empty row is one record with no taker imbalance; a row
     ``(0, 0)`` is a valid bucket whose only record had zero quantity.
+
+    Args:
+        before: Rows for the history buckets, oldest first.
+        after: Rows for bucket 0 onwards.
+
+    Returns:
+        A ``MarketSlice`` with ``origin == len(before)``.
     """
     rows = list(before) + list(after)
     count = np.array([0 if r is None else 1 for r in rows], dtype=np.int64)
@@ -51,12 +61,23 @@ def worksheet_tape(
     vwaps: Sequence[int] = EXEC_VWAPS,
     after: Sequence[Row] = ((DEEP, P_T),),
 ) -> MarketSlice:
-    """Arrival bucket at P_0, the three execution buckets, then the terminal bucket."""
+    """Build the reference tape: an arrival bucket at ``P0``, the execution buckets, then ``after``.
+
+    Args:
+        totals: Total quantity per execution bucket, in quantity ticks.
+        vwaps: VWAP per execution bucket, in price ticks.
+        after: Rows appended after the execution buckets; the default is one
+            deep terminal bucket at ``P_T``.
+    """
     return slice_from_rows([(DEEP, P0)], [*zip(totals, vwaps, strict=True), *after])
 
 
 def worksheet_spec(side: int = 1, **overrides: int) -> EpisodeSpec:
-    """Example (a)/(b) spec: Q* = 300,000, H = 3, lookback 1, free coefficients off."""
+    """Build the reference spec: target 300,000, horizon 3, arrival lookback 1.
+
+    ``risk_lambda`` and ``residual_mu`` keep their zero defaults, which switch
+    the corresponding reward terms off. ``overrides`` replace any field.
+    """
     params: dict[str, int] = {
         "side": side,
         "target_qty_ticks": Q_STAR,
@@ -68,5 +89,5 @@ def worksheet_spec(side: int = 1, **overrides: int) -> EpisodeSpec:
 
 
 def frozen_bytes(objects: Sequence[object]) -> bytes:
-    """Byte-level identity for determinism tests."""
+    """Return a canonical pickle of ``objects`` for byte-level identity checks."""
     return pickle.dumps(list(objects), protocol=pickle.HIGHEST_PROTOCOL)

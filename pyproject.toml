@@ -15,11 +15,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# CPU development and the PyTorch-facing API.
+# CPU development and the PyTorch-facing API; no GPU required.
 torch = ["torch>=2.4"]
-# GPU engine. Linux + NVIDIA only; Triton has no macOS wheels.
+# GPU engine. Linux with an NVIDIA device only; Triton publishes no macOS wheels.
 gpu = ["torch>=2.4", "triton>=3.0"]
-# Model + reporting
+# Model training and result reporting.
 ml = ["torch>=2.4", "scikit-learn>=1.4", "matplotlib>=3.8"]
 dev = [
     "pytest>=8.0",
@@ -65,6 +65,6 @@ strict = true
 warn_unreachable = true
 
 [[tool.mypy.overrides]]
-# Triton ships no type information and has no macOS wheels.
+# Triton ships no type information and publishes no macOS wheels.
 module = ["triton", "triton.*"]
 ignore_missing_imports = true

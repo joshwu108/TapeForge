@@ -1,4 +1,9 @@
-"""Seeded episode sampling: reproducibility from (seed, index), domains, materialisation."""
+"""Tests for tapeforge.execution.sampling: a draw is a pure function of (seed, role, index), draws
+cover the whole side and target-fraction domain, and ``materialize`` cuts the episode a draw names.
+
+``_splits`` builds three flat single-price days whose prices identify the day a
+materialised episode came from.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +27,7 @@ DATES = ("2024-01-01", "2024-01-02", "2024-01-03")
 
 
 def _splits() -> Splits:
+    """Build splits over three flat days (two train, one validation) with distinct prices."""
     days = [
         DayTape(DATES[0], 0, W, slice_from_rows([], [(DEEP, P0)] * 60), "a"),
         DayTape(DATES[1], 60 * W, W, slice_from_rows([], [(DEEP + 1_000, P0 + 5)] * 60), "b"),
@@ -36,7 +42,7 @@ def test_a_draw_is_a_pure_function_of_seed_role_and_index() -> None:
     again = draw_episode(record, "train", seed=7, index=3)
     assert first == again
     assert sample_episodes(record, "train", 10, seed=7)[3] == first
-    assert sample_episodes(record, "train", 4, seed=7)[3] == first   # independent of n
+    assert sample_episodes(record, "train", 4, seed=7)[3] == first   # Independent of n.
     assert draw_episode(record, "train", seed=8, index=3) != first
 
 
@@ -64,7 +70,7 @@ def test_draw_fields_are_consistent_with_the_record() -> None:
 def test_sides_and_rhos_are_sampled_from_the_whole_domain() -> None:
     draws = sample_episodes(_splits().record, "train", 600, seed=11)
     buys = sum(1 for d in draws if d.side == 1)
-    assert 240 <= buys <= 360   # equal probability; a 5-sigma band around 300
+    assert 240 <= buys <= 360   # Equal probability; a 5-sigma band around 300.
     counts = {
         rho: sum(1 for d in draws if d.rho_bps == rho) for rho in ACCEPTED_TARGET_FRACTIONS_BPS
     }
@@ -99,7 +105,7 @@ def test_materialize_cuts_the_episode_the_draw_names() -> None:
     assert spec.side == draw.side and spec.horizon_buckets == 5
     expected_target = min(5 * DEEP * draw.rho_bps // 10_000, 5 * DEEP * 1_000 // 10_000)
     assert spec.target_qty_ticks == expected_target
-    assert set(market.vwap_ticks.tolist()) == {P0 + 9}   # validation day only
+    assert set(market.vwap_ticks.tolist()) == {P0 + 9}   # Validation day only.
     assert market.origin == splits.record.n_before and market.n_after == splits.record.n_after
 
 

@@ -1,4 +1,9 @@
-"""Replay runner: observations, trajectories, summaries, run records and reproducibility."""
+"""Tests for tapeforge.execution.runner: observations, trajectories, episode and set summaries,
+run records and seed reproducibility.
+
+Single episodes run on the reference fixture tape; set-level checks use
+``_synthetic_splits`` over three synthetic days.
+"""
 
 from __future__ import annotations
 
@@ -46,6 +51,7 @@ DATES = ("2024-01-01", "2024-01-02", "2024-01-03")
 
 
 def _synthetic_splits(seed: int = 1) -> Splits:
+    """Build splits over three synthetic days: two train, one validation, no test."""
     days = [
         synthetic_day(seed, DATES[0], 80, start_us=0),
         synthetic_day(seed + 1, DATES[1], 80, start_us=80 * W),
@@ -66,7 +72,7 @@ def test_observation_bundles_the_vector_with_exact_integers() -> None:
     np.testing.assert_array_equal(observation.vector, observe(state, market, spec))
     assert observation.remaining_qty_ticks == Q_STAR and observation.time_remaining_buckets == 3
     assert observation.target_qty_ticks == Q_STAR and observation.side == -1
-    assert observation.newest_bucket_total_qty_ticks == DEEP   # bucket -1 (d = 0)
+    assert observation.newest_bucket_total_qty_ticks == DEEP   # Bucket -1 with zero data delay.
     assert observation.participation_cap_bps == 1_000
 
 
@@ -84,7 +90,7 @@ def test_run_episode_matches_the_plain_rollout_helper() -> None:
 
 def test_run_episode_stops_on_truncation() -> None:
     spec = worksheet_spec(side=1)
-    market = slice_from_rows([(DEEP, P0)], [(DEEP, 10_002), (DEEP, 10_005)])  # one bucket short
+    market = slice_from_rows([(DEEP, P0)], [(DEEP, 10_002), (DEEP, 10_005)])  # One bucket short.
     trajectory = run_episode(spec, market, twap)
     assert trajectory.last_result.truncated and len(trajectory.results) == 3
     assert trajectory.final_state.filled_qty_ticks == 200_000
@@ -124,7 +130,8 @@ def test_episode_summary_of_the_worksheet_buy_table() -> None:
 def test_episode_summary_includes_the_residual_term_when_the_horizon_ends() -> None:
     spec, market = worksheet_spec(side=1, residual_mu=5), worksheet_tape()
     summary = summarize_episode(run_episode(spec, market, lambda _: 0.0))
-    # Nothing filled: IS = side x (P_T - P_0) x Q* + mu x Q* = 10 x 300,000 + 5 x 300,000.
+    # Nothing filled: shortfall = side x (terminal mark - arrival price) x target
+    # + residual_mu x target = 10 x 300,000 + 5 x 300,000.
     assert summary.shortfall_ticks == 3_000_000 + 1_500_000
     assert summary.terminal_price_ticks == 10_010 and not summary.completed
     assert summary.residual_qty_ticks == Q_STAR and summary.terminal_component_ticks == 4_500_000
@@ -156,7 +163,7 @@ def test_nearest_rank_percentile_is_the_textbook_definition() -> None:
     assert nearest_rank_percentile(values, 95) == 5.0
     assert nearest_rank_percentile(values, 100) == 5.0
     assert nearest_rank_percentile([7.0], 99) == 7.0
-    assert nearest_rank_percentile([1.0, 2.0, 3.0, 4.0], 50) == 2.0   # ceil(2) = 2nd value
+    assert nearest_rank_percentile([1.0, 2.0, 3.0, 4.0], 50) == 2.0   # ceil(2) = 2nd value.
     with pytest.raises(ValueError, match="undefined"):
         nearest_rank_percentile([], 50)
     with pytest.raises(ValueError, match=r"\[0, 100\]"):
@@ -211,6 +218,7 @@ def test_set_summary_rejects_an_empty_set() -> None:
 
 
 def _without_volatile_fields(record: dict) -> dict:
+    """Return ``record`` without the two fields that differ between otherwise identical runs."""
     return {k: v for k, v in record.items() if k not in ("created_utc", "code_revision")}
 
 
@@ -238,7 +246,7 @@ def test_run_record_has_the_documented_shape() -> None:
     assert episode["spec"]["target_qty_ticks"] == trajectories[0].spec.target_qty_ticks
     assert episode["summary"] == summarize_episode(trajectories[0]).to_json()
     assert record["code_revision"].keys() == {"commit", "dirty"}
-    json.dumps(record)  # every value is JSON-serialisable
+    json.dumps(record)  # Every value is JSON-serialisable.
 
 
 def test_same_seed_gives_byte_identical_records_and_different_seeds_differ(tmp_path: Path) -> None:
@@ -286,7 +294,11 @@ def test_code_revision_reports_a_commit_or_none() -> None:
 
 
 def test_code_revision_without_git_is_none_not_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An unpacked snapshot on a machine without git still gets a run record."""
+    """An unpacked snapshot on a machine without git still gets a run record.
+
+    Both a missing ``git`` binary and a directory that is not a repository
+    yield ``None`` fields rather than an exception.
+    """
     import subprocess
 
     def no_git(*args: object, **kwargs: object) -> None:

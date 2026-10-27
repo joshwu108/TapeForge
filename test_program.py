@@ -1,9 +1,10 @@
-"""Toy end-to-end check of the CUDA launcher on the hand-calculated example.
+"""End-to-end check of the CUDA launcher on the two-record reference example.
 
-Two records in bucket 0 (buy-initiated 100.00 x 2, sell-initiated 102.00 x 1)
-and an empty bucket 1: counts 2 / 0, total 3 / 0, signed +1 / 0, VWAP
-100.666... / 0.0. Needs a CUDA device and Triton; ``tools/verify_snapshot.py``
-runs it as the ``toy_program`` step and the test suites assert the same
+Bucket 0 holds a buy-initiated trade (100.00 x 2) and a sell-initiated trade
+(102.00 x 1); bucket 1 is empty. Expected features per bucket: event_count
+2 / 0, total_quantity 3 / 0, signed_quantity +1 / 0, vwap 100.666... / 0.0.
+Requires a CUDA device and Triton. ``tools/verify_snapshot.py`` runs this
+script as its ``toy_program`` step, and the pytest suites assert the same
 numbers on the CPU.
 """
 

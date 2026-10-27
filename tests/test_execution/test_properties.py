@@ -1,4 +1,10 @@
-"""Hypothesis: random tapes, random actions, both sides; every invariant and the reward identity."""
+"""Property tests for tapeforge.execution.simulator: random tapes, random actions and both sides
+must keep every step invariant, the reward identity, causality and byte-identical replay.
+
+The per-step invariants are shared with ``test_semantics.assert_step_invariants``;
+``episodes`` draws a spec, a slice with a priced arrival bucket and one action per
+decision.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +29,7 @@ _bucket = st.one_of(st.none(), _priced, st.integers(1, 3).map(lambda c: (c, 0, 0
 
 
 def _slice(before: list, after: list) -> MarketSlice:
+    """Build a slice from ``(count, total, signed, vwap)`` rows; ``None`` is an empty bucket."""
     rows = before + after
     count = np.array([0 if r is None else r[0] for r in rows], dtype=np.int64)
     total = np.array([0 if r is None else r[1] for r in rows], dtype=np.int64)
@@ -34,6 +41,7 @@ def _slice(before: list, after: list) -> MarketSlice:
 
 @st.composite
 def episodes(draw: st.DrawFn) -> tuple[EpisodeSpec, MarketSlice, list[float]]:
+    """Draw a spec, a slice whose arrival bucket is priced, and one action per decision."""
     horizon = draw(st.integers(1, 6))
     latency = draw(st.integers(0, 1))
     delay = draw(st.integers(0, 1))
@@ -53,7 +61,7 @@ def episodes(draw: st.DrawFn) -> tuple[EpisodeSpec, MarketSlice, list[float]]:
     )
     n_before = lookback + delay + draw(st.integers(0, 2))
     before = draw(st.lists(_bucket, min_size=n_before, max_size=n_before))
-    before[-1 - delay] = draw(_priced)  # the arrival price must exist
+    before[-1 - delay] = draw(_priced)  # The arrival price must exist.
     n_after = draw(st.integers(0, horizon + latency + lookback + 1))
     after = draw(st.lists(_bucket, min_size=n_after, max_size=n_after))
     actions = draw(st.lists(st.floats(0.0, 1.0), min_size=horizon, max_size=horizon))
@@ -74,7 +82,7 @@ def test_invariants_reward_identity_causality_and_replay(
             break
         observation = observe(state, market, spec)
         assert observation.shape == (10,) and np.all(np.isfinite(observation))
-        # Causality: any bucket at or after t - d is invisible to this observation.
+        # Causality: any bucket at or after ``t - data_delay_buckets`` is invisible here.
         for bucket in range(t - spec.data_delay_buckets, market.n_after):
             if market.has_bucket(bucket):
                 altered = market.with_bucket(bucket, event_count=1, total_quantity=1,
@@ -93,7 +101,7 @@ def test_invariants_reward_identity_causality_and_replay(
     if last.terminated:
         terminal = last.terminal_price_ticks if last.terminal_price_ticks else None
         shortfall = implementation_shortfall(final, spec, terminal)
-    else:  # truncated: the shortfall of the fills so far, no residual term
+    else:  # Truncated: the shortfall of the fills so far, with no residual term.
         shortfall = spec.side * (
             final.exec_notional_ticks - final.arrival_price_ticks * final.filled_qty_ticks
         ) + final.fees_ticks

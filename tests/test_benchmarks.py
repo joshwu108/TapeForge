@@ -1,8 +1,10 @@
-"""The benchmark baseline and harness are measured against, so they get tests too.
+"""Tests for the benchmarks package: the PyTorch baseline, correctness gate and harness.
 
-A wrong baseline makes every speedup figure wrong; the PyTorch baseline is
-checked here against the plain-loop oracle on CPU, including the window
-edge cases where a scatter-based implementation is most likely to slip.
+A wrong baseline makes every speedup figure wrong, so ``baselines.torch_index_add``
+is checked on the CPU against the plain-loop oracle
+``reference.aggregate_reference_naive``, including the window edge cases where a
+scatter-based implementation is most likely to slip. Workloads come from
+``benchmarks/workload.py``; harness tests write to a temporary results file.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ W = contract.DEFAULT_BUCKET_WIDTH_US
 
 
 def _run_baseline(trades: np.ndarray, offsets: np.ndarray) -> dict[str, object]:
+    """Run the PyTorch ``index_add`` baseline on CPU tensors built from ``trades``."""
     return baselines.torch_index_add(workload.host_columns(trades), torch.from_numpy(offsets))
 
 
@@ -40,6 +43,9 @@ def test_torch_baseline_matches_the_naive_loop(profile: str, seed: int) -> None:
 
 
 def test_torch_baseline_ignores_records_outside_the_window() -> None:
+    """Records before the window start or after its end must not reach any bucket."""
+    # The window is [W, 6W): the record at 0 precedes it and the record at 9W
+    # follows it, so the offsets exclude the first and last records.
     trades = np.zeros(6, dtype=contract.TRADE_DTYPE)
     trades["timestamp"] = [0, W, W, 2 * W + 5, 4 * W, 9 * W]
     trades["price"] = [1, 10_000, 10_200, 500, 700, 9]
@@ -61,6 +67,7 @@ def test_torch_baseline_with_no_records() -> None:
 
 
 def test_correctness_gate_rejects_a_wrong_dtype_and_a_wrong_value() -> None:
+    """The gate fails on a dtype mismatch and on a single off-by-one quantity sum."""
     trades, offsets, _ = workload.make_workload(500, "uniform", 3)
     expected = reference.aggregate_reference(trades, offsets)
     good = workload.features_dict(expected)
@@ -74,12 +81,14 @@ def test_correctness_gate_rejects_a_wrong_dtype_and_a_wrong_value() -> None:
 
 
 def test_environment_captures_provenance() -> None:
+    """Every recorded result carries interpreter, platform and library versions."""
     env = harness.capture_environment()
     assert env.python and env.platform and env.numpy and env.torch
     assert env.git_commit is None or env.git_dirty is not None
 
 
 def test_record_appends_without_touching_the_committed_results(tmp_path: Path) -> None:
+    """``harness.record`` appends to the given path in call order and never to the default."""
     path = tmp_path / "results.json"
     harness.record("kernel", "x", {"p50_ms": 1.0}, {"n": 1}, path=path)
     harness.record("kernel", "y", {"p50_ms": 2.0}, {"n": 2}, path=path)

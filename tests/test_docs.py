@@ -1,4 +1,9 @@
-"""Public documentation syntax, examples, and measurement claims."""
+"""Tests for the public documentation: RST validity, feature coverage, examples and claims.
+
+README.rst is parsed with docutils, every feature in ``contract.FEATURE_NAMES`` must
+be documented, every Python code block must execute on the CPU, and no speedup
+claim may appear before ``benchmarks/results.json`` records a GPU measurement.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +18,7 @@ RESULTS = Path(__file__).parent.parent / "benchmarks" / "results.json"
 
 
 def _parse_problems(text: str) -> list[str]:
+    """Return every docutils warning or error raised while parsing ``text`` as RST."""
     docutils = pytest.importorskip("docutils.core")
     problems: list[str] = []
 
@@ -23,8 +29,8 @@ def _parse_problems(text: str) -> list[str]:
     docutils.publish_doctree(
         text,
         settings_overrides={
-            "report_level": 2,       # warnings and worse
-            "halt_level": 5,         # collect rather than raise
+            "report_level": 2,       # Report warnings and worse.
+            "halt_level": 5,         # Collect problems instead of raising.
             "warning_stream": Collector(),
             "file_insertion_enabled": False,
         },
@@ -33,6 +39,7 @@ def _parse_problems(text: str) -> list[str]:
 
 
 def test_readme_is_valid_restructuredtext() -> None:
+    """README.rst parses without docutils warnings, so it renders on every host."""
     problems = _parse_problems(README.read_text())
     assert not problems, "README.rst has RST errors:\n" + "".join(problems)
 
@@ -47,6 +54,7 @@ def test_readme_documents_every_public_feature() -> None:
 
 
 def _recorded_gpu_kernel_results() -> list[dict[str, object]]:
+    """Return the kernel-scope result entries recorded on a GPU that ran and verified."""
     results = json.loads(RESULTS.read_text() or "[]")
     return [
         entry
@@ -61,10 +69,9 @@ def _recorded_gpu_kernel_results() -> list[dict[str, object]]:
 def test_readme_publishes_no_speedup_claim_before_a_gpu_measurement_exists() -> None:
     """No speedup figure is published until a recorded benchmark reproduces it.
 
-    Guards against earlier, unrecorded figures drifting into the public docs
-    ahead of the measurements. The kernel existing is not enough: the guard lifts only
-    once benchmarks/results.json holds a correct, successful kernel-scope entry
-    recorded on a GPU; failed or unsupported runs do not count.
+    The kernel existing is not enough: the guard lifts only once
+    benchmarks/results.json holds a correct, successful kernel-scope entry
+    recorded on a GPU. Failed or unsupported runs do not count.
     """
     if _recorded_gpu_kernel_results():
         pytest.skip("a GPU kernel measurement is recorded; claims must cite it")
@@ -76,6 +83,7 @@ def test_readme_publishes_no_speedup_claim_before_a_gpu_measurement_exists() -> 
 
 
 def _python_blocks(text: str) -> list[str]:
+    """Return the dedented body of every ``.. code-block:: python`` directive in ``text``."""
     blocks: list[str] = []
     lines = text.splitlines()
     for i, line in enumerate(lines):
@@ -96,4 +104,4 @@ def test_readme_python_examples_run() -> None:
     blocks = _python_blocks(README.read_text())
     assert blocks, "README has no Python example to check"
     for block in blocks:
-        exec(compile(block, "README.rst", "exec"), {})  # noqa: S102 - our own docs
+        exec(compile(block, "README.rst", "exec"), {})  # noqa: S102 - repository-owned docs

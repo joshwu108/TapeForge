@@ -1,9 +1,11 @@
-"""Public aggTrades loading, normalization and validation.
+"""Tests for ``tapeforge.ingest``: aggTrades loading, normalization and validation.
 
-No network access: every case runs against the committed fixtures in
+Covers exact decimal-to-tick conversion, timestamp unit detection, the output
+schema, provenance, input validation and checksum-verified download. No test
+touches the network: every case runs against the committed fixtures in
 tests/fixtures/, which are 5-row excerpts in the two layouts the archive has
-shipped -- 2025-onward (header row, microsecond timestamps) and legacy
-(no header, millisecond timestamps).
+shipped -- 2025-onward (header row, microsecond timestamps) and legacy (no
+header, millisecond timestamps). Download tests monkeypatch ``urlopen``.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ ZIP_US = FIXTURES / "BTCUSDT-aggTrades-2025-01-02.zip"
     ],
 )
 def test_decimal_strings_convert_exactly(text: str, scale: int, expected: int) -> None:
-    """Integer string arithmetic, not a float round-trip: never a tick off."""
+    """Integer string arithmetic, not a float round-trip, so no converted value is a tick off."""
     got = ingest.decimal_strings_to_ticks(np.array([text]), scale)
     assert got.dtype == np.int64
     assert got[0] == expected
@@ -50,7 +52,7 @@ def test_precision_beyond_the_scale_is_rejected_not_truncated() -> None:
 
 
 def test_trailing_zeros_are_not_precision() -> None:
-    """"1.10000000" is two significant decimals, not eight."""
+    """The string "1.10000000" carries two significant decimals, not eight."""
     got = ingest.decimal_strings_to_ticks(np.array(["1.10000000"]), contract.PRICE_SCALE)
     assert got[0] == 110
 
@@ -58,8 +60,8 @@ def test_trailing_zeros_are_not_precision() -> None:
 def test_a_symbol_the_scales_cannot_represent_fails_loudly(tmp_path: Path) -> None:
     """The fixed-scale limitation is enforced by refusing, never by truncating.
 
-    SHIBUSDT-style prices carry 8 significant decimals. The chosen BTCUSDT
-    scales cannot hold them, and the error says what to do about it.
+    SHIBUSDT-style prices carry 8 significant decimals. The BTCUSDT scales
+    cannot hold them, and the error message names the per-symbol remedy.
     """
     with pytest.raises(ValueError, match="per-symbol scales"):
         ingest.load_agg_trades(FIXTURES / "aggTrades_overprecise_price.csv")
@@ -79,14 +81,14 @@ def test_microsecond_file_is_detected_and_left_in_microseconds() -> None:
 
 
 def test_millisecond_file_is_detected_and_scaled_up() -> None:
-    """Legacy archives are ms; everything downstream assumes us."""
+    """Legacy archives carry millisecond timestamps; all downstream code assumes microseconds."""
     trades, prov = ingest.load_agg_trades(CSV_MS)
     assert prov.timestamp_unit == "ms"
     assert trades["timestamp"][0] == 1_704_153_600_100 * 1_000
 
 
 def test_both_layouts_agree_on_the_relative_timeline() -> None:
-    """Same 5 records, two eras: the within-day offsets must match."""
+    """The same 5 records in both archive layouts yield identical within-day offsets."""
     us, _ = ingest.load_agg_trades(CSV_US)
     ms, _ = ingest.load_agg_trades(CSV_MS)
     np.testing.assert_array_equal(
@@ -104,9 +106,9 @@ def test_output_matches_the_trade_dtype() -> None:
 
 def test_prices_and_quantities_are_scaled_integers() -> None:
     trades, _ = ingest.load_agg_trades(CSV_US)
-    assert trades["price"][0] == 9_459_178          # 94591.78
+    assert trades["price"][0] == 9_459_178          # 94591.78 at PRICE_SCALE 1e2.
     assert trades["quantity"][0] == 2 * contract.QUANTITY_SCALE
-    assert trades["quantity"][3] == 100            # 0.001 units at 1e5
+    assert trades["quantity"][3] == 100            # 0.001 units at QUANTITY_SCALE 1e5.
 
 
 def test_buyer_is_maker_parses_as_bool_both_ways() -> None:
@@ -122,7 +124,7 @@ def test_agg_trade_ids_are_preserved_for_deterministic_replay() -> None:
 
 
 def test_duplicate_timestamps_are_preserved_not_deduplicated() -> None:
-    """Two records sharing a microsecond is normal; dropping one is a bug."""
+    """Two records sharing a microsecond is normal archive data; dropping one would be a bug."""
     trades, _ = ingest.load_agg_trades(CSV_US)
     assert np.sum(np.diff(trades["timestamp"]) == 0) == 2
 
@@ -169,7 +171,7 @@ def test_empty_file_is_rejected(tmp_path: Path) -> None:
 
 
 def test_unsorted_input_is_sorted_and_flagged(tmp_path: Path) -> None:
-    """The archive is sorted; if it is not, say so rather than trusting it."""
+    """Unsorted input is sorted and flagged in provenance rather than trusted as-is."""
     rows = CSV_US.read_text().splitlines()
     shuffled = tmp_path / "shuffled.csv"
     shuffled.write_text("\n".join([rows[0], rows[3], rows[1], rows[2], rows[4], rows[5]]) + "\n")
@@ -214,7 +216,7 @@ def test_leading_decimal_point_is_handled() -> None:
 
 
 def test_real_archive_values_round_trip_exactly() -> None:
-    """Rows copied verbatim from BTCUSDT 2025-01-02, the canonical day."""
+    """Values copied verbatim from BTCUSDT 2025-01-02, the canonical day, convert exactly."""
     prices = np.array(["94591.78000000", "97839.50000000", "94392.00000000"])
     quantities = np.array(["0.00181000", "18.89042000", "0.00001000"])
     np.testing.assert_array_equal(
@@ -237,7 +239,7 @@ def test_unparseable_buyer_is_maker_is_rejected(tmp_path: Path) -> None:
 
 
 def test_implausible_timestamp_reports_a_unit_detection_failure(tmp_path: Path) -> None:
-    """A timestamp that is neither plausible ms nor us must not be guessed at."""
+    """A timestamp that is neither plausible ms nor us is an error, not a guess."""
     header, first = CSV_US.read_text().splitlines()[:2]
     fields = first.split(",")
     fields[5] = "999"
@@ -273,6 +275,7 @@ def test_unit_detection_needs_at_least_one_record() -> None:
 def test_provenance_falls_back_when_the_filename_is_not_the_archive_pattern(
     tmp_path: Path,
 ) -> None:
+    """A file outside the archive naming pattern loads with symbol and date ``"unknown"``."""
     renamed = tmp_path / "whatever.csv"
     renamed.write_text(CSV_US.read_text())
     _, prov = ingest.load_agg_trades(renamed)
@@ -282,7 +285,7 @@ def test_provenance_falls_back_when_the_filename_is_not_the_archive_pattern(
 # --- download safety (no real network) -----------------------------------
 
 def test_download_deletes_the_file_on_a_checksum_mismatch(tmp_path, monkeypatch) -> None:
-    """A corrupt download must not be left behind to be silently reused."""
+    """A download whose checksum mismatches is deleted so it cannot be silently reused."""
     import contextlib
     import io as _io
 
@@ -299,6 +302,7 @@ def test_download_deletes_the_file_on_a_checksum_mismatch(tmp_path, monkeypatch)
 
 
 def test_download_accepts_a_matching_checksum(tmp_path, monkeypatch) -> None:
+    """A download whose checksum matches is kept and loads as a normal archive."""
     import contextlib
     import hashlib
     import io as _io
@@ -318,6 +322,7 @@ def test_download_accepts_a_matching_checksum(tmp_path, monkeypatch) -> None:
 
 
 def test_cli_reports_the_schema_without_network(capsys, monkeypatch) -> None:
+    """``--path`` inspects a local archive and prints its schema summary without downloading."""
     assert ingest.main(["--path", str(ZIP_US)]) == 0
     printed = capsys.readouterr().out
     assert "aggregate-trade records" in printed

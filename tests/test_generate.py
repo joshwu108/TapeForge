@@ -1,4 +1,9 @@
-"""Deterministic synthetic trade generation."""
+"""Tests for ``tapeforge.generate``: determinism, dtype, profile shape, validation and CLI.
+
+Reproducibility is checked both in-process and across a fresh interpreter;
+profile tests assert the statistical shape each profile promises (empty buckets,
+heavy tail, duplicate timestamps) rather than exact values.
+"""
 
 from __future__ import annotations
 
@@ -53,10 +58,10 @@ def test_agg_trade_ids_are_unique_and_increasing() -> None:
 
 
 def test_determinism_survives_a_fresh_interpreter() -> None:
-    """The generator's real claim: reproducible across processes, not just calls.
+    """Generation is reproducible across processes, not only across calls.
 
     An in-process check would pass even if the generator read a module-level
-    RNG, so this spawns a new interpreter and compares the raw bytes.
+    RNG, so this spawns a new interpreter twice and compares the raw bytes.
     """
     import subprocess
     import sys
@@ -111,13 +116,13 @@ def test_non_positive_width_is_rejected() -> None:
 
 
 def test_all_empty_output_still_has_the_right_dtype() -> None:
-    """A sparse run short enough to draw nothing must not return a bare array."""
+    """A sparse run short enough to draw nothing still returns ``TRADE_DTYPE``, not a bare array."""
     empty = generate.generate_trades(seed=1, n_buckets=1, profile="sparse", width_us=1_000)
     assert empty.dtype == contract.TRADE_DTYPE
 
 
 def test_cli_writes_a_loadable_reproducible_sample(tmp_path, capsys) -> None:
-    """CLI behavior: the documented command produces a sample."""
+    """The documented CLI command writes a sample equal to the in-process generator output."""
     out = tmp_path / "sample.npy"
     assert generate.main(["--seed", "7", "--seconds", "10", "--profile", "burst",
                           "--out", str(out)]) == 0

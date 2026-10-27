@@ -1,9 +1,12 @@
-"""The PyTorch-facing API: input formats, dispatch, and CPU correctness.
+"""Tests for ``tapeforge.ops``: input formats, dispatch, CPU correctness and validation.
 
-Every correctness check here compares against an independent oracle --
-hand-calculated values or ``reference.aggregate_reference_naive`` (a plain
-Python loop) -- never against the vectorized reference that the CPU path
-itself calls. GPU dispatch is covered in test_gpu_parity.py.
+Every correctness check compares against an independent oracle -- the
+two-record reference example in ``conftest.TOY_EXPECTED``, values derived in
+the test body, or ``reference.aggregate_reference_naive`` (a plain Python
+loop) -- never against the vectorized reference that the CPU path itself
+calls. Each test runs on both the NumPy structured-array input and the
+tensor-column input via the ``FORMATS`` parametrization. GPU dispatch is
+covered in test_gpu_parity.py.
 """
 
 from __future__ import annotations
@@ -33,7 +36,11 @@ DTYPES = {
 
 
 def _trades(rows: list[tuple[int, float, float, bool]]) -> np.ndarray:
-    """TRADE_DTYPE array from (second, price, quantity, buyer_is_maker)."""
+    """Build a ``TRADE_DTYPE`` array from ``(second, price, quantity, buyer_is_maker)`` tuples.
+
+    Prices and quantities are given in real units and scaled to ticks; the
+    record index doubles as ``agg_trade_id``.
+    """
     out = np.zeros(len(rows), dtype=contract.TRADE_DTYPE)
     for i, (second, price, qty, bim) in enumerate(rows):
         out[i] = (second * contract.US_PER_SECOND, round(price * P), round(qty * Q), bim, i)
@@ -41,10 +48,12 @@ def _trades(rows: list[tuple[int, float, float, bool]]) -> np.ndarray:
 
 
 def _as_numpy(trades: np.ndarray, offsets: np.ndarray) -> tuple[Any, Any]:
+    """Pass the structured array and offsets through unchanged (the NumPy input format)."""
     return trades, offsets
 
 
 def _as_tensors(trades: np.ndarray, offsets: np.ndarray) -> tuple[Any, Any]:
+    """Convert the structured array into CPU column tensors (the tensor input format)."""
     columns = {name: torch.from_numpy(trades[name].copy()) for name in trades.dtype.names}
     return columns, torch.from_numpy(offsets.copy())
 
@@ -54,10 +63,12 @@ Formatter = Callable[[np.ndarray, np.ndarray], tuple[Any, Any]]
 
 
 def _run(to_format: Formatter, trades: np.ndarray, offsets: np.ndarray) -> dict[str, Any]:
+    """Aggregate ``trades`` after converting the inputs with ``to_format``."""
     return ops.aggregate(*to_format(trades, offsets))
 
 
 def _assert_matches(got: dict[str, Any], expected: reference.Features) -> None:
+    """Assert counts, sums and validity exactly and VWAP within the contract tolerances."""
     for name in ("event_count", "total_quantity", "signed_quantity", "valid"):
         np.testing.assert_array_equal(got[name].numpy(), getattr(expected, name), err_msg=name)
     np.testing.assert_allclose(
@@ -70,6 +81,7 @@ def _assert_matches(got: dict[str, Any], expected: reference.Features) -> None:
 
 @FORMATS
 def test_returns_documented_keys_shapes_and_dtypes(to_format: Formatter) -> None:
+    """Output keys follow ``FEATURE_NAMES`` order with the documented dtypes, on the CPU."""
     trades = generate.generate_trades(seed=4, n_buckets=7, profile="uniform")
     offsets = windows.build_offsets(trades["timestamp"], 0, 7, W)
     got = _run(to_format, trades, offsets)
@@ -84,6 +96,7 @@ def test_returns_documented_keys_shapes_and_dtypes(to_format: Formatter) -> None
 
 @FORMATS
 def test_toy_example(to_format: Formatter) -> None:
+    """The two-record reference example reproduces the shared ``TOY_EXPECTED`` numbers."""
     trades = _trades([(1, 100.0, 2.0, False), (1, 102.0, 1.0, True)])
     offsets = windows.build_offsets(trades["timestamp"], 1 * contract.US_PER_SECOND, 1, W)
     got = _run(to_format, trades, offsets)
@@ -103,6 +116,7 @@ def test_toy_example(to_format: Formatter) -> None:
 def test_matches_the_naive_loop_across_seeds_and_profiles(
     to_format: Formatter, profile: str, seed: int
 ) -> None:
+    """Generated workloads of every profile match the plain-loop oracle in both formats."""
     trades = generate.generate_trades(seed=seed, n_buckets=40, profile=profile)
     offsets = windows.build_offsets(trades["timestamp"], 0, 40, W)
     _assert_matches(
@@ -115,6 +129,9 @@ def test_matches_the_naive_loop_across_seeds_and_profiles(
 
 @FORMATS
 def test_empty_buckets_are_invalid_and_zeroed(to_format: Formatter) -> None:
+    """A bucket with no records is flagged invalid and every feature reads zero."""
+    # Records land in seconds 0 and 3 of a four-bucket window; buckets 1 and 2
+    # are empty.
     trades = _trades([(0, 100.0, 1.0, False), (3, 200.0, 2.0, True)])
     offsets = windows.build_offsets(trades["timestamp"], 0, 4, W)
     got = _run(to_format, trades, offsets)
@@ -128,6 +145,7 @@ def test_empty_buckets_are_invalid_and_zeroed(to_format: Formatter) -> None:
 
 @FORMATS
 def test_no_records_at_all(to_format: Formatter) -> None:
+    """Zero records with a non-empty window yields all-invalid, all-zero buckets."""
     empty = np.zeros(0, dtype=contract.TRADE_DTYPE)
     offsets = windows.build_offsets(empty["timestamp"], 0, 3, W)
     got = _run(to_format, empty, offsets)
@@ -139,6 +157,9 @@ def test_no_records_at_all(to_format: Formatter) -> None:
 
 @FORMATS
 def test_records_outside_the_window_leave_every_bucket_empty(to_format: Formatter) -> None:
+    """Records before and after the window contribute to no bucket."""
+    # The window starts at second 10; the record at second 0 precedes it and
+    # the record at second 50 follows it, so every offset is 1.
     trades = _trades([(0, 100.0, 1.0, False), (50, 100.0, 1.0, False)])
     offsets = windows.build_offsets(trades["timestamp"], 10 * contract.US_PER_SECOND, 5, W)
     assert offsets.tolist() == [1, 1, 1, 1, 1, 1]
@@ -149,6 +170,7 @@ def test_records_outside_the_window_leave_every_bucket_empty(to_format: Formatte
 
 @FORMATS
 def test_zero_quantity_rows_count_but_give_zero_vwap(to_format: Formatter) -> None:
+    """Zero-quantity rows count as events and mark the bucket valid; the VWAP is 0, never NaN."""
     trades = _trades([(0, 100.0, 0.0, False), (0, 105.0, 0.0, True), (1, 101.0, 0.0, True)])
     offsets = windows.build_offsets(trades["timestamp"], 0, 2, W)
     got = _run(to_format, trades, offsets)
@@ -163,6 +185,7 @@ def test_zero_quantity_rows_count_but_give_zero_vwap(to_format: Formatter) -> No
 
 @FORMATS
 def test_zero_quantity_rows_do_not_move_vwap(to_format: Formatter) -> None:
+    """A zero-quantity row at an extreme price leaves the quantity-weighted VWAP unchanged."""
     trades = _trades([(0, 100.0, 2.0, False), (0, 999.0, 0.0, True)])
     offsets = windows.build_offsets(trades["timestamp"], 0, 1, W)
     got = _run(to_format, trades, offsets)
@@ -172,13 +195,13 @@ def test_zero_quantity_rows_do_not_move_vwap(to_format: Formatter) -> None:
 
 @FORMATS
 def test_sign_convention_follows_buyer_is_maker(to_format: Formatter) -> None:
-    """buyer_is_maker=True: the seller hit the bid, so the trade is sell-initiated."""
+    """``buyer_is_maker=True`` means the seller hit the bid, so the trade is sell-initiated."""
     trades = _trades(
         [
-            (0, 100.0, 1.0, True),   # all sell-initiated
+            (0, 100.0, 1.0, True),   # Bucket 0: all sell-initiated, -(1 + 2).
             (0, 100.0, 2.0, True),
-            (1, 100.0, 1.5, False),  # all buy-initiated
-            (2, 100.0, 4.0, False),  # mixed: +4 - 1.25
+            (1, 100.0, 1.5, False),  # Bucket 1: all buy-initiated, +1.5.
+            (2, 100.0, 4.0, False),  # Bucket 2: mixed, +4 - 1.25 = 2.75.
             (2, 100.0, 1.25, True),
         ]
     )
@@ -202,14 +225,14 @@ def test_window_boundaries_are_half_open(to_format: Formatter) -> None:
     offsets = windows.build_offsets(trades["timestamp"], 0, 2, W)
     got = _run(to_format, trades, offsets)
 
-    assert offsets.tolist() == [0, 1, 3]  # the record at 2W is outside the window
+    assert offsets.tolist() == [0, 1, 3]  # The record at 2W is outside the window.
     assert got["event_count"].tolist() == [1, 2]
     assert got["vwap"].tolist() == pytest.approx([100.0, 250.0], rel=contract.VWAP_RTOL)
 
 
 @FORMATS
 def test_large_single_bucket_is_exact_on_cpu(to_format: Formatter) -> None:
-    """The CPU path has no bucket-size limit: 20,000 records in one second."""
+    """The CPU path has no bucket-size limit: 20,000 records in one second stay exact."""
     n = 20_000
     trades = np.zeros(n, dtype=contract.TRADE_DTYPE)
     trades["price"] = 100 * P + np.arange(n) % 7
@@ -226,6 +249,9 @@ def test_large_single_bucket_is_exact_on_cpu(to_format: Formatter) -> None:
 
 @FORMATS
 def test_sums_just_inside_the_int64_bound_are_exact(to_format: Formatter) -> None:
+    """Products summing to just under ``INT64_MAX`` are accumulated exactly."""
+    # n * price * qty is as close to INT64_MAX as integer division allows;
+    # one sell against three buys gives a signed quantity of +2 * qty.
     n = 4
     price, qty = 2**30, (contract.INT64_MAX // (n * 2**30))
     trades = np.zeros(n, dtype=contract.TRADE_DTYPE)
@@ -241,6 +267,7 @@ def test_sums_just_inside_the_int64_bound_are_exact(to_format: Formatter) -> Non
 
 @FORMATS
 def test_sums_past_the_int64_bound_raise_instead_of_wrapping(to_format: Formatter) -> None:
+    """One quantity tick past the exact bound raises ``OverflowError`` rather than wrapping."""
     n = 4
     price, qty = 2**30, (contract.INT64_MAX // (n * 2**30)) + 1
     trades = np.zeros(n, dtype=contract.TRADE_DTYPE)
@@ -255,7 +282,7 @@ def test_overflow_bound_uses_the_longest_bucket_not_the_record_count() -> None:
     price, qty = 2**30, contract.INT64_MAX // (2 * 2**30)
     trades = np.zeros(n, dtype=contract.TRADE_DTYPE)
     trades["price"], trades["quantity"] = price, qty
-    offsets = np.arange(0, n + 1, 2, dtype=np.int64)  # 500 buckets of 2 records
+    offsets = np.arange(0, n + 1, 2, dtype=np.int64)  # 500 buckets of 2 records each.
     got = ops.aggregate(trades, offsets)
     assert (got["total_quantity"] == 2 * qty).all()
 
@@ -264,6 +291,7 @@ def test_overflow_bound_uses_the_longest_bucket_not_the_record_count() -> None:
 
 
 def _cpu_inputs() -> tuple[dict[str, Any], Any]:
+    """Build a valid three-record, two-bucket tensor input for the validation tests."""
     trades = _trades([(0, 100.0, 1.0, False), (0, 101.0, 2.0, True), (1, 99.0, 1.0, False)])
     return _as_tensors(trades, np.array([0, 2, 3], dtype=np.int64))
 
@@ -298,6 +326,7 @@ def _cpu_inputs() -> tuple[dict[str, Any], Any]:
     ],
 )
 def test_invalid_columns_are_rejected(mutate: Any, error: type, match: str) -> None:
+    """Each malformed column is rejected with the documented error type and message."""
     columns, offsets = _cpu_inputs()
     mutate(columns, offsets)
     with pytest.raises(error, match=match):
@@ -314,6 +343,7 @@ def test_invalid_columns_are_rejected(mutate: Any, error: type, match: str) -> N
     ],
 )
 def test_invalid_offsets_are_rejected(offsets: list[int], error: type, match: str) -> None:
+    """Decreasing, out-of-range, negative or too-short offsets are rejected before dispatch."""
     columns, _ = _cpu_inputs()
     with pytest.raises(error, match=match):
         ops.aggregate(columns, torch.tensor(offsets, dtype=torch.int64))
@@ -358,6 +388,7 @@ def test_unsupported_trade_container_is_rejected() -> None:
 
 
 def test_unsupported_device_is_rejected_not_silently_moved() -> None:
+    """Inputs on a device without a kernel path raise rather than being copied to the CPU."""
     columns, offsets = _cpu_inputs()
     meta = {name: col.to("meta") for name, col in columns.items()}
     with pytest.raises(ValueError, match="unsupported device"):
@@ -372,6 +403,7 @@ def test_columns_on_another_device_than_offsets_are_rejected() -> None:
 
 
 def test_extra_columns_are_ignored() -> None:
+    """Columns outside the contract are ignored, so callers may pass wider mappings."""
     columns, offsets = _cpu_inputs()
     columns["note"] = torch.zeros(1)
     assert ops.aggregate(columns, offsets)["event_count"].tolist() == [2, 1]

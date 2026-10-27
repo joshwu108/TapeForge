@@ -1,16 +1,17 @@
-"""Pure-PyTorch baseline for the kernel benchmark: searchsorted + index_add_.
+"""Pure-PyTorch baseline for the kernel benchmark: searchsorted plus index_add.
 
-Same inputs and outputs as ``tapeforge.ops.aggregate`` on tensors, built only
-from stock PyTorch ops, with no host sync, so it runs eagerly or under
-``torch.compile`` on any device. Every record is mapped to its bucket with
+The baseline takes the same inputs and produces the same outputs as
+``tapeforge.ops.aggregate`` on tensors, built only from stock PyTorch ops
+with no host synchronisation, so it runs eagerly or under ``torch.compile``
+on any device. Every record is mapped to its bucket with
 ``torch.searchsorted`` over ``offsets``; records outside
-``[offsets[0], offsets[-1])`` get zero weight. Sums use int64
-``index_add_`` (exact), and VWAP is one float64 division, in the same order
-as the reference.
+``[offsets[0], offsets[-1])`` get zero weight. Sums use int64 ``index_add``
+(exact), and VWAP is one float64 division, in the same order as the
+reference.
 
-This is a fair baseline, not a straw man: it reads each input once and
-writes each output once, like the fused kernel, but goes through several
-separate PyTorch kernels and a searchsorted.
+The baseline is representative rather than deliberately weak: it reads each
+input once and writes each output once, like the fused kernel, but through
+several separate PyTorch kernels and a searchsorted.
 """
 
 from __future__ import annotations
@@ -21,10 +22,20 @@ from tapeforge import contract
 
 
 def torch_index_add(columns: dict[str, Any], offsets: Any) -> dict[str, Any]:
-    """The five features from stock PyTorch ops, on whichever device the inputs live.
+    """Compute the five features from stock PyTorch ops on the device the inputs live on.
 
-    No validation and no host synchronisation, so the timed region is the
-    tensor work alone. The caller is responsible for the int64 bound.
+    No validation and no host synchronisation take place, so a timed region
+    around this call holds the tensor work alone. The caller is responsible
+    for keeping the sums within the int64 bound.
+
+    Args:
+        columns: ``price``, ``quantity`` and ``buyer_is_maker`` tensors on one device.
+        offsets: Bucket boundaries of length ``n_buckets + 1``, on the same device.
+
+    Returns:
+        The feature dict in the shape ``tapeforge.ops.aggregate`` returns:
+        ``event_count``, ``total_quantity``, ``signed_quantity``, ``vwap``
+        and ``valid``.
     """
     import torch
 

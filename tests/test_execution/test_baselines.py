@@ -1,4 +1,9 @@
-"""Baselines: TWAP completes when liquidity allows, immediate hits the cap, the cap-aware rule."""
+"""Tests for tapeforge.execution.baselines: TWAP shares, immediate submission, cap-aware catch-up
+and the registry.
+
+Episodes run through ``run_episode`` on the reference fixture tape and spec from
+``test_execution.tapes``; ``_observation`` builds the policy input directly.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +24,7 @@ from test_execution.tapes import DEEP, P0, Q_STAR, slice_from_rows, worksheet_sp
 
 def _observation(remaining: int, time_remaining: int, newest_total: int = DEEP,
                  cap_bps: int = 1_000) -> Observation:
+    """Build an ``Observation`` with a zero feature vector and the given scalar fields."""
     import numpy as np
 
     return Observation(
@@ -53,7 +59,7 @@ def test_twap_completes_exactly_when_liquidity_allows() -> None:
 def test_twap_leaves_a_residual_only_when_the_cap_binds() -> None:
     spec = worksheet_spec(side=1)
     thin = slice_from_rows([(DEEP, P0)], [(500_000, 10_002), (500_000, 10_005), (500_000, 10_001),
-                                          (DEEP, 10_010)])  # cap 50,000 per bucket
+                                          (DEEP, 10_010)])  # The 10 % cap is 50,000 per bucket.
     trajectory = run_episode(spec, thin, twap)
     # Shares: 300,000 / 3, then 250,000 / 2, then all 200,000 left; each fills the 50,000 cap.
     assert [r.fill_qty_ticks for r in trajectory.results] == [50_000, 50_000, 50_000]
@@ -104,11 +110,11 @@ def test_cap_aware_twap_submits_the_catch_up_quantity_on_a_thin_tape() -> None:
     assert [r.submitted_qty_ticks for r in aware.results] == [200_000, 200_000, 200_000]
     # Over-submitting is free under the fill rule, so both fill the same capped 150,000.
     assert aware.final_state.filled_qty_ticks == plain.final_state.filled_qty_ticks == 150_000
-    assert aware.results[0].fill_qty_ticks == 50_000   # the real cap still binds
+    assert aware.results[0].fill_qty_ticks == 50_000   # The real cap still binds.
 
 
 def test_cap_aware_twap_catches_up_after_a_thin_bucket() -> None:
-    """Deep history, one thin bucket visible: the policy raises its share, then relaxes."""
+    """A thin bucket in the observation raises the next share; deep buckets afterwards relax it."""
     spec = EpisodeSpec(side=1, target_qty_ticks=300_000, horizon_buckets=4, arrival_lookback=1)
     market = slice_from_rows([(DEEP, P0)], [(DEEP, 10_002), (200_000, 10_005), (DEEP, 10_001),
                                             (DEEP, 10_003), (DEEP, 10_010)])

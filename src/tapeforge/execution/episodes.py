@@ -1,25 +1,31 @@
-"""Episode construction: the tape window an episode needs, V_ref and the target Q*.
+"""Episode construction: the tape window an episode needs and target sizing.
 
 Given a day's trades and bucket offsets, ``make_episode`` cuts the
-``MarketSlice`` around a start bucket ``t_0`` and sizes the target from the
-volume *before* ``t_0``:
+``MarketSlice`` around a start bucket and sizes ``target_qty_ticks`` from the
+volume *before* the start::
 
-    V_ref = total quantity over the H buckets preceding t_0   (causal)
-    Q*    = round_half_up(rho * V_ref), rho in basis points,
-            floored at one tick, capped at participation_cap * V_ref
+    v_ref_ticks      = total quantity over the horizon_buckets buckets
+                       preceding the start (causal)
+    target_qty_ticks = round_half_up(rho_bps * v_ref_ticks), rho_bps in
+                       basis points, capped at participation_cap_bps *
+                       v_ref_ticks, then floored at one tick
 
-Using the episode's own future volume for V_ref would leak; using the
-preceding H buckets is known at ``t_0``. The cap is the participation cap
-applied to the reference volume, the quantity the fill rule could complete
-over H buckets of volume like the reference window, so completion is
-feasible by construction when the future resembles the past. The one-tick
-floor is applied last so Q* is always positive.
+Using the episode's own future volume for the reference volume would leak;
+the preceding ``horizon_buckets`` buckets are known at the start. The cap is
+the participation cap applied to the reference volume: the quantity the fill
+rule could complete over ``horizon_buckets`` buckets of volume like the
+reference window, so completion is feasible by construction when the future
+resembles the past. The one-tick floor is applied last, so the target is
+always positive.
 
-Window: ``required_window`` returns how many buckets before and after ``t_0``
-the slice must carry: ``max(H, L + d)`` before (reference volume and arrival
-lookback under the data delay) and ``H + l + L`` after (every fill bucket plus
-the terminal-mark search). A day that ends early yields a shorter slice and a
-truncated episode; too little history before ``t_0`` is an error.
+Window:
+    ``required_window`` returns how many buckets before and after the start
+    the slice must carry: ``max(horizon_buckets, arrival_lookback +
+    data_delay_buckets)`` before (reference volume, and the arrival lookback
+    under the data delay) and ``horizon_buckets + latency_buckets +
+    arrival_lookback`` after (every fill bucket plus the terminal-mark
+    search). A day that ends early yields a shorter slice and a truncated
+    episode; too little history before the start is an error.
 """
 
 from __future__ import annotations
@@ -43,22 +49,29 @@ __all__ = [
 
 
 def required_window(spec: EpisodeSpec) -> tuple[int, int]:
-    """``(n_before, n_after)``: buckets the slice needs around ``t_0`` for ``spec``."""
+    """Return ``(n_before, n_after)``: the buckets the slice needs around the start.
+
+    See the module docstring for the formulas.
+    """
     n_before = max(spec.horizon_buckets, spec.arrival_lookback + spec.data_delay_buckets)
     n_after = spec.horizon_buckets + spec.latency_buckets + spec.arrival_lookback
     return n_before, n_after
 
 
 def round_half_up_bps(value: int, rate_bps: int) -> int:
-    """``round_half_up(value * rate_bps / 10_000)`` in integer arithmetic."""
+    """Return ``round_half_up(value * rate_bps / 10_000)`` in integer arithmetic."""
     return (2 * value * rate_bps + BPS_DENOMINATOR) // (2 * BPS_DENOMINATOR)
 
 
 def reference_volume_ticks(market: MarketSlice, horizon_buckets: int) -> int:
-    """V_ref: total quantity over buckets ``-H .. -1`` of the slice, in quantity ticks.
+    """Return the reference volume in quantity ticks.
+
+    Sums ``total_quantity`` over episode buckets ``-horizon_buckets .. -1`` of
+    the slice.
 
     Raises:
-        ValueError: the slice carries fewer than ``horizon_buckets`` buckets before ``t_0``.
+        ValueError: The slice carries fewer than ``horizon_buckets`` buckets
+            before the first decision.
     """
     if market.origin < horizon_buckets:
         raise ValueError(
@@ -70,10 +83,21 @@ def reference_volume_ticks(market: MarketSlice, horizon_buckets: int) -> int:
 
 
 def target_from_reference_volume(v_ref_ticks: int, rho_bps: int, cap_bps: int) -> int:
-    """Q* from V_ref: ``round_half_up(rho * V_ref)``, capped at ``cap * V_ref``, at least one tick.
+    """Return the target quantity sized from the reference volume.
+
+    Computes ``round_half_up(rho_bps * v_ref_ticks)``, capped at
+    ``floor(cap_bps * v_ref_ticks)``, then floored at one tick.
+
+    Args:
+        v_ref_ticks: Reference volume in quantity ticks.
+        rho_bps: Target fraction of the reference volume, in basis points.
+        cap_bps: Participation cap in basis points.
+
+    Returns:
+        The target in quantity ticks; always at least 1.
 
     Raises:
-        ValueError: a negative volume or rate.
+        ValueError: A negative volume or rate.
     """
     if min(v_ref_ticks, rho_bps, cap_bps) < 0:
         raise ValueError("reference volume and rates must be non-negative")
@@ -88,13 +112,14 @@ def build_market_slice(
     """Cut the slice for an episode whose first decision bucket is ``start_bucket``.
 
     Features come from ``reference.aggregate_reference`` over all of
-    ``offsets``; the slice then keeps buckets ``[start - n_before, start +
-    n_after)``, clipped at the end of the window (fewer buckets after the
-    start mean the episode will truncate, not fail).
+    ``offsets``; the slice then keeps buckets
+    ``[start_bucket - n_before, start_bucket + n_after)``, clipped at the end
+    of the window. Fewer buckets after the start mean the episode will
+    truncate, not fail.
 
     Raises:
-        ValueError: ``start_bucket - n_before < 0`` or ``start_bucket`` is past
-            the window, plus whatever ``aggregate_reference`` rejects.
+        ValueError: ``start_bucket - n_before < 0``, ``start_bucket`` is past
+            the window, or ``aggregate_reference`` rejects the inputs.
     """
     n_buckets = offsets.size - 1
     first = start_bucket - n_before
@@ -130,9 +155,11 @@ def make_episode(
 
     ``template`` supplies every spec field except ``side`` and
     ``target_qty_ticks`` (its own values for those two are ignored); ``None``
-    means the accepted defaults. Returns the finished spec and its slice;
-    ``simulator.reset`` still validates the arrival price and the int64
-    bounds.
+    selects the default production configuration.
+
+    Returns:
+        The finished spec and its slice. ``simulator.reset`` still validates
+        the arrival price and the int64 bounds.
     """
     base = EpisodeSpec(side=side, target_qty_ticks=1) if template is None else replace(
         template, side=side, target_qty_ticks=1

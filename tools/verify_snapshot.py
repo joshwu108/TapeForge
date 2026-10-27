@@ -1,8 +1,9 @@
 """Pack the working tree for a GPU machine and run the verification steps there.
 
-One file holds both halves, so the snapshot that leaves this machine and the
-checks that run on the other one cannot drift apart:
+One file holds both halves, so the snapshot that leaves the packing machine
+and the checks that run on the GPU machine cannot drift apart.
 
+Usage:
     python tools/verify_snapshot.py pack --out /tmp/tapeforge-snapshot.tgz
     python tools/verify_snapshot.py run --artifacts verification --record --zip
 
@@ -11,7 +12,7 @@ ignored), under a top-level ``TapeForge/`` directory. Uncommitted edits are
 therefore what gets tested, and ignored material (planning notes, datasets,
 virtualenvs, caches) never leaves the machine. The archive carries
 ``snapshot.json`` -- commit, dirty flag, a digest over every packed file --
-so the run on the other side can say exactly which tree it verified.
+so the run on the GPU machine records exactly which tree it verified.
 
 ``run`` executes the steps below in order, each as a subprocess, and writes
 into the artifacts directory:
@@ -25,12 +26,12 @@ into the artifacts directory:
 
 Steps that need CUDA are recorded as ``skipped`` with the reason when no
 device is available; a skipped step is never reported as passed. The exit
-status is non-zero if any executed step failed. The default step list runs
-nothing that writes to ``benchmarks/results.json``; ``--record`` adds the
-kernel sweep and the pipeline benchmark, which append to it.
+status is 1 if any executed step failed and 0 otherwise. The default step
+list runs nothing that writes to ``benchmarks/results.json``; ``--record``
+adds the kernel sweep and the pipeline benchmark, which append to it.
 
-Usable from a plain checkout with the GPU extras installed; nothing here
-depends on the local virtualenv layout.
+The script runs from a plain checkout with the GPU extras installed; nothing
+in it depends on the local virtualenv layout.
 """
 
 from __future__ import annotations
@@ -54,18 +55,28 @@ ARCHIVE_ROOT = "TapeForge"
 SNAPSHOT_FILE = "snapshot.json"
 RESULTS = REPO / "benchmarks" / "results.json"
 
-PY = sys.executable
+PY = sys.executable  # Interpreter that runs every step; it must own the installed extras.
 
 
 @dataclass(frozen=True)
 class Step:
-    """One verification command. ``needs_cuda`` steps skip without a device."""
+    """One verification command.
+
+    Attributes:
+        name: Step name; also the stem of the step's log and JUnit files.
+        argv: Command line, executed from the repository root.
+        needs_cuda: The step is skipped, with a reason, when no CUDA device
+            (with Triton) is available.
+        writes_results: The step appends to ``benchmarks/results.json`` and
+            runs only with ``--record``.
+        pytest: The step receives ``--junitxml=<artifacts>/<name>.xml``.
+    """
 
     name: str
     argv: tuple[str, ...]
     needs_cuda: bool = False
-    writes_results: bool = False  # appends to benchmarks/results.json; only with --record
-    pytest: bool = False  # gets --junitxml=<artifacts>/<name>.xml
+    writes_results: bool = False
+    pytest: bool = False
 
 
 STEPS: tuple[Step, ...] = (
@@ -89,11 +100,22 @@ STEP_NAMES = tuple(step.name for step in STEPS)
 
 @dataclass
 class StepResult:
-    """One row of ``manifest.json``; ``reason`` is set only for skipped steps."""
+    """One row of ``manifest.json``.
+
+    Attributes:
+        name: Step name.
+        argv: Command line as executed, including any JUnit flag.
+        status: ``"ok"``, ``"failed"`` or ``"skipped"``.
+        reason: Why the step was skipped; set only for skipped steps.
+        exit_code: Subprocess exit code; ``None`` for skipped steps.
+        duration_s: Wall-clock duration in seconds, rounded to milliseconds.
+        log: Log file name, relative to the artifacts directory.
+        junit: JUnit report file name, relative to the artifacts directory.
+    """
 
     name: str
     argv: list[str]
-    status: str  # "ok" | "failed" | "skipped"
+    status: str
     reason: str | None = None
     exit_code: int | None = None
     duration_s: float | None = None
@@ -105,6 +127,7 @@ class StepResult:
 
 
 def _git(*args: str) -> str | None:
+    """Return the stdout of ``git`` run in the repository, or ``None`` if it fails or is absent."""
     try:
         return subprocess.run(
             ["git", *args], cwd=REPO, capture_output=True, text=True, check=True
@@ -114,21 +137,26 @@ def _git(*args: str) -> str | None:
 
 
 def tree_files() -> list[Path]:
-    """Files Git tracks or would track: tracked plus untracked-but-not-ignored."""
+    """Return the files Git tracks or would track: tracked plus untracked-but-not-ignored.
+
+    Raises:
+        RuntimeError: ``REPO`` is not a Git checkout.
+    """
     listing = _git("ls-files", "-z", "--cached", "--others", "--exclude-standard")
     if listing is None:
         raise RuntimeError(f"{REPO} is not a Git checkout; pack needs Git to apply .gitignore")
-    # An unpacked snapshot carries its own snapshot.json; never pack it twice.
+    # An unpacked snapshot already contains snapshot.json; it must not be packed again.
     names = sorted({name for name in listing.split("\0") if name and name != SNAPSHOT_FILE})
     return [REPO / name for name in names if (REPO / name).is_file()]
 
 
 def _sha256(data: bytes) -> str:
+    """Return the hex SHA-256 digest of ``data``."""
     return hashlib.sha256(data).hexdigest()
 
 
 def tree_digest(files: list[Path]) -> str:
-    """One hash over (relative path, content hash) of every packed file, in order."""
+    """Return one SHA-256 over (relative path, content hash) of every file, in the given order."""
     digest = hashlib.sha256()
     for path in files:
         digest.update(str(path.relative_to(REPO)).encode())
@@ -139,7 +167,7 @@ def tree_digest(files: list[Path]) -> str:
 
 
 def snapshot_metadata(files: list[Path]) -> dict[str, Any]:
-    """The ``snapshot.json`` payload: commit, dirty flag, file count, tree digest, pack time."""
+    """Return the ``snapshot.json`` payload: commit, dirty flag, file count, digest, pack time."""
     commit = _git("rev-parse", "HEAD")
     status = _git("status", "--porcelain")
     return {
@@ -153,7 +181,7 @@ def snapshot_metadata(files: list[Path]) -> dict[str, Any]:
 
 
 def capture_environment() -> dict[str, Any]:
-    """The benchmark harness's provenance record, so results and runs agree."""
+    """Return the benchmark harness's provenance record, so results and runs agree."""
     sys.path.insert(0, str(REPO / "benchmarks"))
     import harness  # noqa: PLC0415 - benchmarks/ is a script directory, not a package
 
@@ -161,7 +189,7 @@ def capture_environment() -> dict[str, Any]:
 
 
 def nvidia_smi() -> str | None:
-    """The GPU query as CSV text, or ``None`` when the tool is absent or fails."""
+    """Return the GPU query as CSV text, or ``None`` when the tool is absent, fails or times out."""
     try:
         return subprocess.run(
             [
@@ -179,7 +207,12 @@ def nvidia_smi() -> str | None:
 
 
 def cuda_status() -> tuple[bool, str]:
-    """Same probe as tests/conftest.py, so the runner and the suite agree on 'skip'."""
+    """Return whether CUDA steps can run, with the reason when they cannot.
+
+    The probe is the same as in ``tests/conftest.py``, so the runner and the
+    test suite agree on what counts as a skip: torch importable, a CUDA
+    device available, and triton installed.
+    """
     try:
         import torch
     except ImportError:
@@ -197,10 +230,10 @@ def cuda_status() -> tuple[bool, str]:
 
 
 def pack(out: Path) -> dict[str, Any]:
-    """Write the tarball and return its metadata plus the archive path and sha256.
+    """Write the tarball to ``out`` and return its metadata plus the archive path and sha256.
 
     Raises:
-        RuntimeError: not a Git checkout (``tree_files``).
+        RuntimeError: ``REPO`` is not a Git checkout (from ``tree_files``).
     """
     files = tree_files()
     meta = snapshot_metadata(files)
@@ -222,7 +255,21 @@ def pack(out: Path) -> dict[str, Any]:
 def plan(
     only: list[str] | None, cuda: bool, cuda_reason: str, record: bool
 ) -> list[tuple[Step, str | None]]:
-    """Resolve which steps execute and which are skipped, with the reason."""
+    """Resolve which steps execute and which are skipped, with the skip reason.
+
+    Args:
+        only: Step names to run, or ``None`` for every step.
+        cuda: Whether CUDA steps can run.
+        cuda_reason: Skip reason recorded for CUDA steps when ``cuda`` is false.
+        record: Whether steps that append to ``benchmarks/results.json`` run.
+
+    Returns:
+        ``(step, reason)`` pairs in ``STEPS`` order; ``reason`` is ``None``
+        for steps that execute.
+
+    Raises:
+        ValueError: ``only`` names a step that does not exist.
+    """
     if only:
         unknown = sorted(set(only) - set(STEP_NAMES))
         if unknown:
@@ -240,7 +287,11 @@ def plan(
 
 
 def run_step(step: Step, artifacts: Path) -> StepResult:
-    """Execute one step as a subprocess, logging to ``<name>.log``; never raises on failure."""
+    """Execute one step as a subprocess, logging combined stdout/stderr to ``<name>.log``.
+
+    A failing step is reported through ``status``; this function does not
+    raise on a non-zero exit code.
+    """
     argv = list(step.argv)
     log = artifacts / f"{step.name}.log"
     junit = None
@@ -263,6 +314,7 @@ def run_step(step: Step, artifacts: Path) -> StepResult:
 
 
 def _results_entries() -> int:
+    """Return the entry count of ``benchmarks/results.json``, or 0 when absent or not a list."""
     if not RESULTS.exists():
         return 0
     loaded = json.loads(RESULTS.read_text() or "[]")
@@ -270,10 +322,14 @@ def _results_entries() -> int:
 
 
 def run(artifacts: Path, only: list[str] | None, record: bool, make_zip: bool) -> int:
-    """Run the planned steps, write the artifacts, return 1 if any executed step failed.
+    """Run the planned steps and write the artifacts.
+
+    Returns:
+        1 if any executed step failed, otherwise 0. Skipped steps never
+        count as failures.
 
     Raises:
-        ValueError: ``only`` names an unknown step.
+        ValueError: ``only`` names a step that does not exist.
     """
     artifacts.mkdir(parents=True, exist_ok=True)
     cuda, cuda_reason = cuda_status()
@@ -331,7 +387,7 @@ def run(artifacts: Path, only: list[str] | None, record: bool, make_zip: bool) -
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI: ``pack --out PATH`` or ``run [--artifacts DIR] [--steps ...] [--record] [--zip]``."""
+    """Parse ``pack --out PATH`` or ``run [--artifacts DIR] [--steps ...] [--record] [--zip]``."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
 

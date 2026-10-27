@@ -1,4 +1,10 @@
-"""Chronological splits: hand-built boundaries, embargo widths, purge, and the invariants."""
+"""Tests for tapeforge.execution.splits: hand-built segment boundaries, embargo widths, the purge
+window, start enumeration, validation, JSON round-trips and the split invariants under random
+day structures.
+
+Days are flat single-price tapes from ``_day``; ``_four_days`` is the hand-built
+calendar whose segment ranges are asserted exactly.
+"""
 
 from __future__ import annotations
 
@@ -24,20 +30,21 @@ from tapeforge.execution.splits import (
 )
 from test_execution.tapes import DEEP, P0, slice_from_rows
 
-# Hand-built geometry: H = 5, l = 1, L = 3, d = 0 -> n_before 5, n_after 9,
-# purge window [t_0 - 3, t_0 + 7], embargo E = max(6, 3) = 6.
+# Hand-built geometry: horizon 5, latency 1, lookback 3, delay 0 -> n_before 5, n_after 9,
+# purge window [start - 3, start + 7], embargo max(6, 3) = 6.
 SPEC = EpisodeSpec(side=1, target_qty_ticks=1, horizon_buckets=5, latency_buckets=1,
                    arrival_lookback=3)
 DATES = ("2024-01-01", "2024-01-02", "2024-01-03", "2024-01-05")
 
 
 def _day(date: str, n_buckets: int, start_us: int, price: int = P0) -> DayTape:
+    """Build a flat day tape of ``n_buckets`` deep buckets at one price."""
     tape = slice_from_rows([], [(DEEP, price)] * n_buckets)
     return DayTape(date=date, start_us=start_us, width_us=W, tape=tape, source=f"rows {date}")
 
 
 def _four_days() -> list[DayTape]:
-    """Three contiguous 50-bucket days, then a day after a one-day gap."""
+    """Build three contiguous 50-bucket days, then a fourth after a one-day gap."""
     return [
         _day(DATES[0], 50, 0),
         _day(DATES[1], 50, 50 * W),
@@ -86,7 +93,7 @@ def test_embargo_width_separates_the_last_episode_before_from_the_first_after() 
     assert last_train_start + splits.record.n_after == train.n_buckets
     assert purge_window(last_train_start, SPEC)[1] == train.n_buckets - 2
     first_validation_start = validation.first_start
-    # The whole slice of the first validation episode begins E buckets into its segment.
+    # The whole slice of the first validation episode begins ``embargo_buckets`` into its segment.
     assert first_validation_start - splits.record.n_before == embargo_buckets(SPEC)
     assert purge_window(first_validation_start, SPEC)[0] >= embargo_buckets(SPEC)
 
@@ -139,7 +146,7 @@ def test_test_period_is_empty_when_not_provided() -> None:
 
 
 def test_a_segment_too_short_for_an_episode_has_no_starts() -> None:
-    days = [_day(DATES[0], 50, 0), _day(DATES[1], 15, 50 * W)]  # 15 < E + n_before + ...
+    days = [_day(DATES[0], 50, 0), _day(DATES[1], 15, 50 * W)]  # 15 < embargo + n_before + n_after.
     splits = build_splits(days, SplitDates((DATES[0],), (DATES[1],)), SPEC)
     short = splits.record.segments[1]
     assert short.n_starts == 0 and short.first_start == short.end_start == 11
@@ -159,7 +166,7 @@ def test_split_dates_validation() -> None:
         SplitDates((DATES[0],), (DATES[0],))
     with pytest.raises(ValueError, match="listed under"):
         SplitDates((DATES[0], DATES[0]), ())
-    dates = SplitDates([DATES[0]], [DATES[1]])  # lists are accepted and frozen as tuples
+    dates = SplitDates([DATES[0]], [DATES[1]])  # Lists are accepted and frozen as tuples.
     assert dates.train == (DATES[0],) and dates.role_of(DATES[1]) == "validation"
     assert dates.role_of("1999-01-01") is None
 
@@ -220,7 +227,7 @@ def test_episode_from_splits_is_cut_inside_its_segment() -> None:
     assert spec.side == -1 and market.origin == 5 and market.n_after == 9
     assert int(market.vwap_ticks[market.index(-1)]) == P0
     spec, market = splits.episode("train", splits.record.n_starts("train") - 1, 1, 200, SPEC)
-    assert set(market.vwap_ticks.tolist()) == {P0 + 100}   # entirely inside day 2
+    assert set(market.vwap_ticks.tolist()) == {P0 + 100}   # Entirely inside day 2.
     spec, market = splits.episode("validation", 0, 1, 1_000, SPEC)
     assert set(market.vwap_ticks.tolist()) == {P0 + 200}
     with pytest.raises(ValueError, match="geometry"):
@@ -229,11 +236,16 @@ def test_episode_from_splits_is_cut_inside_its_segment() -> None:
     assert isinstance(splits, Splits) and isinstance(splits.record, SplitRecord)
 
 
-# --- Hypothesis: random day structures keep the invariants -------------------------
+# --- property tests: random day structures keep the invariants ---------------------
 
 
 @st.composite
 def structures(draw: st.DrawFn) -> tuple[list[DayTape], SplitDates, EpisodeSpec]:
+    """Draw up to five days of random length, optional gaps, a role assignment and a spec.
+
+    Roles are assigned chronologically (train, then validation, then test) so
+    the dates are always a valid ``SplitDates``.
+    """
     n_days = draw(st.integers(1, 5))
     lengths = draw(st.lists(st.integers(1, 70), min_size=n_days, max_size=n_days))
     gaps = draw(st.lists(st.booleans(), min_size=n_days, max_size=n_days))
@@ -262,6 +274,7 @@ def structures(draw: st.DrawFn) -> tuple[list[DayTape], SplitDates, EpisodeSpec]
 
 
 def _rules_hold(segment: Segment, start: int, record: SplitRecord, spec: EpisodeSpec) -> bool:
+    """Return whether ``start`` satisfies both the data-range and the purge-window rule."""
     a, b = purge_window(start, spec)
     data = segment.embargo_before <= start - record.n_before and (
         start + record.n_after <= segment.n_buckets

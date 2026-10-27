@@ -1,4 +1,9 @@
-"""Transition semantics: invariants, termination vs truncation, causality, latency, replay."""
+"""Tests for tapeforge.execution.simulator transition semantics: per-step invariants, termination
+versus truncation, reset, action conversion, causality, latency and determinism.
+
+``assert_step_invariants`` is shared with the property tests in ``test_properties``.
+All tapes come from ``test_execution.tapes``.
+"""
 
 from __future__ import annotations
 
@@ -41,7 +46,15 @@ from test_execution.tapes import (
 def assert_step_invariants(
     before: State, after: State, result: StepResult, market: MarketSlice, spec: EpisodeSpec
 ) -> None:
-    """The per-step invariants of the worksheet test plan (items 2, 3, 4, 6)."""
+    """Assert the invariants every transition from ``before`` to ``after`` must satisfy.
+
+    Submitted quantity is bounded by what remains; the fill by the remaining
+    quantity and the participation cap of the fill bucket (zero for an invalid
+    or missing bucket); the fee by the ceiling rule; inventory by the side and
+    the fill count. Terminated and truncated are mutually exclusive, the reward
+    is the negated sum of its components, and the running accounting identity
+    holds.
+    """
     remaining_before = spec.target_qty_ticks - before.filled_qty_ticks
     assert 0 <= result.submitted_qty_ticks <= remaining_before
     assert result.fill_qty_ticks <= min(remaining_before, result.cap_qty_ticks)
@@ -65,8 +78,8 @@ def assert_step_invariants(
     assert result.reward_ticks == -(
         result.cost_component + result.risk_component + result.terminal_component
     )
-    # Running accounting identity: paper portfolio at P_0 minus the real one equals the
-    # shortfall of the fills so far (residual term excluded).
+    # Running accounting identity: the paper portfolio at the arrival price minus the real
+    # one equals the shortfall of the fills so far (residual term excluded).
     paper = after.cash_ticks + after.inventory_ticks * P0_of(after)
     initial = spec.initial_inventory_ticks * P0_of(after)
     shortfall_so_far = spec.side * (
@@ -76,19 +89,21 @@ def assert_step_invariants(
 
 
 def P0_of(state: State) -> int:
+    """Return the arrival price of ``state``, in price ticks."""
     return state.arrival_price_ticks
 
 
 def _run_checked(
     spec: EpisodeSpec, market: MarketSlice, policy: Policy
 ) -> tuple[list[State], list[StepResult]]:
+    """Roll out ``policy`` and assert the step invariants on every transition."""
     states, results = rollout(spec, market, policy)
     for before, after, result in zip(states[:-1], states[1:], results, strict=True):
         assert_step_invariants(before, after, result, market, spec)
     return states, results
 
 
-# --- invariants on the worksheet tapes -----------------------------------------------
+# --- invariants on the reference tape ------------------------------------------------
 
 
 @pytest.mark.parametrize("side", [1, -1])
@@ -108,7 +123,10 @@ def test_invariants_hold_on_the_worksheet_tape(side: int, policy: Policy) -> Non
 
 
 def test_completion_terminates_early_and_stops_fills() -> None:
-    """Submitting everything fills 200,000 (the cap) then 100,000: done after 2 of 3 steps."""
+    """Submitting everything fills 200,000 (the cap) then 100,000: done after 2 of 3 steps.
+
+    Stepping a finished episode raises ``EpisodeOver``.
+    """
     spec, market = worksheet_spec(side=1), worksheet_tape()
     states, results = rollout(spec, market, immediate_policy)
     assert [r.fill_qty_ticks for r in results] == [200_000, 100_000]
@@ -131,7 +149,7 @@ def test_horizon_end_terminates_even_with_residual() -> None:
 
 def test_short_slice_truncates_when_the_fill_bucket_is_missing() -> None:
     spec = worksheet_spec(side=1)
-    market = slice_from_rows([(DEEP, P0)], [(DEEP, 10_002), (DEEP, 10_005)])  # H = 3 needs 3
+    market = slice_from_rows([(DEEP, P0)], [(DEEP, 10_002), (DEEP, 10_005)])  # Horizon 3 needs 3.
     states, results = rollout(spec, market, schedule_policy(100_000))
     assert len(results) == 3
     assert [r.fill_qty_ticks for r in results] == [100_000, 100_000, 0]
@@ -139,7 +157,7 @@ def test_short_slice_truncates_when_the_fill_bucket_is_missing() -> None:
     assert last.truncated and not last.terminated
     assert last.cap_qty_ticks == 0 and last.notional_ticks == 0
     assert last.cost_component == 0
-    assert states[-1].step == 3  # time still advanced
+    assert states[-1].step == 3  # Time still advanced.
     # No terminal price exists, so the shortfall of the fills is what can be reported.
     assert sum(r.reward_ticks for r in results) == -(
         spec.side * (states[-1].exec_notional_ticks - P0 * states[-1].filled_qty_ticks)
@@ -149,7 +167,7 @@ def test_short_slice_truncates_when_the_fill_bucket_is_missing() -> None:
 
 def test_missing_terminal_mark_truncates_instead_of_terminating() -> None:
     spec = worksheet_spec(side=1)
-    market = worksheet_tape(after=[])  # fills exist, no bucket after the horizon
+    market = worksheet_tape(after=[])  # Fills exist; no bucket after the horizon.
     _, results = rollout(spec, market, zero_policy)
     assert results[-1].truncated and not results[-1].terminated
     assert results[-1].terminal_component == 0 and results[-1].terminal_price_ticks == 0
@@ -242,7 +260,7 @@ def test_action_is_floored_to_quantity_ticks_once() -> None:
     assert result.submitted_qty_ticks == math.floor(300_000 / 7) == 42_857
     _, result = step(reset(spec, market), np.float32(0.25), market, spec)
     assert result.submitted_qty_ticks == 75_000
-    _, result = step(reset(spec, market), 1, market, spec)  # integer 1 is a valid fraction
+    _, result = step(reset(spec, market), 1, market, spec)  # Integer 1 is a valid fraction.
     assert result.submitted_qty_ticks == 300_000
 
 
@@ -265,6 +283,7 @@ def test_action_for_quantity_rejects_overfill() -> None:
 
 
 def _long_tape(n_before: int = 4, n_after: int = 8) -> MarketSlice:
+    """Build a tape whose every bucket has a distinct quantity and price."""
     rows_before = [(DEEP + 1_000 * i, P0 - i) for i in range(n_before)]
     rows_after = [(DEEP + 7_000 * i, P0 + 3 * i + 1) for i in range(n_after)]
     return slice_from_rows(rows_before, rows_after)
@@ -279,7 +298,7 @@ def test_observation_reads_only_buckets_up_to_t_minus_1_minus_d(delay: int) -> N
         baseline = observe(state, market, spec)
         assert baseline.shape == (len(OBSERVATION_FIELDS),)
         newest = t - 1 - delay
-        for bucket in range(newest + 1, market.n_after):  # every bucket >= t - d
+        for bucket in range(newest + 1, market.n_after):  # Every bucket >= t - delay.
             perturbed = market.with_bucket(bucket, total_quantity=1, vwap_ticks=1)
             np.testing.assert_array_equal(observe(state, perturbed, spec), baseline)
         changed = market.with_bucket(newest, total_quantity=1, vwap_ticks=1)
@@ -308,13 +327,13 @@ def test_observation_fields_are_what_the_layout_says() -> None:
     assert obs["remaining_fraction"] == 1.0
     assert obs["time_remaining_fraction"] == 1.0
     assert obs["side"] == -1.0
-    assert obs["mark_return"] == 0.0  # the arrival bucket is the newest priced bucket
+    assert obs["mark_return"] == 0.0  # The arrival bucket is the newest priced bucket.
     assert obs["mark_age"] == 0.0
     assert obs["bucket_valid"] == 1.0
     assert obs["bucket_event_count"] == 3.0
-    assert obs["bucket_quantity_fraction"] == 2.0  # 600,000 / 300,000
+    assert obs["bucket_quantity_fraction"] == 2.0  # 600,000 / 300,000.
     assert obs["bucket_signed_fraction"] == -0.25
-    assert obs["bucket_return"] == pytest.approx(0.0)  # VWAP 10,100 vs arrival 10,100
+    assert obs["bucket_return"] == pytest.approx(0.0)  # VWAP 10,100 against arrival 10,100.
 
 
 def test_observation_of_an_empty_newest_bucket_is_zeroed_but_the_mark_persists() -> None:
@@ -354,7 +373,7 @@ def test_latency_shifts_fills_by_one_bucket_on_a_shifted_tape() -> None:
 def test_latency_terminal_mark_starts_after_the_last_fill_bucket() -> None:
     spec = worksheet_spec(side=1, latency_buckets=1)
     market = worksheet_tape(after=[(DEEP, 10_020), (DEEP, 10_030)])
-    assert terminal_mark(market, spec) == 10_030  # bucket H + l = 4, not bucket 3
+    assert terminal_mark(market, spec) == 10_030  # Bucket horizon + latency = 4, not bucket 3.
 
 
 # --- determinism -------------------------------------------------------------------
@@ -387,4 +406,4 @@ def test_slippage_moves_the_fill_price_against_the_agent() -> None:
     _, buy = step(reset(buy_spec, market), 1.0, market, buy_spec)
     _, sell = step(reset(sell_spec, market), 1.0, market, sell_spec)
     assert buy.fill_price_ticks == 10_002 + 3 and sell.fill_price_ticks == 10_002 - 3
-    assert buy.fill_qty_ticks == sell.fill_qty_ticks == 200_000  # the 10 % cap binds
+    assert buy.fill_qty_ticks == sell.fill_qty_ticks == 200_000  # The 10 % cap binds.

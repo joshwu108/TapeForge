@@ -1,47 +1,49 @@
-"""Prepared execution: validate and plan once, launch many times.
+"""Prepared CUDA aggregation: validate and plan once, launch many times.
 
 ``ops.aggregate`` re-validates its input, rebuilds the chunk schedule and
-allocates fresh outputs on every call. That is the right behaviour for a
-public API, and the wrong cost model for a training loop or a benchmark
-that aggregates the same resident tensors thousands of times. This module
-separates the two:
+allocates fresh outputs on every call. That is correct for a public API and
+the wrong cost model for a training loop or a benchmark that aggregates the
+same resident tensors thousands of times. This module separates the two:
 
     prepared = prepare(columns, offsets)      # validate, plan, allocate: once
     features = prepared.execute()             # kernel launches only
-    features = prepared.execute()             # ... again, same buffers
+    features = prepared.execute()             # again, same buffers
 
-Contract of a ``PreparedAggregation``
--------------------------------------
-Inputs are **borrowed**, not copied. The object holds references to the
-column and offset tensors it was prepared with, so they stay allocated for
-its lifetime; the caller must not resize, re-layout or mutate them. The
-chunk schedule and the output allocation were derived from the offsets at
-``prepare`` time; the overflow bound was checked against the prices and
-quantities at ``prepare`` time. Changed data silently makes the prepared
-state stale (wrong schedule, or sums that can wrap): prepare again instead.
-There is no cache anywhere in this module; every ``prepare`` validates
-from scratch, and nothing is keyed on tensor identity.
+Invariants:
+    Inputs are borrowed, not copied. A ``PreparedAggregation`` holds
+    references to the column and offset tensors it was prepared with, so
+    they stay allocated for its lifetime; the caller must not resize,
+    re-layout or mutate them. The chunk schedule and the output allocation
+    derive from the offsets at ``prepare`` time, and the overflow bound was
+    checked against the prices and quantities at ``prepare`` time. Changed
+    data silently makes the prepared state stale (wrong schedule, or sums
+    that can wrap); the caller must prepare again. Nothing is cached and
+    nothing is keyed on tensor identity: every ``prepare`` validates from
+    scratch.
 
-Outputs of ``execute`` are **borrowed** too: the same five tensors are
-returned every call and overwritten by the next ``execute``. Callers that
-keep a result across calls take ``execute_owned``, which clones them.
+    Outputs of ``execute`` are borrowed too: the same five tensors are
+    returned on every call and overwritten by the next ``execute``. Callers
+    that keep a result across calls use ``execute_owned``, which clones them.
 
-Device and streams: all launches go to the current CUDA stream of the
-inputs' device at ``execute`` time, like any PyTorch op. Results are ready
-on that stream; a caller consuming them on another stream synchronizes.
+Device and streams:
+    All launches go to the current CUDA stream of the inputs' device at
+    ``execute`` time, like any PyTorch op. Results are ready on that stream;
+    a caller consuming them on another stream must synchronize.
 
-Concurrency: one prepared object owns one set of output and scratch
-buffers, so concurrent ``execute`` calls from several threads or streams
-race on them. Prepare one object per concurrent user.
+Concurrency:
+    One prepared object owns one set of output and scratch buffers, so
+    concurrent ``execute`` calls from several threads or streams race on
+    them. Prepare one object per concurrent user.
 
-Synchronization: ``prepare`` performs the launcher's host syncs
-(validation statistics, and the chunk count on the two-pass path).
-``execute`` performs none.
+Synchronization:
+    ``prepare`` performs the launcher's host syncs (validation statistics,
+    and the chunk count on the two-pass path). ``execute`` performs none.
 
-Path forcing (``path="two_pass"``) exists so the benchmark can measure both
-paths on one workload; results are identical by contract. ``block_size``
-forces the one-pass path with an explicit capacity check, exactly like
-``kernels.launch_aggregate``.
+Path forcing:
+    ``path="two_pass"`` lets the benchmark measure both paths on one
+    workload; results are identical by contract. ``block_size`` forces the
+    one-pass path with an explicit capacity check, exactly as
+    ``kernels.launch_aggregate`` does.
 """
 
 from __future__ import annotations
@@ -60,18 +62,28 @@ if TYPE_CHECKING:
 
 __all__ = ["PreparedAggregation", "prepare"]
 
-COLUMNS: tuple[str, ...] = ("price", "quantity", "buyer_is_maker")
+COLUMNS: tuple[str, ...] = ("price", "quantity", "buyer_is_maker")  # Columns the kernels read.
 
 
 @dataclass(frozen=True, eq=False)
 class PreparedAggregation:
     """Validated inputs, dispatch plan and preallocated buffers for one workload.
 
-    Construct with ``prepare``. Frozen: no field is rebound after
-    construction; ``execute`` writes into the tensors the fields reference.
-    The ``features`` and ``partials`` dicts are the object's own buffers and
-    are not meant to be modified by callers. ``eq=False``: identity semantics,
-    since tensor fields have no meaningful value equality or hash.
+    Instances are produced by ``prepare``. The dataclass is frozen: no field
+    is rebound after construction, and ``execute`` writes into the tensors the
+    fields reference. ``eq=False`` gives identity semantics, since tensor
+    fields have no meaningful value equality or hash.
+
+    Attributes:
+        trades: The borrowed kernel columns (``price``, ``quantity``,
+            ``buyer_is_maker``); extra input columns are not retained.
+        offsets: The borrowed bucket boundaries, length ``n_buckets + 1``.
+        summary: Validation facts from ``validation.validate_columns``.
+        plan: The chosen path and tile or chunk size.
+        features: The five output tensors, each of shape ``(n_buckets,)``.
+            Owned by this object and overwritten by every ``execute``.
+        chunks: Pass-1 schedule on the two-pass path; ``None`` on one-pass.
+        partials: Pass-1 scratch on the two-pass path; ``None`` on one-pass.
     """
 
     trades: Mapping[str, torch.Tensor]
@@ -84,23 +96,24 @@ class PreparedAggregation:
 
     @property
     def path(self) -> str:
-        """``"one_pass"`` or ``"two_pass"``."""
+        """Return ``"one_pass"`` or ``"two_pass"``."""
         return self.plan.path
 
     @property
     def n_chunks(self) -> int:
-        """Pass-1 programs on the two-pass path; 0 on the one-pass path."""
+        """Return the number of pass-1 programs on the two-pass path; 0 on one-pass."""
         return self.chunks.n_chunks if self.chunks is not None else 0
 
     def execute(self) -> dict[str, torch.Tensor]:
         """Launch the planned kernels and return the borrowed output tensors.
 
-        The returned dict holds the same tensor objects every call; the next
-        ``execute`` overwrites them. Performs no validation and no host sync.
+        The returned dict holds the same tensor objects on every call; the
+        next ``execute`` overwrites them. Performs no validation and no host
+        sync.
         """
         if self.summary.max_bucket_len == 0:
-            # Zero-filled outputs are already the answer for all-empty buckets,
-            # and nothing has written to them since allocation.
+            # Every bucket is empty, so the zero-filled outputs are already the
+            # answer, and nothing has written to them since allocation.
             return self.features
         if self.plan.path == "one_pass":
             assert self.plan.block_size is not None
@@ -115,20 +128,27 @@ class PreparedAggregation:
         return self.features
 
     def execute_owned(self) -> dict[str, torch.Tensor]:
-        """``execute`` and return independent copies that survive the next call."""
+        """Run ``execute`` and return independent copies that survive the next call."""
         return {name: tensor.clone() for name, tensor in self.execute().items()}
 
     def run_pass_1(self) -> None:
-        """Two-pass only: write the int64 partials. For instrumentation."""
+        """Write the int64 partials of the two-pass path, for instrumentation.
+
+        Raises:
+            ValueError: The object was prepared for the one-pass path.
+        """
         if self.chunks is None or self.partials is None:
             raise ValueError("run_pass_1 applies to the two-pass path only")
         kernels.launch_pass_1_unchecked(self.trades, self.chunks, self.partials)
 
     def run_pass_2(self) -> None:
-        """Two-pass only: combine the partials written by the last ``run_pass_1``.
+        """Combine the partials written by the last ``run_pass_1``, for instrumentation.
 
         Idempotent given unchanged partials, so it can be timed in isolation.
         Calling it before any pass 1 reads uninitialised scratch.
+
+        Raises:
+            ValueError: The object was prepared for the one-pass path.
         """
         if self.chunks is None or self.partials is None:
             raise ValueError("run_pass_2 applies to the two-pass path only")
@@ -144,14 +164,20 @@ def prepare(
 ) -> PreparedAggregation:
     """Validate once and preallocate everything ``execute`` needs.
 
-    Same input contract and errors as ``kernels.launch_aggregate``
-    (``tapeforge.validation.validate_columns``), plus:
+    The input contract and errors are those of ``kernels.launch_aggregate``
+    (``tapeforge.validation.validate_columns``).
+
+    Args:
+        trades: Mapping of column name to CUDA tensor.
+        offsets: CUDA int64 bucket boundaries of length ``n_buckets + 1``.
+        block_size: Explicit one-pass tile; implies ``path="one_pass"``.
+        path: ``"auto"``, ``"one_pass"`` or ``"two_pass"``.
 
     Raises:
-        ValueError: ``path`` is invalid, or ``block_size`` is combined with
-            ``path="two_pass"``.
-        BucketTooLargeError: the one-pass path was forced for a bucket
-            longer than its tile.
+        ValueError: ``path`` is invalid, ``block_size`` is combined with
+            ``path="two_pass"``, or the tensors are not on CUDA.
+        BucketTooLargeError: The one-pass path was forced for a bucket longer
+            than its tile.
     """
     kernels._require_triton()
     import torch
@@ -165,7 +191,7 @@ def prepare(
     summary = validate_columns(trades, offsets)
     plan = kernels.plan_dispatch(summary.max_bucket_len, block_size, path)
 
-    # Hold only the columns the kernels read; extra columns are not kept alive.
+    # Hold only the columns the kernels read, so extra columns are not kept alive.
     held = {name: trades[name] for name in COLUMNS}
     with torch.cuda.device(offsets.device):
         features = kernels.empty_features(summary.n_buckets, offsets.device)

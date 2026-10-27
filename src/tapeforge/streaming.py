@@ -1,10 +1,17 @@
 """Streaming (live-path) trade aggregation on the CPU, independent of CUDA.
 
-Computes the same five features as ``reference.aggregate_reference`` over the
-window ``windows.build_offsets(timestamps, start_us, n_buckets, width_us)``,
-but from a stream of timestamp-ordered chunks instead of one array. A chunk
-can be a single record (the per-event case) or a whole day; the result is
+``StreamingAggregator`` computes the same five features as
+``reference.aggregate_reference`` over the window
+``windows.build_offsets(timestamps, start_us, n_buckets, width_us)``, but
+from a stream of timestamp-ordered chunks instead of one array. A chunk can
+be a single record (the per-event case) or a whole day; the result is
 identical either way, and identical to the batch result.
+
+Invariants:
+    Chunks must arrive in timestamp order, and each chunk must be internally
+    non-decreasing. Buckets are emitted at most once, in order, as soon as
+    the newest timestamp proves they can receive nothing more. A rejected
+    chunk leaves the aggregator unchanged.
 """
 
 from __future__ import annotations
@@ -30,10 +37,20 @@ class OutOfOrderError(ValueError):
 
 
 class StreamingAggregator:
-    """Accumulate per-bucket features from timestamp-ordered chunks of trades.
+    """Accumulator of per-bucket features over timestamp-ordered chunks of trades.
 
     ``start_us``, ``n_buckets`` and ``width_us`` define the same fixed window
-    as ``windows.build_offsets``. The geometry is validated up front.
+    as ``windows.build_offsets``; the geometry is validated at construction.
+    Records outside the window are counted in ``records_seen`` but contribute
+    to no bucket.
+
+    Args:
+        start_us: Timestamp of the first bucket edge, in microseconds.
+        n_buckets: Number of buckets in the window; must be positive.
+        width_us: Bucket width in microseconds; must be positive.
+
+    Raises:
+        ValueError: ``n_buckets`` or ``width_us`` is not positive.
     """
 
     def __init__(
@@ -57,47 +74,54 @@ class StreamingAggregator:
         self._max_quantity = 0
         self._finished = False
 
-    # --- read-only state ----------------------------------------------------
+    # --- Read-only state ----------------------------------------------------
 
     @property
     def n_buckets(self) -> int:
-        """Buckets in the window; the total number of rows emitted over the stream."""
+        """Return the buckets in the window: the total rows emitted over the stream."""
         return self._n_buckets
 
     @property
     def emitted_buckets(self) -> int:
-        """How many leading buckets have already been returned."""
+        """Return how many leading buckets have already been returned."""
         return self._emitted
 
     @property
     def records_seen(self) -> int:
-        """Every record pushed so far, inside the window or not."""
+        """Return the number of records pushed so far, inside the window or not."""
         return self._records_seen
 
     @property
     def last_timestamp(self) -> int | None:
-        """Timestamp of the last record pushed; the floor for the next chunk."""
+        """Return the timestamp of the last record pushed; the floor for the next chunk."""
         return self._last_timestamp
 
     @property
     def is_finished(self) -> bool:
-        """True after ``finalize``; further ``push`` calls raise."""
+        """Return ``True`` after ``finalize``; further ``push`` calls raise."""
         return self._finished
 
-    # --- the stream ---------------------------------------------------------
+    # --- Stream operations --------------------------------------------------
 
     def push(self, chunk: np.ndarray) -> Features:
         """Absorb one ordered chunk and return the buckets it closed.
 
-        Raises:
-            RuntimeError: the stream was already finalized.
-            ValueError: wrong dtype or shape, or a negative price or quantity.
-            OutOfOrderError: timestamps decrease within the chunk, or the
-                chunk starts before the previous chunk's last record.
-            OverflowError: absorbing the chunk could make an int64 bucket sum
-                wrap (``contract.check_exact_accumulation_bound``).
-
         On any error the aggregator is unchanged.
+
+        Args:
+            chunk: 1-D ``TRADE_DTYPE`` array with non-decreasing timestamps,
+                starting at or after ``last_timestamp``.
+
+        Returns:
+            The buckets closed by this chunk, in order; possibly none.
+
+        Raises:
+            RuntimeError: The stream was already finalized.
+            ValueError: Wrong dtype or shape, or a negative price or quantity.
+            OutOfOrderError: Timestamps decrease within the chunk, or the
+                chunk starts before the previous chunk's last record.
+            OverflowError: Absorbing the chunk could make an int64 bucket sum
+                wrap (``contract.check_exact_accumulation_bound``).
         """
         if self._finished:
             raise RuntimeError(
@@ -120,8 +144,8 @@ class StreamingAggregator:
         bucket = ((timestamps[inside] - self._start_us) // self._width_us).astype(np.int64)
         added_counts = np.bincount(bucket, minlength=self._n_buckets).astype(np.int64)
 
-        # Bound check first, on the state as it would be after this chunk, so
-        # a rejected chunk leaves nothing half-applied.
+        # The bound is checked first, on the state as it would be after this
+        # chunk, so a rejected chunk leaves nothing half-applied.
         max_price = max(self._max_price, int(price.max()))
         max_quantity = max(self._max_quantity, int(quantity.max()))
         check_exact_accumulation_bound(
@@ -147,16 +171,17 @@ class StreamingAggregator:
         """End the stream and return every bucket not yet emitted.
 
         Trailing buckets that never saw a record at or beyond their upper
-        edge are emitted here as they stand (empty, or partially filled by
-        the last records of the stream). Idempotent: a second call returns
-        zero buckets.
+        edge are emitted as they stand: empty, or partially filled by the
+        last records of the stream. Idempotent: a second call returns zero
+        buckets.
         """
         self._finished = True
         return self._emit(self._n_buckets)
 
-    # --- internals ----------------------------------------------------------
+    # --- Internals ----------------------------------------------------------
 
     def _validated_timestamps(self, chunk: np.ndarray) -> np.ndarray:
+        """Check the chunk's dtype, shape and ordering; return its contiguous timestamps."""
         if not isinstance(chunk, np.ndarray) or chunk.dtype != TRADE_DTYPE:
             got = chunk.dtype if isinstance(chunk, np.ndarray) else type(chunk).__name__
             raise ValueError(f"chunk must be a TRADE_DTYPE array, got {got}")
@@ -182,6 +207,7 @@ class StreamingAggregator:
         return timestamps
 
     def _emit(self, upto: int) -> Features:
+        """Return buckets ``[emitted, upto)`` as copies and advance the emitted mark."""
         lo, hi = self._emitted, max(self._emitted, upto)
         self._emitted = hi
         count = self._count[lo:hi].copy()
@@ -202,7 +228,10 @@ class StreamingAggregator:
 
 
 def concat_features(parts: Sequence[Features]) -> Features:
-    """Join emitted bucket runs, in order, into one ``Features`` of all buckets."""
+    """Join emitted bucket runs, in order, into one ``Features`` covering all buckets.
+
+    An empty sequence yields zero-length arrays of the contract dtypes.
+    """
     if not parts:
         empty = np.zeros(0, dtype=np.int64)
         return Features(
@@ -229,9 +258,9 @@ def aggregate_stream(
 ) -> Features:
     """Run a whole chunked stream through ``StreamingAggregator`` and finalize.
 
-    Convenience for tests and offline replay: the result has ``n_buckets``
-    rows and equals ``reference.aggregate_reference`` on the concatenated
-    chunks with ``windows.build_offsets(..., start_us, n_buckets, width_us)``.
+    Intended for tests and offline replay. The result has ``n_buckets`` rows
+    and equals ``reference.aggregate_reference`` on the concatenated chunks
+    with ``windows.build_offsets(..., start_us, n_buckets, width_us)``.
     """
     aggregator = StreamingAggregator(start_us, n_buckets, width_us)
     parts = [aggregator.push(chunk) for chunk in chunks]

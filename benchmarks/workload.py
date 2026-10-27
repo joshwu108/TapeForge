@@ -5,10 +5,15 @@ record count. Nothing is timed until its output has matched the CPU
 reference (exact integers, VWAP within the contract tolerance), and the
 outcome of that check is recorded alongside the timing.
 
-``WorkloadInfo`` records the bucket-length distribution, because that
+``WorkloadInfo`` records the bucket-length distribution because that
 distribution, not the record count, decides which kernel path runs and how
 much of each one-pass tile is masked: the one-pass tile follows the longest
-bucket, and the two-pass chunk count follows the sum of ceil(len / CHUNK).
+bucket, and the two-pass chunk count is the sum over buckets of
+``ceil(len / CHUNK_SIZE)``.
+
+Not covered:
+    Timing and result recording; those live in ``harness.py``. Row
+    definitions live in ``kernel.py`` and ``pipeline.py``.
 """
 
 from __future__ import annotations
@@ -20,14 +25,35 @@ import numpy as np
 
 from tapeforge import contract, generate, kernels, reference, windows
 
-# Approximate generator means, used only to pick a bucket count that lands
-# near the requested record count. The actual count is always recorded.
+# Approximate records per bucket for each generator profile, used only to pick
+# a bucket count that lands near the requested record count. The actual record
+# count is always recorded.
 RECORDS_PER_BUCKET = {"sparse": 0.5, "uniform": 50.0, "burst": 100.0}
 
 
 @dataclass(frozen=True)
 class WorkloadInfo:
-    """Everything a result record needs to name the workload and its dispatch."""
+    """Description of one benchmark workload and the kernel dispatch it implies.
+
+    Attributes:
+        profile: Generator profile name.
+        seed: Generator seed.
+        requested_records: Record count asked for by the sweep.
+        n_records: Record count actually generated.
+        n_buckets: Number of buckets; ``len(offsets) - 1``.
+        bucket_width_us: Bucket width in microseconds.
+        max_bucket_len: Records in the longest bucket.
+        buckets_over_one_pass_limit: Buckets longer than ``kernels.MAX_ONE_PASS_BUCKET``.
+        n_empty_buckets: Buckets holding no records.
+        bucket_len_p50: 50th percentile of bucket length, truncated to int.
+        bucket_len_p90: 90th percentile of bucket length, truncated to int.
+        bucket_len_p99: 99th percentile of bucket length, truncated to int.
+        dispatch_path: ``kernels.plan_dispatch`` result for the longest bucket.
+        one_pass_block_size: Tile the one-pass path would use; ``None`` when
+            the longest bucket exceeds the one-pass limit.
+        two_pass_chunk_size: ``kernels.CHUNK_SIZE``.
+        two_pass_n_chunks: Pass-1 programs the two-pass path would launch.
+    """
 
     profile: str
     seed: int
@@ -37,23 +63,30 @@ class WorkloadInfo:
     bucket_width_us: int
     max_bucket_len: int
     buckets_over_one_pass_limit: int
-    # Bucket-length distribution and the dispatch it implies.
     n_empty_buckets: int
     bucket_len_p50: int
     bucket_len_p90: int
     bucket_len_p99: int
-    dispatch_path: str  # kernels.plan_dispatch on the longest bucket
-    one_pass_block_size: int | None  # tile the one-pass path would use, if it applies
+    dispatch_path: str
+    one_pass_block_size: int | None
     two_pass_chunk_size: int
-    two_pass_n_chunks: int  # pass-1 programs the two-pass path would launch
+    two_pass_n_chunks: int
 
     def as_dict(self) -> dict[str, Any]:
-        """Plain dict for the ``config.workload`` field of a result record."""
+        """Return a plain dict for the ``config.workload`` field of a result record."""
         return asdict(self)
 
 
 def describe_offsets(offsets: np.ndarray) -> dict[str, Any]:
-    """Distribution and dispatch facts for a given offsets array."""
+    """Compute the bucket-length distribution and dispatch facts for ``offsets``.
+
+    Args:
+        offsets: Bucket boundaries of length ``n_buckets + 1``.
+
+    Returns:
+        The ``WorkloadInfo`` fields from ``max_bucket_len`` onward. Percentiles
+        are truncated to ``int``; an empty ``offsets`` yields zeros.
+    """
     lengths = np.diff(offsets)
     longest = int(lengths.max()) if lengths.size else 0
     plan = kernels.plan_dispatch(longest)
@@ -77,14 +110,24 @@ def describe_offsets(offsets: np.ndarray) -> dict[str, Any]:
 def make_workload(
     n_records: int, profile: str, seed: int, width_us: int = contract.DEFAULT_BUCKET_WIDTH_US
 ) -> tuple[np.ndarray, np.ndarray, WorkloadInfo]:
-    """Seeded trades, their offsets and the workload description for about ``n_records``.
+    """Generate seeded trades, their offsets and the workload description for ``n_records``.
 
-    The bucket count is chosen from the profile's mean rate, so the actual
-    record count differs from the request and is recorded in ``info``.
+    The bucket count is derived from the profile's mean rate, so the actual
+    record count differs from the request; both are recorded in the returned
+    ``WorkloadInfo``.
+
+    Args:
+        n_records: Requested record count; at least one bucket is generated.
+        profile: Generator profile; a key of ``RECORDS_PER_BUCKET``.
+        seed: Generator seed.
+        width_us: Bucket width in microseconds.
+
+    Returns:
+        ``(trades, offsets, info)``.
 
     Raises:
-        KeyError: unknown profile.
-        ValueError: whatever ``generate_trades`` rejects.
+        KeyError: ``profile`` is not a key of ``RECORDS_PER_BUCKET``.
+        ValueError: ``generate_trades`` rejected its arguments.
     """
     n_buckets = max(1, round(n_records / RECORDS_PER_BUCKET[profile]))
     trades = generate.generate_trades(
@@ -104,7 +147,7 @@ def make_workload(
 
 
 def host_columns(trades: np.ndarray, pin: bool = False) -> dict[str, Any]:
-    """Contiguous CPU tensors for the three kernel inputs, optionally pinned."""
+    """Return contiguous CPU tensors for the three kernel inputs, pinned when ``pin`` is set."""
     import torch
 
     columns = {
@@ -115,7 +158,15 @@ def host_columns(trades: np.ndarray, pin: bool = False) -> dict[str, Any]:
 
 
 def check_features(got: dict[str, Any], expected: reference.Features) -> None:
-    """Raise AssertionError unless ``got`` matches the reference per the contract."""
+    """Assert that ``got`` matches ``expected`` under the contract tolerances.
+
+    Integer features and dtypes must match exactly; ``vwap`` is compared with
+    ``contract.VWAP_RTOL`` and ``contract.VWAP_ATOL``. Device tensors are
+    moved to the host for the comparison.
+
+    Raises:
+        AssertionError: A dtype or value differs from the reference.
+    """
     for name in contract.FEATURE_NAMES:
         value = got[name]
         actual = value.cpu().numpy() if hasattr(value, "cpu") else np.asarray(value)
@@ -131,5 +182,5 @@ def check_features(got: dict[str, Any], expected: reference.Features) -> None:
 
 
 def features_dict(features: reference.Features) -> dict[str, np.ndarray]:
-    """The reference ``Features`` as the dict shape ``ops.aggregate`` returns."""
+    """Return the reference ``Features`` in the dict shape ``ops.aggregate`` returns."""
     return {name: getattr(features, name) for name in contract.FEATURE_NAMES}

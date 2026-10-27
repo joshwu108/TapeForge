@@ -1,7 +1,7 @@
 """Scope 2: host-to-device transfer plus features.
 
-Starts from host-resident column tensors (the column extraction from the
-structured array is done once, untimed) and times, per variant:
+The benchmark starts from host-resident column tensors (the column extraction
+from the structured array is done once, untimed) and times, per variant:
 
     h2d_ms         copy the three input columns and offsets to the GPU
     compute_ms     tapeforge.ops.aggregate on the resident copies
@@ -20,13 +20,15 @@ Variants (``variants`` in the config):
                     the compute of the previous one on separate CUDA streams;
                     reported as skipped until it exists
 
-``compute_ms`` is ``ops.aggregate`` as a user calls it (validation, planning,
-allocation, launches), on whichever kernel path the workload's longest
-bucket selects; the path is recorded in the workload info. Also records
-``numpy_reference`` (CPU features on the host, no transfer) as the
-end-to-end CPU baseline. Every variant is checked against the reference
-before it is timed. Requires CUDA; exits with status 2 without it.
+``compute_ms`` is ``ops.aggregate`` as a caller uses it (validation,
+planning, allocation, launches), on whichever kernel path the workload's
+longest bucket selects; the path is recorded in the workload info.
+``numpy_reference`` (CPU features on the host, no transfer) is recorded as
+the end-to-end CPU baseline. Every variant is checked against the reference
+before it is timed. CUDA is required; the exit status is 2 without it and 0
+otherwise.
 
+Usage:
     python benchmarks/pipeline.py --config benchmarks/configs/pipeline.toml
 """
 
@@ -46,16 +48,26 @@ from workload import check_features, features_dict, host_columns, make_workload
 
 from tapeforge import ops, reference
 
+# Variants with an implementation; any other configured variant is skipped.
 IMPLEMENTED_VARIANTS = ("pageable_sync", "pinned_sync")
 
 
 def _numpy_reference(trades: Any, offsets: Any) -> dict[str, Any]:
+    """Return the host reference features in the dict shape ``ops.aggregate`` returns."""
     return features_dict(reference.aggregate_reference(trades, offsets))
 
 
 def _variant_callables(
     trades: Any, offsets: Any, pinned: bool
 ) -> dict[str, Callable[[], Any]]:
+    """Build the ``h2d``, ``compute``, ``d2h`` and ``end_to_end`` callables for one variant.
+
+    Host columns and offsets are prepared (and pinned when ``pinned`` is
+    set) once, untimed. One untimed transfer and aggregation provide the
+    resident inputs for ``compute`` and the resident features for ``d2h``.
+    With ``pinned`` the copies are ``non_blocking``; the timing harness
+    synchronises around each call.
+    """
     import torch
 
     columns = host_columns(trades, pin=pinned)
@@ -85,6 +97,13 @@ def _measure_variant(
     trades: Any, offsets: Any, pinned: bool, expected: reference.Features, warmup: int,
     repeats: int,
 ) -> dict[str, Any]:
+    """Gate one variant's end-to-end output against the reference, then time each part.
+
+    Returns:
+        ``{"status": "incorrect", "reason": ...}`` when the gate fails;
+        otherwise ``status`` ``"ok"``, ``correct`` ``True`` and
+        ``<part>_p50_ms`` / ``<part>_p95_ms`` for each of the four parts.
+    """
     try:
         parts = _variant_callables(trades, offsets, pinned)
         check_features(parts["end_to_end"](), expected)
@@ -99,7 +118,14 @@ def _measure_variant(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Time every configured variant on every workload; exit 2 without CUDA."""
+    """Time every configured variant on every workload and print one JSON line per result.
+
+    Unimplemented variants are skipped with a message on stderr. Results are
+    recorded unless ``--no-record`` is given.
+
+    Returns:
+        2 when CUDA is unavailable, otherwise 0.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="benchmarks/configs/pipeline.toml")
     parser.add_argument("--sizes", type=int, nargs="+", help="override config record counts")

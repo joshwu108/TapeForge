@@ -1,4 +1,9 @@
-"""Shared test fixtures and capability probes."""
+"""Shared pytest fixtures, capability probes and GPU parity helpers.
+
+Owns the two-record reference example (``TOY_EXPECTED``) and the parity
+rule used by every CUDA test, so CPU and GPU suites assert against the same
+numbers and the same oracle.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +11,7 @@ import pytest
 
 
 def _cuda_triton_ready() -> tuple[bool, str]:
+    """Report whether CUDA and Triton are both usable, with a skip reason when not."""
     try:
         import torch
     except ImportError:
@@ -21,14 +27,14 @@ def _cuda_triton_ready() -> tuple[bool, str]:
 
 @pytest.fixture(scope="session")
 def gpu_ready() -> None:
-    """Skip a GPU test with a precise reason instead of failing on a CPU box."""
+    """Skip a GPU test with a precise reason instead of failing on a CPU-only host."""
     ready, reason = _cuda_triton_ready()
     if not ready:
         pytest.skip(reason)
 
 
-# The hand-calculated toy example (also test_program.py), kept in one place
-# so CPU and GPU tests assert against identical numbers.
+# The two-record reference example (also exercised by test_program.py), kept
+# in one place so CPU and GPU tests assert against identical numbers.
 #   bucket at 10:00:01: buy-initiated price 100 qty 2, sell-initiated price 102 qty 1
 #   -> event_count 2, total_quantity 3, signed_quantity +1, vwap 100.666...
 TOY_EXPECTED = {
@@ -40,9 +46,9 @@ TOY_EXPECTED = {
 }
 
 
-# --- shared GPU parity helpers --------------------------------------------
+# --- GPU parity helpers ----------------------------------------------------
 #
-# Used by test_gpu_parity.py (one-pass path), test_two_pass.py (buckets
+# Shared by test_gpu_parity.py (one-pass path), test_two_pass.py (buckets
 # beyond the one-pass tile) and test_prepared.py. All compare the real CUDA
 # code path against reference.aggregate_reference_naive, the plain-loop
 # oracle, so the GPU is never checked against code that shares its
@@ -59,7 +65,7 @@ from tapeforge import contract, reference  # noqa: E402
 
 
 def cuda_inputs(trades: np.ndarray, offsets: np.ndarray) -> tuple[dict[str, Any], Any]:
-    """Column tensors and offsets on the current CUDA device."""
+    """Return ``trades`` as column tensors and ``offsets`` as a tensor on the CUDA device."""
     import torch
 
     columns = {name: torch.as_tensor(trades[name].copy()).cuda() for name in trades.dtype.names}
@@ -67,7 +73,13 @@ def cuda_inputs(trades: np.ndarray, offsets: np.ndarray) -> tuple[dict[str, Any]
 
 
 def assert_gpu_parity(got: dict[str, Any], trades: np.ndarray, offsets: np.ndarray) -> None:
-    """Assert the parity rule above between CUDA outputs and the plain-loop oracle."""
+    """Assert the parity rule above between CUDA outputs and the plain-loop oracle.
+
+    Args:
+        got: Feature tensors returned by the CUDA path, keyed by feature name.
+        trades: Host-side trade records in ``contract.TRADE_DTYPE``.
+        offsets: Host-side bucket offsets matching ``trades``.
+    """
     expected = reference.aggregate_reference_naive(trades, offsets)
     assert tuple(got) == contract.FEATURE_NAMES
     for name in contract.FEATURE_NAMES:

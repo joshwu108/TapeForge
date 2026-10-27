@@ -1,4 +1,9 @@
-"""Episode construction: the required window, V_ref and the target Q*."""
+"""Tests for tapeforge.execution.episodes: the required window, the reference volume, the target
+quantity derived from it, and episode construction from a trade array.
+
+Rounding cases are pinned with exact integers; ``_day`` generates a uniform
+synthetic day for the end-to-end checks.
+"""
 
 from __future__ import annotations
 
@@ -43,7 +48,10 @@ def test_round_half_up_bps(value: int, rate_bps: int, expected: int) -> None:
 
 @pytest.mark.parametrize("rho_bps, expected", [(200, 24_691), (500, 61_728), (1_000, 123_456)])
 def test_target_for_each_accepted_rho(rho_bps: int, expected: int) -> None:
-    """rho = 10 % rounds up to 123,457 and is then clipped by the 10 % cap (floor, 123,456)."""
+    """A 10 % target fraction rounds up to 123,457 and is then clipped by the cap (floor, 123,456).
+
+    With the cap lifted to 100 % every fraction gives the half-up rounded value.
+    """
     assert target_from_reference_volume(1_234_567, rho_bps, 1_000) == expected
     assert target_from_reference_volume(1_234_567, rho_bps, 10_000) == round_half_up_bps(
         1_234_567, rho_bps
@@ -52,14 +60,14 @@ def test_target_for_each_accepted_rho(rho_bps: int, expected: int) -> None:
 
 def test_target_is_floored_at_one_tick() -> None:
     assert target_from_reference_volume(0, 1_000, 1_000) == 1
-    assert target_from_reference_volume(24, 200, 1_000) == 1   # 0.48 ticks rounds to 0, floored
-    assert target_from_reference_volume(25, 200, 1_000) == 1   # 0.5 rounds up
+    assert target_from_reference_volume(24, 200, 1_000) == 1   # 0.48 ticks rounds to 0, floored.
+    assert target_from_reference_volume(25, 200, 1_000) == 1   # 0.5 rounds up.
 
 
 def test_target_is_capped_at_the_participation_cap_times_the_reference_volume() -> None:
-    assert target_from_reference_volume(1_000_000, 5_000, 1_000) == 100_000  # 50 % asked, 10 % cap
-    assert target_from_reference_volume(1_000_000, 1_000, 1_000) == 100_000  # rho == cap
-    assert target_from_reference_volume(1_000_005, 1_000, 1_000) == 100_000  # rounding up, then cap
+    assert target_from_reference_volume(1_000_000, 5_000, 1_000) == 100_000  # 50 % asked, 10 % cap.
+    assert target_from_reference_volume(1_000_000, 1_000, 1_000) == 100_000  # Fraction equals cap.
+    assert target_from_reference_volume(1_000_005, 1_000, 1_000) == 100_000  # Rounds up, then cap.
     with pytest.raises(ValueError, match="non-negative"):
         target_from_reference_volume(-1, 200, 1_000)
 
@@ -73,6 +81,7 @@ def test_reference_volume_sums_exactly_the_h_buckets_before_t0() -> None:
 
 
 def _day(seed: int = 5, n_buckets: int = 40) -> tuple[np.ndarray, np.ndarray]:
+    """Generate a uniform-profile synthetic trade day and its bucket offsets."""
     trades = generate.generate_trades(seed=seed, n_buckets=n_buckets, profile="uniform")
     return trades, windows.build_offsets(trades["timestamp"], 0, n_buckets, W)
 
@@ -117,7 +126,7 @@ def test_perturbing_a_bucket_after_t0_leaves_q_star_unchanged() -> None:
 def test_build_market_slice_clips_at_the_end_of_the_day() -> None:
     trades, offsets = _day()
     market = build_market_slice(trades, offsets, start_bucket=36, n_before=5, n_after=7)
-    assert market.origin == 5 and market.n_after == 4  # buckets 36..39 only
+    assert market.origin == 5 and market.n_after == 4  # Buckets 36..39 only.
     with pytest.raises(ValueError, match="buckets of history"):
         build_market_slice(trades, offsets, start_bucket=3, n_before=5, n_after=7)
     with pytest.raises(ValueError, match="past the 40-bucket window"):

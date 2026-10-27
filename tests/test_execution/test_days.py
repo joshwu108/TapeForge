@@ -1,4 +1,9 @@
-"""Day tapes: calendar geometry, adapters, concatenation, slicing and episodes on a tape."""
+"""Tests for tapeforge.execution.days: UTC day geometry, the synthetic, trade-array and archive
+adapters, contiguity and concatenation, slice cutting, and episodes cut from a day tape.
+
+Synthetic days are checked bucket for bucket against the reference feature
+engine; the archive adapter runs on the five-record fixture under ``tests/fixtures``.
+"""
 
 from __future__ import annotations
 
@@ -97,7 +102,7 @@ def test_cut_slice_reindexes_relative_to_the_new_origin() -> None:
     tape = slice_from_rows([], [(DEEP, P0 + i) for i in range(8)])
     cut = cut_slice(tape, 2, 7, origin=3)
     assert cut.n_buckets == 5 and cut.origin == 3 and cut.n_after == 2
-    assert int(cut.vwap_ticks[cut.index(0)]) == P0 + 5   # tape bucket 5 is episode bucket 0
+    assert int(cut.vwap_ticks[cut.index(0)]) == P0 + 5   # Tape bucket 5 is episode bucket 0.
     assert int(cut.vwap_ticks[cut.index(-3)]) == P0 + 2
     for first, last in [(3, 3), (-1, 4), (0, 9), (5, 2)]:
         with pytest.raises(ValueError, match="not inside"):
@@ -135,13 +140,17 @@ def test_episode_at_rejects_starts_without_history_or_past_the_tape() -> None:
     with pytest.raises(ValueError, match="past the 12-bucket tape"):
         episode_at(tape, 12, 1, 500, template=template)
     _, clipped = episode_at(tape, 10, 1, 500, template=template)
-    assert clipped.n_after == 2   # the slice ends with the tape; the episode will truncate
+    assert clipped.n_after == 2   # The slice ends with the tape, so the episode truncates.
 
 
 # --- whole-day adapters -------------------------------------------------------------
 
 
 def _day_trades(day: str, seconds: tuple[int, ...]) -> np.ndarray:
+    """Build ``TRADE_DTYPE`` records at the given bucket offsets into UTC day ``day``.
+
+    Every record carries the same price and quantity; only the timestamps vary.
+    """
     trades = np.zeros(len(seconds), dtype=contract.TRADE_DTYPE)
     trades["timestamp"] = utc_day_start_us(day) + np.array(seconds, dtype=np.int64) * W
     trades["price"] = 10_000

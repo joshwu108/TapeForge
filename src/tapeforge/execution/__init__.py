@@ -1,13 +1,20 @@
-"""Reference execution simulator (CPU, torch-free, exact integer accounting).
+"""Reference execution simulator: CPU-only, torch-free, exact integer accounting.
 
-See ``simulator`` for the transition semantics, ``spec`` for the episode
-parameters and units, ``state`` for the frozen data carried through an
-episode, ``episodes`` for cutting a tape into episodes and sizing targets,
-``days`` for whole-day tapes (synthetic or from an archive), ``splits`` for
-chronological day splits with embargo and purge, ``sampling`` for seeded
-episode draws, ``runner`` for replaying a policy and recording runs,
-``baselines`` for the signal-free policies and ``normalization`` for
-train-only observation statistics.
+Submodules and their responsibilities:
+
+* ``spec``: episode parameters, units and the int64 bound check.
+* ``state``: immutable data carried through an episode (tape slice, state,
+  step record).
+* ``simulator``: ``reset`` / ``observe`` / ``step`` transition semantics, the
+  fill rule and the reward decomposition.
+* ``episodes``: the tape window an episode needs and target sizing from the
+  reference volume.
+* ``days``: whole-day tapes, synthetic or from an aggTrades archive.
+* ``splits``: chronological day splits with embargo and purge controls.
+* ``sampling``: seeded, index-addressable episode draws.
+* ``runner``: policy replay, summaries and JSON run records.
+* ``baselines``: signal-free reference policies.
+* ``normalization``: train-only observation statistics.
 """
 
 from __future__ import annotations

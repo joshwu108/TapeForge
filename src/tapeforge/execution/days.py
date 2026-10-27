@@ -1,31 +1,35 @@
 """Day tapes: one UTC day of bucketed features, and episodes cut from a tape.
 
 A ``DayTape`` is the feature engine's output for one calendar day as a
-``MarketSlice`` with ``origin == 0`` (array index == bucket index), plus the
-calendar label and bucket geometry the split logic needs: ``date`` (the UTC
-day, ``YYYY-MM-DD``), ``start_us`` (the timestamp of bucket 0) and
+``MarketSlice`` with ``origin == 0`` (array index equals bucket index), plus
+the calendar label and bucket geometry the split logic needs: ``date`` (the
+UTC day, ``YYYY-MM-DD``), ``start_us`` (the timestamp of bucket 0) and
 ``width_us``. Two days are *contiguous* when one ends where the next starts;
 ``concat_tapes`` joins contiguous days into one longer tape so an episode
 may run across midnight inside a split.
 
 Adapters:
-
-* ``synthetic_day``: a ``generate.generate_trades`` day, so splits and
-  baselines are testable without data; the number of buckets is a parameter
-  and the geometry is whatever the caller asks for.
-* ``day_from_trades``: a full UTC day (86,400 one-second buckets by default)
-  from any ``TRADE_DTYPE`` array whose records fall inside that day.
-* ``day_from_archive``: the above for a downloaded aggTrades archive, through
-  ``tapeforge.ingest.load_agg_trades``; every record must belong to the day
-  the file name claims.
+    * ``synthetic_day``: a ``generate.generate_trades`` day, so splits and
+      baselines are testable without data; the number of buckets is a
+      parameter and the geometry is whatever the caller asks for.
+    * ``day_from_trades``: a full UTC day (86,400 one-second buckets by
+      default) from any ``TRADE_DTYPE`` array whose records fall inside that
+      day.
+    * ``day_from_archive``: the above for a downloaded aggTrades archive,
+      through ``tapeforge.ingest.load_agg_trades``; every record must belong
+      to the day the file name claims.
 
 ``episode_at`` is ``episodes.make_episode`` for a tape that is already
-bucketed: it cuts the slice ``required_window`` demands around ``t_0`` and
-sizes Q* from the reference volume, with no recomputation of features.
+bucketed: it cuts the slice ``required_window`` demands around the start
+bucket and sizes ``target_qty_ticks`` from the reference volume, with no
+recomputation of features.
 
-Units follow the data contract: int64 ticks everywhere, VWAP quantised by
-``vwap_ticks_from_numerators``. This module reads nothing after the end of a
-tape and does not know about splits, sampling or policies.
+Data contract:
+    int64 ticks everywhere; VWAP quantised by ``vwap_ticks_from_numerators``.
+
+Not covered:
+    This module reads nothing after the end of a tape and does not know
+    about splits, sampling or policies.
 """
 
 from __future__ import annotations
@@ -59,12 +63,12 @@ __all__ = [
     "utc_day_start_us",
 ]
 
-SECONDS_PER_DAY: Final[int] = 86_400
-BUCKETS_PER_DAY: Final[int] = SECONDS_PER_DAY  # at the default one-second width
+SECONDS_PER_DAY: Final[int] = 86_400  # Length of a UTC day in seconds.
+BUCKETS_PER_DAY: Final[int] = SECONDS_PER_DAY  # Buckets per day at the default one-second width.
 
 
 def utc_day_start_us(day: str) -> int:
-    """Microseconds since the epoch at 00:00:00 UTC of ``day`` (``YYYY-MM-DD``).
+    """Return microseconds since the epoch at 00:00:00 UTC of ``day`` (``YYYY-MM-DD``).
 
     Raises:
         ValueError: ``day`` is not an ISO calendar date.
@@ -78,9 +82,18 @@ def utc_day_start_us(day: str) -> int:
 class DayTape:
     """One day's bucket features with their calendar position.
 
-    ``tape.origin`` must be 0 so that bucket ``b`` is array index ``b``.
-    ``source`` is a short provenance string carried into run records (the
-    generator seed and profile, or the archive name and digest).
+    Equality is identity (``eq=False``). Instances are produced by the
+    adapters in this module and validated at construction.
+
+    Attributes:
+        date: The UTC calendar day, ``YYYY-MM-DD``.
+        start_us: Timestamp of bucket 0, in microseconds since the epoch;
+            non-negative.
+        width_us: Bucket width in microseconds; positive.
+        tape: The day's features as a ``MarketSlice`` with ``origin == 0``,
+            so bucket ``b`` is array index ``b``.
+        source: Short provenance string carried into run records (the
+            generator seed and profile, or the archive name and digest).
     """
 
     date: str
@@ -107,20 +120,24 @@ class DayTape:
 
     @property
     def n_buckets(self) -> int:
-        """Buckets in the day (86,400 for a full day at the default width)."""
+        """Return the bucket count of the day (86,400 for a full day at the default width)."""
         return self.tape.n_buckets
 
     @property
     def end_us(self) -> int:
-        """Timestamp just past the last bucket (the next day's ``start_us`` when contiguous)."""
+        """Return the timestamp just past the last bucket, in microseconds.
+
+        Equals the next day's ``start_us`` when the two are contiguous.
+        """
         return self.start_us + self.n_buckets * self.width_us
 
     def is_contiguous_with(self, following: DayTape) -> bool:
-        """True when ``following`` starts exactly where this day ends, at the same width."""
+        """Return whether ``following`` starts exactly where this day ends, at the same width."""
         return self.width_us == following.width_us and self.end_us == following.start_us
 
 
 def _tape_from_trades(trades: np.ndarray, offsets: np.ndarray) -> MarketSlice:
+    """Bucket ``trades`` by ``offsets`` into an ``origin == 0`` slice with exact VWAP ticks."""
     features = reference.aggregate_reference(trades, offsets)
     numerators = reference.vwap_numerators(trades, offsets)
     return MarketSlice.from_features(features, numerators, origin=0)
@@ -134,14 +151,15 @@ def synthetic_day(
     start_us: int | None = None,
     width_us: int = DEFAULT_BUCKET_WIDTH_US,
 ) -> DayTape:
-    """A seeded synthetic day: ``generate.generate_trades`` bucketed into a tape.
+    """Return a seeded synthetic day: ``generate.generate_trades`` bucketed into a tape.
 
     ``start_us`` defaults to midnight UTC of ``day``; pass it explicitly to
-    build short contiguous test days. Deterministic in ``seed`` and the other
-    arguments.
+    build short contiguous test days. The result is deterministic in ``seed``
+    and the other arguments.
 
     Raises:
-        ValueError: whatever ``generate_trades`` rejects, or a bad ``day``.
+        ValueError: ``generate_trades`` rejects the arguments, or ``day`` is
+            not an ISO calendar date.
     """
     start = utc_day_start_us(day) if start_us is None else start_us
     trades = generate.generate_trades(
@@ -166,13 +184,19 @@ def day_from_trades(
     """Bucket a timestamp-sorted ``TRADE_DTYPE`` array over the whole UTC day ``day``.
 
     The day is ``[midnight, midnight + 86,400 s)`` cut into ``width_us``
-    buckets (``width_us`` must divide the day). Every record must lie inside
+    buckets; ``width_us`` must divide the day. Every record must lie inside
     the day: a record outside it means the array is not the day it claims to
     be, and silently ignoring it would make the tape disagree with its label.
 
+    Args:
+        trades: ``TRADE_DTYPE`` array sorted by timestamp.
+        day: The UTC calendar day, ``YYYY-MM-DD``.
+        width_us: Bucket width in microseconds.
+        source: Provenance string stored on the tape.
+
     Raises:
-        ValueError: wrong dtype, ``width_us`` does not divide a day, or any
-            record outside the day (the message counts them).
+        ValueError: Wrong dtype, ``width_us`` does not divide a day, or any
+            record falls outside the day (the message counts them).
     """
     if trades.dtype != TRADE_DTYPE:
         raise ValueError(f"trades must have TRADE_DTYPE, got {trades.dtype}")
@@ -201,14 +225,17 @@ def day_from_archive(
     """Load a downloaded aggTrades archive and bucket it over its UTC day.
 
     ``day`` defaults to the date in the archive's file name
-    (``SYMBOL-aggTrades-YYYY-MM-DD.zip``); pass it when the file is renamed.
-    Returns the tape and the ingest provenance (sha256, record count,
-    timestamp unit, resort flag). The futures and spot archives share the
-    7-column layout, so the trade ingest handles both.
+    (``SYMBOL-aggTrades-YYYY-MM-DD.zip``); pass it when the file has been
+    renamed. The futures and spot archives share the 7-column layout, so the
+    trade ingest handles both.
+
+    Returns:
+        The tape and the ingest provenance (sha256, record count, timestamp
+        unit, resort flag).
 
     Raises:
-        ValueError: no date given and none in the file name, plus whatever
-            ``load_agg_trades`` and ``day_from_trades`` reject.
+        ValueError: No date given and none in the file name, or
+            ``load_agg_trades`` or ``day_from_trades`` rejects the input.
     """
     trades, provenance = ingest.load_agg_trades(path)
     if day is None:
@@ -225,7 +252,7 @@ def day_from_archive(
 
 
 def cut_slice(tape: MarketSlice, first: int, last: int, origin: int) -> MarketSlice:
-    """Buckets ``[first, last)`` of a tape as a new slice with the given ``origin``.
+    """Return buckets ``[first, last)`` of a tape as a new slice with the given ``origin``.
 
     ``tape`` is indexed by array position (an ``origin == 0`` tape, or a
     concatenation of days). The copy is validated like any slice.
@@ -250,9 +277,11 @@ def cut_slice(tape: MarketSlice, first: int, last: int, origin: int) -> MarketSl
 def concat_tapes(days: tuple[DayTape, ...] | list[DayTape]) -> MarketSlice:
     """Join contiguous days, in order, into one ``origin == 0`` slice.
 
+    A single day returns its own tape without copying.
+
     Raises:
-        ValueError: no days, or two neighbours that are not contiguous
-            (the message names the dates).
+        ValueError: No days, or two neighbours that are not contiguous (the
+            message names the dates).
     """
     if not days:
         raise ValueError("concat_tapes needs at least one day")
@@ -283,14 +312,16 @@ def episode_at(
 ) -> tuple[EpisodeSpec, MarketSlice]:
     """Cut the episode whose first decision bucket is ``start_bucket`` of ``tape``.
 
-    Same contract as ``episodes.make_episode`` (``template`` supplies every
-    field except side and target; Q* from the H buckets before the start),
-    but on an already bucketed tape: the slice is ``required_window`` buckets
-    around the start, clipped at the end of the tape (a clipped slice makes
-    the episode truncate, not fail).
+    Same contract as ``episodes.make_episode``: ``template`` supplies every
+    field except side and target, and ``target_qty_ticks`` is sized from the
+    ``horizon_buckets`` buckets before the start. The difference is that the
+    tape is already bucketed: the slice is ``required_window`` buckets around
+    the start, clipped at the end of the tape, and a clipped slice makes the
+    episode truncate rather than fail.
 
     Raises:
-        ValueError: too little history before the start, or a start past the tape.
+        ValueError: Too little history before the start, or a start past the
+            end of the tape.
     """
     base = EpisodeSpec(side=side, target_qty_ticks=1) if template is None else replace(
         template, side=side, target_qty_ticks=1

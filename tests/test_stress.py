@@ -1,8 +1,9 @@
-"""Robustness at scale: a million records per profile, with the correctness gate.
+"""Tests for ``tapeforge.ops`` at scale: a million records per profile through the gate.
 
-Slow: run with ``python -m pytest -q -m slow``. The CPU cases run everywhere;
-the GPU cases additionally need the ``gpu_ready`` capability and skip with its
-reason otherwise.
+Oracle: ``reference.aggregate_reference_naive`` on the CPU path and
+``reference.aggregate_reference`` on the GPU path. Slow: run with
+``python -m pytest -q -m slow``. The CPU cases run everywhere; the GPU cases
+additionally need the ``gpu_ready`` fixture and skip with its reason otherwise.
 """
 
 from __future__ import annotations
@@ -22,12 +23,14 @@ _RECORDS_PER_BUCKET = {"sparse": 0.5, "uniform": 50.0, "burst": 100.0}
 
 
 def _workload(n_records: int, profile: str, seed: int = 17) -> tuple[np.ndarray, np.ndarray]:
+    """Generate roughly ``n_records`` trades of ``profile`` and offsets spanning every bucket."""
     n_buckets = max(1, round(n_records / _RECORDS_PER_BUCKET[profile]))
     trades = generate.generate_trades(seed=seed, n_buckets=n_buckets, profile=profile)
     return trades, windows.build_offsets(trades["timestamp"], 0, n_buckets, W)
 
 
 def _assert_same(got: dict[str, object], expected: reference.Features) -> None:
+    """Assert counts, sums and validity exactly and VWAP within the contract tolerances."""
     for name in ("event_count", "total_quantity", "signed_quantity", "valid"):
         np.testing.assert_array_equal(got[name].cpu().numpy(), getattr(expected, name))  # type: ignore[attr-defined]
     np.testing.assert_allclose(
@@ -41,6 +44,7 @@ def _assert_same(got: dict[str, object], expected: reference.Features) -> None:
 @pytest.mark.parametrize("n_records", [100_000, 1_000_000])
 @pytest.mark.parametrize("profile", ["sparse", "uniform", "burst"])
 def test_no_incorrect_features_at_scale(n_records: int, profile: str) -> None:
+    """The CPU path matches the plain-loop oracle and conserves records at scale."""
     pytest.importorskip("torch")
     trades, offsets = _workload(n_records, profile)
     got = ops.aggregate(trades, offsets)
@@ -60,6 +64,7 @@ def test_no_incorrect_features_at_scale(n_records: int, profile: str) -> None:
 def test_gpu_no_incorrect_features_at_scale(
     gpu_ready: None, n_records: int, profile: str
 ) -> None:
+    """The CUDA path matches the reference on both dispatch paths at scale."""
     import torch
 
     trades, offsets = _workload(n_records, profile)
@@ -76,7 +81,10 @@ def test_gpu_no_incorrect_features_at_scale(
 
 
 def _real_magnitude_bucket(n: int) -> np.ndarray:
-    """One bucket at BTCUSDT 2025-01-02 extremes: top price, largest quantity."""
+    """Build ``n`` records at the BTCUSDT 2025-01-02 extremes: highest price, largest quantity.
+
+    Sides alternate so the signed quantity sums to zero for even ``n``.
+    """
     trades = np.zeros(n, dtype=contract.TRADE_DTYPE)
     trades["price"] = round(97_839.50 * contract.PRICE_SCALE)
     trades["quantity"] = round(18.89042 * contract.QUANTITY_SCALE)
