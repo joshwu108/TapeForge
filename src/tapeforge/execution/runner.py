@@ -15,10 +15,6 @@ accounting plus the shortfall in basis points; ``summarize_set`` aggregates a
 set of episodes with nearest-rank percentiles (``sorted[ceil(p * n) - 1]``,
 no interpolation) so a plain loop can recompute every figure.
 
-Shortfall of a truncated episode is the shortfall of the fills so far, with
-no residual term (there is no terminal mark); the summary flags it so a set
-summary can report truncations separately.
-
 ``run_policy`` samples a split role, replays one policy, and writes a JSON
 run record (configuration, seeds, split record, code revision, per-episode
 draws and summaries, set summary) under a runs directory that Git ignores.
