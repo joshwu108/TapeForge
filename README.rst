@@ -33,7 +33,12 @@ integer partial sums and divides once. On top of the features, a torch-free
 reference execution simulator replays an optimal-execution episode against
 the bucket tape with exact integer accounting (see "Execution simulator"),
 and signal-free baselines replay over chronological day splits with embargo
-and purge (see "Episodes, splits and baselines"). Planned extensions include
+and purge (see "Episodes, splits and baselines"). A configuration-driven
+experiment runner replays the baselines on identical episodes and writes
+auditable run directories, a report generator and an episode replay tool
+read them, and an optional Gymnasium adapter exposes the simulator to RL
+libraries (see "Baseline experiments" and "Gymnasium adapter"). Planned
+extensions include
 pinned-memory stream overlap in the transfer benchmark and an end-to-end
 training throughput experiment. The classifier and training benchmark remain
 stubs; no policy is learned. The input contains trades rather than order-book
@@ -91,8 +96,24 @@ manual run and must be refreshed whenever the GPU-facing modules change.
      - no GPU counterpart exists
    * - day tapes, chronological splits (embargo, purge), seeded sampling, train-only statistics, replay runner, run records, three baselines
      - yes
-     - yes, on synthetic days; on the downloaded futures day when present
+     - yes, on synthetic days; on the downloaded futures days when present
      - no GPU counterpart exists
+   * - archive acquisition with checksum verification, budget and manifest (``execution.datasets``)
+     - yes
+     - yes, against a fake network; three real futures days fetched and verified locally
+     - no GPU code
+   * - experiment runner, run directories, comparison utility (``execution.experiment``)
+     - yes
+     - yes, on synthetic days; a three-day futures smoke run executed locally (not published)
+     - no GPU code
+   * - report generator and episode replay (``execution.report``, ``execution.replay``)
+     - yes
+     - yes, hand-calculated cases and reconstruction from records
+     - no GPU code
+   * - Gymnasium adapter (``execution.gym_env``, optional ``rl`` extra)
+     - yes
+     - yes, environment checker, simulator parity, every baseline through it
+     - no GPU code; no learned policy exists
    * - kernel and pipeline benchmarks
      - yes
      - CPU smoke run of the CPU-capable rows
@@ -196,6 +217,7 @@ device and a working Triton build.
    $ python -m venv .venv && source .venv/bin/activate
    $ pip install -e '.[torch,dev]'          # CPU development
    $ pip install -e '.[gpu,ml,dev]'         # Linux + NVIDIA CUDA GPU
+   $ pip install -e '.[rl]'                 # adds gymnasium for the environment adapter
 
 Verify a checkout
 =================
@@ -288,8 +310,11 @@ Command line:
 
    $ python -m tapeforge.generate --seed 7 --seconds 10 --profile burst
    $ python -m tapeforge.ingest --symbol BTCUSDT --date 2025-01-02
+   $ python -m tapeforge.ingest --market futures-um --symbol BTCUSDT --date 2023-12-01
 
-Downloaded archives land in ``data/`` and are never committed.
+Downloaded archives land in ``data/`` and are never committed. The spot and
+USD-M futures archives share one layout but are different instruments; a
+dataset or experiment names exactly one market.
 
 Streaming
 =========
@@ -539,6 +564,183 @@ with ``day_from_archive``). The real futures day, when downloaded under
 ``data/``, is covered by tests that skip precisely when it is absent; no
 result from it is published here.
 
+Baseline experiments, reports and replay
+========================================
+
+``tapeforge.execution.experiment`` turns one TOML configuration into one run
+directory. The configuration names everything explicitly and nothing has a
+default date: the market (``spot`` or ``futures-um``, never both in one
+run), the symbol, the days of each role, the seeds, the episodes per day,
+the target fractions, the policies and every ``EpisodeSpec`` field. Two
+configurations are tracked under ``experiments/configs/``: a synthetic
+smoke run that needs no data, and a futures smoke run over three
+consecutive days of Binance USD-M BTCUSDT (two train, one validation, no
+test). Both carry ``label = "smoke"``; their output demonstrates that the
+pipeline works and supports no claim about any policy. A research
+evaluation needs its own configuration with research dates.
+
+.. code-block:: console
+
+   $ python -m tapeforge.execution.datasets fetch --market futures-um \
+         --symbol BTCUSDT --date 2023-12-02 --date 2023-12-03   # verified, budgeted
+   $ python -m tapeforge.execution.experiment run experiments/configs/smoke-synthetic.toml
+   $ python -m tapeforge.execution.experiment run experiments/configs/smoke-futures-btcusdt-2023-12.toml
+   $ python -m tapeforge.execution.report runs/<run-dir>            # report/ under the run
+   $ python -m tapeforge.execution.replay runs/<run-dir> --episode validation/s1/i0 \
+         --policy twap --verify
+   $ python -m tapeforge.execution.experiment compare runs/<run-a> runs/<run-b>
+
+**Data.** ``execution.datasets`` acquires daily aggTrades archives under
+``data/<market>/aggTrades/``. A file is used only after its sha256 matches
+the published checksum; a verified local copy is reused without network; a
+download happens only when the configuration allows it and the run's
+budget (archives and bytes, every attempt counted) has room for the size
+the server reports; a mismatch deletes the partial file and reports every
+attempt. Downloaded data stays under the ignored ``data/`` directory and is
+never redistributed.
+
+**Run directories.** ``runs/<name>-<utc>/`` (ignored by Git; a second run
+in the same second gets a suffix) holds ``records/<policy>-<role>-seed<n>.json``,
+one run record per policy, role and seed, and ``manifest.json`` with the
+resolved configuration, the sha256 and size of every archive (or the
+generator seed of every synthetic day), the code revision and dirty flag,
+the simulator version and its assumptions, the split record, the
+identifier of every episode (``<role>/s<seed>/i<index>``), timings and
+peak memory. Every policy replays exactly the same draws, cut fresh for
+each replay, so policy order changes nothing; two runs of one
+configuration on the same data give byte-identical records apart from
+timestamps and revision fields, which ``compare`` ignores. Files are
+written through a temporary name and a rename. The test role is evaluated
+only with ``--include-test`` and its records are tagged held-out.
+
+**Report.** ``execution.report`` writes ``report.json``, ``policies.csv``,
+``days.csv``, ``paired.csv``, ``episodes.csv`` and ``report.rst`` under the
+run. Episodes are classed as completed, incomplete (horizon reached with
+residual inventory; the shortfall includes the residual term) or truncated
+(the tape ran out; the record holds a fills-only shortfall, a different
+quantity, counted separately and never pooled or paired). Per policy and
+per day it lists counts, mean, median, p95, p99 and maximum shortfall in
+basis points, totals in cash ticks, fees, steps used, capped fills and the
+residual fraction; paired differences against a reference policy are
+taken on identical episode identifiers. Uncertainty is a day-cluster
+bootstrap of the pooled mean, shown only when at least five distinct days
+exist; a one-day run reports it as insufficient. Held-out records are
+excluded unless asked for. With ``residual_mu = 0`` the report says so:
+an incomplete episode then pays only the Perold term, so mean shortfalls
+of policies with different completion rates are not comparable on their
+own.
+
+**Replay.** ``execution.replay`` rebuilds one episode from its identifier
+and prints, per decision, the newest bucket the policy could see and
+whether it was priced, the mark price and its age, the action, the
+submitted quantity, the cap, the fill and its price, the fee, the
+remaining quantity, cash and inventory, the three reward components and
+the flags, followed by how the episode ended (terminal mark and residual
+term, or the truncation notice). ``--verify`` compares the replayed
+accounting with the stored record.
+
+.. code-block:: python
+
+   import tempfile
+
+   from tapeforge.execution.experiment import config_from_mapping, run_experiment
+   from tapeforge.execution.replay import replay_episode, verify_against_record
+   from tapeforge.execution.report import build_report
+
+   config = config_from_mapping({
+       "name": "readme", "label": "smoke",
+       "data": {"source": "synthetic", "market": "synthetic",
+                "synthetic": {"n_buckets": 200, "days": [
+                    {"date": "2024-01-01", "seed": 1}, {"date": "2024-01-02", "seed": 2}]}},
+       "split": {"train": ["2024-01-01"], "validation": ["2024-01-02"]},
+       "episodes": {"seeds": [1], "episodes_per_day": 3},
+       "policies": {"names": ["twap", "immediate"]},
+       "template": {"horizon_buckets": 10, "arrival_lookback": 3},
+   })
+   run_dir = run_experiment(config, output_dir=tempfile.mkdtemp())   # normally runs/, ignored
+   report = build_report(run_dir)                            # paired against "twap"
+   assert report["per_policy"][0]["n_episodes"] == 3
+   assert report["paired"][0]["n_pairs"] == 3
+   assert verify_against_record(replay_episode(run_dir, "validation/s1/i0", "twap"), run_dir) == []
+
+Gymnasium adapter
+=================
+
+``tapeforge.execution.gym_env`` wraps the simulator as a Gymnasium
+environment for RL libraries. Gymnasium is an optional extra (``rl``); the
+data and CPU reference packages never import it, and the adapter contains
+no learner, optimiser or policy. ``ExecutionEnv`` takes an episode pool:
+``SplitPool`` names the seeded draws of one split role, exactly the
+episodes a run record with that seed lists, and ``ListPool`` takes explicit
+``(id, spec, slice)`` entries.
+
+===============  =============================================================
+contract         value
+===============  =============================================================
+observation      ``Box`` of shape ``(10,)``, float32, the ``OBSERVATION_FIELDS``
+                 of ``observe`` (remaining and time fractions, side, mark
+                 return and age, newest visible bucket's validity, count,
+                 quantity over target, taker imbalance, return); bounded
+                 fields carry their bounds, returns are unbounded
+action           ``Box`` ``[0, 1]`` of shape ``(1,)``, float32: fraction of the
+                 remaining quantity, floored to ticks by the simulator; a
+                 scalar is accepted; the value is passed on unchanged (a
+                 float64 action keeps a quantity-exact baseline exact)
+reward           ``reward_ticks x 10,000 / (P_0 x Q*)``, basis points of the
+                 arrival notional, as a float; ``reward_unit="ticks"``
+                 returns the integer as a float; ``info`` keeps the exact
+                 ``reward_ticks`` and its cost, risk and terminal parts
+normalisation    only with explicitly supplied frozen ``ObservationStatistics``
+                 from the training split; nothing is fitted by the adapter
+flags            the simulator's ``terminated`` and ``truncated``, never both;
+                 no wrapper time limit; a truncated episode gets no residual
+                 term and no terminal mark
+terminal obs     ``observe`` of the final state; when the tape ends exactly at
+                 the newest visible bucket the last observation is repeated
+                 and ``info["terminal_observation_available"]`` is false
+invalid actions  outside ``[0, 1]``, non-finite, wrong shape or non-numeric
+                 raise ``ValueError`` or ``TypeError``; nothing is clipped
+reset            ``reset(seed=s)`` reseeds and restarts a sequential pool;
+                 ``reset()`` takes the next entry (``EpisodePoolExhausted``
+                 at the end unless ``cycle=True``) or, with
+                 ``selection="random"``, a draw from ``np_random``;
+                 ``options={"episode": index or id}`` selects explicitly
+after the end    ``step`` raises ``EpisodeOver``; before the first reset it
+                 raises ``RuntimeError``
+===============  =============================================================
+
+.. code-block:: python
+
+   try:
+       from tapeforge.execution.gym_env import ExecutionEnv, SplitPool
+   except ImportError:          # gymnasium is optional: pip install -e '.[rl]'
+       ExecutionEnv = None
+
+   if ExecutionEnv is not None:
+       from tapeforge.execution import EpisodeSpec, SplitDates, build_splits, synthetic_day
+
+       SECOND = 1_000_000
+       days = [synthetic_day(seed=1, day="2024-01-01", n_buckets=80, start_us=0),
+               synthetic_day(seed=2, day="2024-01-02", n_buckets=80, start_us=80 * SECOND)]
+       template = EpisodeSpec(side=1, target_qty_ticks=1, horizon_buckets=5, arrival_lookback=3)
+       splits = build_splits(days, SplitDates(("2024-01-01",), ("2024-01-02",)), template)
+       env = ExecutionEnv(SplitPool(splits, "train", template, seed=1, n_episodes=4))
+       observation, info = env.reset(seed=0)        # info["episode_id"] == "train/s1/i0"
+       total = 0.0
+       while True:                                   # a random policy, not a trained one
+           observation, reward, terminated, truncated, info = env.step(env.action_space.sample())
+           total += reward
+           if terminated or truncated:
+               break
+       assert info["reward_ticks"] == -(info["reward_components_ticks"]["cost"]
+                                        + info["reward_components_ticks"]["risk"]
+                                        + info["reward_components_ticks"]["terminal"])
+
+The adapter is CPU-verified with Gymnasium's environment checker, step by
+step against direct simulator calls, and by replaying every baseline
+through it with identical fills, fees, flags and rewards. No policy has
+been trained with it.
+
 Reproducible GPU verification
 =============================
 
@@ -651,6 +853,11 @@ Layout
        runner.py      Observation, run_episode, summaries, JSON run records
        baselines.py   twap, immediate, cap_aware_twap
        normalization.py  train-only observation statistics
+       datasets.py    archive acquisition: checksums, cache, budget, manifest
+       experiment.py  TOML-configured baseline experiments, run directories, compare
+       report.py      per-policy, per-day and paired statistics; JSON, CSV, RST
+       replay.py      step-by-step replay of one recorded episode
+       gym_env.py     Gymnasium adapter (optional ``rl`` extra)
    tests/           parity, edge-case, streaming, two-pass, prepared, stress,
                     docs and tooling suites; tests/test_execution/ holds the
                     simulator, splits, sampling, runner, baseline, leakage and
@@ -659,10 +866,12 @@ Layout
    test_program.py  toy CUDA example, run by the snapshot verifier
    benchmarks/      harness, the three timed scopes, baselines, workloads,
                     versioned configs/, results.json (empty until recorded)
+   experiments/configs/   smoke experiment configurations (synthetic, futures)
    tools/           check_gpu_parity.py (one-screen GPU parity summary),
                     verify_snapshot.py (snapshot packer + verification runner)
    .github/workflows/ci.yml   lint and CPU test matrix (Python 3.11, 3.12)
-   runs/            baseline run records (ignored, never committed)
+   runs/            baseline run records and experiment run directories
+                    (ignored, never committed)
    data/            downloaded archives (ignored, never committed)
 
 Development guidelines

@@ -15,6 +15,12 @@ Submodules and their responsibilities:
 * ``runner``: policy replay, summaries and JSON run records.
 * ``baselines``: signal-free reference policies.
 * ``normalization``: train-only observation statistics.
+* ``datasets``: archive acquisition with checksums, a budget and a manifest.
+* ``experiment``: TOML-configured baseline experiments and run directories.
+* ``report``: per-policy, per-day and paired statistics over a run.
+* ``replay``: step-by-step replay of one recorded episode.
+* ``gym_env``: Gymnasium adapter; needs the optional ``rl`` extra and is
+  not imported here.
 """
 
 from __future__ import annotations
@@ -36,11 +42,18 @@ from tapeforge.execution.episodes import (
     required_window,
     target_from_reference_volume,
 )
+from tapeforge.execution.experiment import (
+    ExperimentConfig,
+    load_config,
+    run_experiment,
+)
 from tapeforge.execution.normalization import (
     ObservationStatistics,
     normalize,
     observation_statistics,
 )
+from tapeforge.execution.replay import replay_episode
+from tapeforge.execution.report import build_report, write_report
 from tapeforge.execution.runner import (
     EpisodeSummary,
     Observation,
@@ -99,6 +112,7 @@ __all__ = [
     "EpisodeOver",
     "EpisodeSpec",
     "EpisodeSummary",
+    "ExperimentConfig",
     "MarketSlice",
     "Observation",
     "ObservationStatistics",
@@ -112,6 +126,7 @@ __all__ = [
     "Trajectory",
     "action_for_quantity",
     "build_market_slice",
+    "build_report",
     "build_splits",
     "cap_aware_twap",
     "check_episode_bounds",
@@ -126,6 +141,7 @@ __all__ = [
     "immediate",
     "implementation_shortfall",
     "is_done",
+    "load_config",
     "make_episode",
     "materialize",
     "normalize",
@@ -135,9 +151,11 @@ __all__ = [
     "purge_window",
     "reference_volume_ticks",
     "remaining_qty_ticks",
+    "replay_episode",
     "required_window",
     "reset",
     "run_episode",
+    "run_experiment",
     "run_policy",
     "sample_episodes",
     "shortfall_bps",
@@ -148,5 +166,6 @@ __all__ = [
     "target_from_reference_volume",
     "terminal_mark",
     "twap",
+    "write_report",
     "write_run_record",
 ]
