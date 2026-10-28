@@ -18,11 +18,12 @@ Invariants:
     instead of shifting every record by a factor of 1,000.
 
 Not covered:
-    Network access exists only in ``download`` (spot archive URL). Every
-    other function reads local files, so the test suite stays offline.
+    Network access exists only in ``download``. Every other function reads
+    local files, so the test suite stays offline.
 
 CLI:
     python -m tapeforge.ingest --symbol BTCUSDT --date 2025-01-02
+    python -m tapeforge.ingest --market futures-um --symbol BTCUSDT --date 2023-12-01
 """
 
 from __future__ import annotations
@@ -46,6 +47,15 @@ from tapeforge.contract import (
 )
 
 BASE_URL: Final[str] = "https://data.binance.vision/data/spot/daily/aggTrades"
+
+# Daily aggTrades archive roots per market. Spot and USD-M futures publish the
+# same 7-column layout but are different instruments; a dataset or experiment
+# names exactly one market and never mixes the two as one history.
+MARKET_BASE_URLS: Final[dict[str, str]] = {
+    "spot": BASE_URL,
+    "futures-um": "https://data.binance.vision/data/futures/um/daily/aggTrades",
+}
+DEFAULT_MARKET: Final[str] = "spot"
 
 EXPECTED_COLUMNS: Final[tuple[int, ...]] = (7, 8)  # Column counts of the known layouts.
 COL_AGG_TRADE_ID: Final[int] = 0
@@ -90,9 +100,15 @@ class Provenance:
     was_resorted: bool = False
 
 
-def archive_url(symbol: str, date: str) -> str:
-    """Return the public ZIP URL for one symbol-day."""
-    return f"{BASE_URL}/{symbol}/{symbol}-aggTrades-{date}.zip"
+def archive_url(symbol: str, date: str, market: str = DEFAULT_MARKET) -> str:
+    """Return the public ZIP URL for one symbol-day of ``market``.
+
+    Raises:
+        ValueError: ``market`` is not a key of ``MARKET_BASE_URLS``.
+    """
+    if market not in MARKET_BASE_URLS:
+        raise ValueError(f"unknown market {market!r}; expected one of {sorted(MARKET_BASE_URLS)}")
+    return f"{MARKET_BASE_URLS[market]}/{symbol}/{symbol}-aggTrades-{date}.zip"
 
 
 def _scale_digits(scale: int) -> int:
@@ -290,18 +306,22 @@ def load_agg_trades(path: str | Path) -> tuple[np.ndarray, Provenance]:
     )
 
 
-def download(symbol: str, date: str, out_dir: str | Path = "data") -> Path:
+def download(
+    symbol: str, date: str, out_dir: str | Path = "data", market: str = DEFAULT_MARKET
+) -> Path:
     """Fetch one symbol-day ZIP and verify it against the published CHECKSUM.
 
     An existing file is not re-downloaded but is still verified. When the
     checksum cannot be fetched, a warning is printed and the local digest is
-    reported instead. This is the only function in the package that touches
-    the network.
+    reported instead. ``tapeforge.execution.datasets`` wraps this behaviour
+    with a size budget, a manifest and strict (never unverified) acquisition
+    for experiments.
 
     Args:
         symbol: Exchange symbol, for example ``"BTCUSDT"``.
         date: Trading day as ``YYYY-MM-DD``.
         out_dir: Directory that receives the ZIP; created if missing.
+        market: ``"spot"`` or ``"futures-um"``.
 
     Returns:
         Path of the verified ZIP.
@@ -314,7 +334,7 @@ def download(symbol: str, date: str, out_dir: str | Path = "data") -> Path:
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    url = archive_url(symbol, date)
+    url = archive_url(symbol, date, market)
     target = out_dir / Path(url).name
 
     if not target.exists():
@@ -349,10 +369,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--date", default="2025-01-02")
     parser.add_argument("--out-dir", default="data")
+    parser.add_argument(
+        "--market", default=DEFAULT_MARKET, choices=sorted(MARKET_BASE_URLS),
+        help="archive family; spot and USD-M futures are never mixed as one history",
+    )
     parser.add_argument("--path", default=None, help="skip the download, read this file")
     args = parser.parse_args(argv)
 
-    path = Path(args.path) if args.path else download(args.symbol, args.date, args.out_dir)
+    path = (
+        Path(args.path) if args.path
+        else download(args.symbol, args.date, args.out_dir, args.market)
+    )
     trades, prov = load_agg_trades(path)
 
     span_s = (int(trades["timestamp"][-1]) - int(trades["timestamp"][0])) / US_PER_SECOND
