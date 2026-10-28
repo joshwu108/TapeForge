@@ -21,6 +21,9 @@ torch = ["torch>=2.4"]
 gpu = ["torch>=2.4", "triton>=3.0"]
 # Model training and result reporting.
 ml = ["torch>=2.4", "scikit-learn>=1.4", "matplotlib>=3.8"]
+# Gymnasium adapter over the CPU reference simulator (tapeforge.execution.gym_env).
+# The data and CPU reference packages never import it.
+rl = ["gymnasium>=1.0"]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
