@@ -62,6 +62,8 @@ from tapeforge.execution.state import MarketSlice, State, StepResult
 
 __all__ = [
     "OBSERVATION_FIELDS",
+    "SIMULATOR_ASSUMPTIONS",
+    "SIMULATOR_VERSION",
     "EpisodeOver",
     "action_for_quantity",
     "implementation_shortfall",
@@ -77,6 +79,36 @@ __all__ = [
     "step",
     "terminal_mark",
 ]
+
+# Version tag of the transition semantics, recorded in every experiment
+# manifest so a result can be matched to the rules that produced it. Bump it
+# whenever a fill, accounting, reward or termination rule changes.
+SIMULATOR_VERSION: Final[str] = "tapeforge.execution.simulator/1"
+
+# What the fill model does and does not represent, in the words an experiment
+# record should carry. Every entry is a limitation of the synthetic fill rule,
+# not a tunable parameter; see the module docstring.
+SIMULATOR_ASSUMPTIONS: Final[dict[str, str]] = {
+    "fill_rule": (
+        "bucket_vwap_capped: the submitted quantity fills at the execution bucket's "
+        "tick-rounded VWAP plus side * slippage_ticks, capped at participation_cap_bps of "
+        "that bucket's total quantity; nothing fills in a bucket without quantity"
+    ),
+    "fee": "ceil(notional * fee_bps / 10_000) cash ticks; the only rounding in the accounting",
+    "arrival_price": "VWAP of the newest priced bucket visible before the first decision",
+    "residual_rule": (
+        "Perold opportunity cost side * (terminal_mark - arrival) * residual + "
+        "residual_mu * residual at the horizon; terminal_mark is the first priced bucket "
+        "after the last fill bucket"
+    ),
+    "not_modelled": (
+        "bid/ask spread, queue position, passive or limit orders, market impact, the "
+        "market's reaction to the policy's own orders, intra-bucket timing"
+    ),
+    "observation_causality": (
+        "a decision at step t reads buckets <= t - 1 - data_delay_buckets only"
+    ),
+}
 
 # Layout of the observation vector returned by ``observe`` (float64).
 OBSERVATION_FIELDS: Final[tuple[str, ...]] = (

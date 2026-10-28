@@ -1,0 +1,45 @@
+# Historical smoke configuration: Binance USD-M futures BTCUSDT, three
+# consecutive UTC days in the accepted quote-data window. Two train days and one
+# validation day; no test dates. The label marks a demonstration: one validation
+# day gives no day-level uncertainty and supports no claim about any policy.
+# Research evaluation needs its own configuration with explicit research dates.
+schema = "tapeforge.execution.experiment-config/1"
+name = "smoke-futures-btcusdt-2023-12"
+label = "smoke"
+description = "USD-M futures BTCUSDT 2023-12-01..03 (2 train, 1 validation); smoke only"
+
+[data]
+source = "archive"
+market = "futures-um"          # never mixed with spot history
+symbol = "BTCUSDT"
+data_dir = "data"              # ignored by Git
+allow_download = true          # verified against the published checksum
+max_download_archives = 3
+max_download_bytes = 524288000 # 500 MiB, every attempt counted
+
+[split]
+train = ["2023-12-01", "2023-12-02"]
+validation = ["2023-12-03"]
+test = []
+
+[episodes]
+seeds = [1]
+episodes_per_day = 50
+rho_choices_bps = [200, 500, 1000]
+evaluate_roles = ["train", "validation"]
+
+[policies]
+names = ["twap", "immediate", "cap_aware_twap"]
+
+# The accepted first configuration; the two swept coefficients stay at zero (off).
+[template]
+horizon_buckets = 300
+participation_cap_bps = 1000
+slippage_ticks = 0
+fee_bps = 10
+latency_buckets = 0
+data_delay_buckets = 0
+risk_lambda = 0
+residual_mu = 0
+arrival_lookback = 60
+fill_rule = "bucket_vwap_capped"
