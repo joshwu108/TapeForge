@@ -34,9 +34,11 @@ large buckets. A separate streaming CPU aggregator checks the same feature
 semantics across ordered input chunks.
 
 The execution simulator currently uses a synthetic, volume-capped bucket
-VWAP fill model. It is not an exchange simulator or a live trading system.
-There is no order routing, passive-order queue model, market impact, or
-market response to the policy's actions.
+VWAP fill model and, in its primary configuration, a synthetic terminal
+settlement of whatever is unfilled at the horizon. It is not an exchange
+simulator or a live trading system. There is no order routing, passive-order
+queue model, market impact, or market response to the policy's actions, and
+neither the fills nor the settlement represent real execution.
 
 Status
 ======
@@ -57,12 +59,18 @@ Status
        ``c5d0f80`` (PyTorch 2.14.1+cu130, Triton 3.8.0, CUDA 13.0).
        This verification is specific to that revision's GPU-facing code.
    * - CPU execution research
-     - Reference simulator, day tapes, chronological splits, episode sampling,
-       train-only normalization, three baselines, experiment CLI, reporting,
-       and replay implemented and CPU-tested.
+     - Reference simulator (version 2: terminal settlement as the primary
+       rule, the legacy residual rule named explicitly), day tapes,
+       chronological splits, episode sampling, train-only normalization with
+       versioned statistics files, three baselines plus a zero-action
+       diagnostic, experiment CLI, reporting, replay and cross-run
+       sensitivity tables implemented and CPU-tested.
    * - RL interface
      - Optional Gymnasium CPU adapter tested against direct simulator calls
-       and the baseline policies. No PPO or SAC learner is included.
+       and the baseline policies; environment checker command; fixed
+       evaluation manifests; external-policy evaluation writing
+       baseline-comparable records; checkpoint provenance schema. No PPO or
+       SAC learner is included.
    * - Performance evaluation
      - Kernel, stage, and pageable/pinned transfer benchmarks implemented.
        Recorded tuning sweeps and pinned-stream overlap remain pending.
@@ -74,8 +82,10 @@ Status
 CI checks CPU behavior; it has no CUDA runner. Hardware verification must be
 repeated after GPU-facing changes. The quick T4 benchmark checked correctness
 but was not recorded in ``benchmarks/results.json``. **No speedup figures are
-published.** A local three-day futures smoke experiment demonstrated the CPU
-pipeline; it does not establish policy superiority or out-of-sample skill.
+published.** Local three-day futures smoke experiments demonstrated the CPU
+pipeline under the terminal-settlement and legacy rules; they do not
+establish policy superiority, out-of-sample skill, or a research value of
+the terminal surcharge.
 
 Install
 =======
@@ -114,22 +124,38 @@ subsequent commands:
    $ python -m tapeforge.execution.replay runs/<run-dir> \
        --episode validation/s1/i0 --policy twap --verify
    $ python -m tapeforge.execution.experiment compare runs/<run-a> runs/<run-b>
+   $ python -m tapeforge.execution.env_check experiments/configs/smoke-synthetic.toml
 
 The report writes JSON, CSV, and reStructuredText under ``<run-dir>/report/``.
 Replay prints the visible market bucket, action, submitted quantity, fill
-cap, fill price, fees, remaining inventory, reward components, and terminal
-flags. ``--verify`` checks the replay against its recorded outcome.
+cap, fill price, fees, settled quantity and price, remaining inventory,
+reward components, and terminal flags; ``--verify`` checks the replay
+against its recorded outcome. The environment checker runs Gymnasium's
+``check_env``, drives random actions through the adapter and compares every
+step with a direct simulator call; it needs the ``rl`` extra.
 
-For historical data, the futures smoke configuration uses BTCUSDT aggregate
+For historical data, the futures smoke configurations use BTCUSDT aggregate
 trades from 2023-12-01 through 2023-12-03: two training days, one validation
-day, and no test period. It allows at most three downloads totaling 500 MiB.
-It is a demonstration configuration, not a research evaluation protocol.
+day, and no test period. They allow at most three downloads totaling 500 MiB.
+They are demonstration configurations, not a research evaluation protocol.
+One configuration per terminal-rule setting keeps the sampled episodes
+identical across settings so the sensitivity tool can line them up:
 
 .. code-block:: console
 
    $ python -m tapeforge.execution.datasets fetch --market futures-um \
        --symbol BTCUSDT --date 2023-12-01 --date 2023-12-02 --date 2023-12-03
-   $ python -m tapeforge.execution.experiment run experiments/configs/smoke-futures-btcusdt-2023-12.toml
+   $ for s in 0 10 25 50; do python -m tapeforge.execution.experiment run \
+       experiments/configs/smoke-futures-btcusdt-2023-12-settlement-${s}bps.toml; done
+   $ python -m tapeforge.execution.experiment run \
+       experiments/configs/smoke-futures-btcusdt-2023-12-legacy-perold.toml
+   $ python -m tapeforge.execution.sensitivity runs/<run-0bps> runs/<run-10bps> \
+       runs/<run-25bps> runs/<run-50bps> runs/<run-legacy> --out runs/<sensitivity-dir>
+
+``smoke-futures-btcusdt-2023-12.toml`` is the 25 bps settlement configuration
+with downloads enabled. The surcharge values are experimental settings for a
+sensitivity comparison, not calibrated market-impact estimates; 25 bps is the
+initial smoke setting, not a chosen research coefficient.
 
 Archives live under ``data/<market>/aggTrades/`` and are checked against the
 source's published SHA-256 checksum. Verified cached archives can be reused
@@ -139,9 +165,13 @@ one market and symbol. Check source licensing before redistributing data.
 Experiment contract
 ===================
 
-The TOML configuration specifies data source, dates, split roles, seeds,
-episodes per day, target fractions, policies, and simulator settings.
-Unknown keys are rejected. Research configurations need explicit dates;
+The TOML configuration (schema 2) specifies data source, dates, split roles,
+seeds, episodes per day, target fractions, policies, and simulator settings.
+Unknown keys are rejected, and ``template.terminal_rule`` must be named:
+``"terminal_settlement"`` with an explicit ``terminal_surcharge_bps``, or
+the legacy ``"residual_perold"``. Schema 1 configurations, run records and
+manifests, which predate the terminal rule, are refused with a migration
+hint rather than reinterpreted. Research configurations need explicit dates;
 copying the smoke configuration does not create a held-out experiment.
 
 * Each policy receives the same seeded episode draws with fresh state.
@@ -158,19 +188,31 @@ A run directory contains ``manifest.json`` and
 configuration, data checksums, revision and dirty state, simulator version
 and assumptions, split metadata, episode IDs, timings, and peak memory.
 Result files are written atomically; repeated runs get distinct directories.
+Externally evaluated policies add records and manifest entries to the same
+directory (see "Evaluating a policy").
 
-Reports separate completed, incomplete, and truncated episodes. They include
-per-policy and per-day shortfall, fees, completion, residuals, and tail costs,
-plus paired differences on identical episode IDs. Truncated episodes have
-fills-only shortfall and are not pooled with terminated episodes. Day-cluster
-bootstrap intervals require at least five days; smaller samples report
-insufficient data for uncertainty estimation.
+Reports separate four outcomes: completed (ordinary fills reached the
+target), settled (the target was reached only through the terminal
+settlement), incomplete (legacy rule, residual left) and truncated (the tape
+ran out). They include per-policy and per-day shortfall split into the
+fills-only part and the terminal term, ordinary and settlement fees, the
+risk charge, completion by fills next to final completion, the settled
+fraction with a ``none`` / ``light`` / ``heavy`` settlement label, tail
+costs, and paired differences on identical episode IDs. Truncated episodes
+have fills-only shortfall and are not pooled with terminated episodes.
+Day-cluster bootstrap intervals require at least five days; smaller samples
+report insufficient data for uncertainty estimation. The zero-action policy
+is labelled a diagnostic.
 
-**Completion must be reported alongside cost.** With ``residual_mu = 0``,
-unfilled quantity incurs only the terminal price-movement charge and avoids
-execution fees. A policy that leaves more unfilled can therefore have lower
-reported shortfall. This is not evidence of better execution. Residual and
-risk settings must be settled before optimizing a learned policy.
+**Completion must be reported alongside cost.** Under terminal settlement
+every terminated episode reaches the target by construction, so a 100 %
+final completion rate says nothing by itself; read it next to completion by
+fills, the settled fraction and the settlement cost. Under the legacy rule
+with ``residual_mu = 0``, unfilled quantity incurs only the terminal
+price-movement charge and avoids execution fees, so a policy that leaves
+more unfilled can have lower reported shortfall; that is not evidence of
+better execution. Surcharge and risk settings must be chosen before
+optimizing a learned policy.
 
 Execution model
 ===============
@@ -192,8 +234,9 @@ The supplied smoke configurations use:
 * A 10-basis-point fee, rounded up in cash ticks; zero slippage and latency.
 * Observations at decision ``t`` use buckets through ``t - 1 - data_delay``.
 * An arrival price from the last valid visible bucket in the lookback.
-* A terminal residual charge based on price movement from arrival to the
-  terminal mark, with optional additional residual and inventory-risk terms.
+* Terminal settlement of the quantity still unfilled at the horizon, at the
+  terminal mark moved 25 basis points against the side (the smoke setting),
+  with the same fee; an optional inventory-risk term.
 
 Quantities use 1e-5 units and prices use 0.01 units. Cash ticks are the
 product of price and quantity ticks. Accounting uses integers; bucket VWAP
@@ -203,12 +246,87 @@ precision instead of truncating it.
 
 For a fill, execution cost is
 ``side * (notional - arrival_price * filled_quantity) + fee``.
-Reward is the negative sum of execution cost, inventory risk, and any
-terminal residual component. Completion or horizon exhaustion terminates
-an episode. Missing data truncates it; the simulator does not invent a
-terminal mark or residual charge for a truncated episode.
+Reward is the negative sum of execution cost, inventory risk, and the
+terminal term. Completion or horizon exhaustion terminates an episode.
+Missing data truncates it; the simulator does not invent a terminal mark,
+a settlement or a residual charge for a truncated episode.
 
-The three baselines are:
+Terminal rules
+--------------
+
+The terminal mark is the VWAP of the first valid bucket at or after bucket
+``horizon + latency``, searched over ``arrival_lookback`` buckets. Two rules
+decide what happens to quantity still unfilled when the horizon ends; a
+specification names one explicitly.
+
+``terminal_settlement`` (primary research configuration). The residual is
+settled in one synthetic fill at the terminal mark moved against the side
+by ``terminal_surcharge_bps``: a buy pays the mark times
+``(10000 + surcharge) / 10000`` rounded up to a price tick, a sell receives
+the mark times ``(10000 - surcharge) / 10000`` rounded down. The settlement
+pays the configured fee with the usual ceiling and updates inventory, cash,
+the settled quantity, the settlement notional and the settlement fee, which
+are kept apart from the ordinary fills. No opportunity-cost term is charged
+in addition. The task therefore always ends with the target reached unless
+the tape runs out. The settlement ignores the participation cap of the
+terminal bucket and the record flags when it exceeds it; it is a boundary
+condition of the task, not executable depth, impact or guaranteed liquidity.
+``residual_mu`` must be zero under this rule, and ordinary
+``slippage_ticks`` applies to fills only. Early completion settles nothing.
+
+``residual_perold`` (legacy, explicit). The residual stays unfilled and is
+charged ``side * (terminal_mark - arrival) * residual + residual_mu *
+residual``. With ``residual_mu = 0`` the residual pays no fee and a
+favourable price move rewards inaction. Simulator version 1 used this rule
+for every episode; naming it reproduces those transitions.
+
+Worked example on the reference fixture (arrival 10,000 ticks, fee 10 bps,
+terminal mark 10,010, 120,000 of 300,000 ticks left after fills whose own
+shortfall is 2,200,400 cash ticks):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 10 14 16 14 18 18
+
+   * - Side
+     - Surcharge
+     - Settlement price
+     - Settlement fee
+     - Settlement cost
+     - Total shortfall
+   * - buy
+     - 0 bps
+     - 10,010
+     - 1,201,200
+     - 2,401,200
+     - 4,601,600
+   * - buy
+     - 25 bps
+     - 10,036
+     - 1,204,320
+     - 5,524,320
+     - 7,724,720
+   * - sell
+     - 25 bps
+     - 9,984
+     - 1,198,080
+     - 3,118,080
+     - 4,518,480
+
+Settlement cost is ``side * (price * 120,000 - 10,000 * 120,000) + fee``;
+the sell row adds the sell-side fill shortfall of 1,400,400. Under the legacy
+rule with ``residual_mu = 0`` the same buy residual costs 1,200,000 and no
+fee. A zero-action buy on a terminal mark of 9,990 settles at 0 bps for
+minus 3,000 cash ticks: favourable market movement can make delaying
+execution beneficial, and the rule does not pretend otherwise; what it
+removes is the fee avoidance. These cases are pinned by the oracle tests.
+
+Under both rules the risk term charges ``risk_lambda`` per tick unfilled
+after each step's ordinary fill, before any settlement, and the per-step
+rewards of a terminated episode sum to minus the implementation shortfall
+minus the risk charge.
+
+The baselines are:
 
 * ``twap``: divide remaining quantity by remaining decisions.
 * ``immediate``: request all remaining quantity at every decision; fills
@@ -216,6 +334,9 @@ The three baselines are:
 * ``cap_aware_twap``: increase TWAP's submission if recent liquidity suggests
   the remaining decisions may not absorb the outstanding quantity. This is
   a heuristic, not a forecast.
+* ``zero_action``: never trade. A diagnostic, not a strategy: it isolates
+  the cost of the terminal rule alone and may win an episode when the
+  market moves favourably.
 
 Gymnasium interface
 ===================
@@ -230,10 +351,15 @@ explicit episode entries.
   actions raise rather than being silently clipped.
 * Reward: basis points of arrival notional by default. ``info`` retains the
   exact integer reward and its components; raw-tick rewards are optional.
+  The horizon step's reward includes the settlement cost, and its
+  ``step_result`` carries the settled quantity, price, notional, fee and
+  cap-override flag. The settlement price is read from the bucket after the
+  horizon and never enters an observation the agent acted on.
 * ``terminated`` and ``truncated`` follow the reference simulator. No
   wrapper time limit changes the horizon.
-* Frozen training statistics can be supplied explicitly. Sequential pools
-  support fixed evaluation sets; random selection supports training.
+* Frozen training statistics can be supplied explicitly or loaded from a
+  versioned file. Sequential pools support fixed evaluation sets; random
+  selection supports training.
 
 A CPU smoke example:
 
@@ -263,6 +389,53 @@ To use the same episode with Gymnasium after installing ``.[rl]``:
 
 The environment is ready for a trainer adapter. PPO/SAC training, policy
 checkpoint selection, and GPU-vectorized environments are not included.
+
+Evaluating a policy
+===================
+
+``tapeforge.execution.evaluation`` holds what a trainer needs around the
+environment, and nothing of the trainer itself.
+
+* ``load_training_config`` reads a strict TOML description
+  (``tapeforge.execution.training-config/1``): the experiment configuration,
+  the training role (always ``train``) and seeds, the reference baseline and
+  seed for the frozen statistics, and the evaluation roles and seeds. The
+  test role is refused unless ``include_test`` is set.
+* ``training_statistics`` fits the statistics on training draws only;
+  ``save_statistics`` and ``load_statistics`` freeze them to a JSON file
+  tagged with its schema and the simulator version, and refuse files from
+  another version.
+* ``evaluation_manifest`` lists the fixed evaluation episodes of a run
+  directory (the identifiers every baseline replayed) with the split record,
+  data digests and a content digest; ``load_evaluation_manifest`` rejects an
+  edited file.
+* ``vector_policy`` adapts a callable over the learner's float32 observation
+  vector to the runner's policy interface. Its output is validated, never
+  clipped.
+* ``evaluate_policy`` replays any policy on a run's episodes and writes
+  records with the baseline schema into the run directory, so the report
+  pairs it against the baselines on identical episode IDs.
+* ``checkpoint_provenance`` returns the model-agnostic record a checkpoint
+  must carry (configuration and its hash, split and data hashes, statistics,
+  seed, action and reward conventions, simulator version, evaluation
+  digest); ``validate_checkpoint_provenance`` checks it before an
+  evaluation.
+
+.. code-block:: python
+
+   import tempfile
+
+   import numpy as np
+
+   from tapeforge.execution import evaluate_policy, run_experiment, vector_policy
+   from tapeforge.execution.experiment import load_config, rebuild_splits
+
+   config = load_config("experiments/configs/smoke-synthetic.toml")
+   run_dir = run_experiment(config, output_dir=tempfile.mkdtemp())
+   splits = rebuild_splits(config)
+   policy = vector_policy(lambda vector: np.float32(0.1))  # a stand-in for a learned policy
+   written = evaluate_policy(run_dir, policy, "constant-0.1", splits=splits)
+   assert len(written) == 2  # one record per evaluated role and seed
 
 Feature engine
 ==============
@@ -324,7 +497,7 @@ Checks and GPU verification
    $ python -m ruff check src tests benchmarks tools
    $ python -m pytest -q
    $ python -m pytest -q --cov=tapeforge --cov-report=term-missing
-   $ python -m pytest -q tests/test_execution/test_gym_env.py
+   $ python -m pytest -q tests/test_execution/test_gym_env.py tests/test_execution/test_end_to_end.py
    $ python -m mypy
 
 The strict type check currently reports two known errors in the ``model.py``
@@ -395,9 +568,11 @@ Repository layout
        baselines.py, runner.py       policies, replay loop, summaries
        datasets.py, experiment.py    acquisition and configured experiments
        report.py, replay.py          aggregate reports and episode inspection
-       gym_env.py                    optional Gymnasium interface
+       sensitivity.py                cross-run terminal-rule comparison
+       evaluation.py                 evaluation sets, external policies, provenance
+       gym_env.py, env_check.py      optional Gymnasium interface and checker
      model.py                        classifier stub
-   experiments/configs/              synthetic and futures smoke configs
+   experiments/configs/              synthetic and futures smoke configs per terminal setting
    benchmarks/                       compute/transfer timings and result records
    tests/                            CPU/GPU parity, accounting, leakage, tooling
    tools/                            parity summary and snapshot verification
