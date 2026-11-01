@@ -14,31 +14,46 @@ set, is centred and left unscaled).
 
 Invariants:
     The statistics are stored next to the split record in run records
-    (``ObservationStatistics.to_json``). The baselines do not use them, since
-    they read exact quantities rather than the scaled vector. The
-    observations depend on the reference policy's actions through the
-    remaining fraction, so the policy name is recorded with the result.
+    (``ObservationStatistics.to_json``) and can be frozen to a JSON file
+    (``save_statistics`` / ``load_statistics``) tagged with
+    ``STATISTICS_SCHEMA`` and the simulator version, so a trainer and a later
+    evaluation load exactly the statistics the training run used. The
+    baselines do not use them, since they read exact quantities rather than
+    the scaled vector. The observations depend on the reference policy's
+    actions through the remaining fraction, so the policy name is recorded
+    with the result.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import json
+import math
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Final
 
 import numpy as np
 
 from tapeforge.execution.runner import Policy, run_episode
 from tapeforge.execution.sampling import EpisodeDraw, materialize
-from tapeforge.execution.simulator import OBSERVATION_FIELDS
+from tapeforge.execution.simulator import OBSERVATION_FIELDS, SIMULATOR_VERSION
 from tapeforge.execution.spec import EpisodeSpec
 from tapeforge.execution.splits import Splits
 
 __all__ = [
+    "STATISTICS_SCHEMA",
     "ObservationStatistics",
+    "load_statistics",
     "normalize",
     "observation_statistics",
+    "save_statistics",
+    "statistics_from_json",
 ]
+
+# Schema tag of a frozen statistics file. The file also names the simulator
+# version whose observation layout the statistics describe.
+STATISTICS_SCHEMA: Final[str] = "tapeforge.execution.observation-statistics/1"
 
 
 @dataclass(frozen=True)
@@ -74,8 +89,86 @@ class ObservationStatistics:
             raise ValueError("fields, mean and std must have the same length")
 
     def to_json(self) -> dict[str, Any]:
-        """Return a plain dict of built-in types, stored verbatim in run records."""
-        return asdict(self)
+        """Return a plain dict of built-in types tagged with the schema and simulator version.
+
+        Stored verbatim in run records and written by ``save_statistics``.
+        """
+        return {
+            "schema": STATISTICS_SCHEMA,
+            "simulator_version": SIMULATOR_VERSION,
+            **asdict(self),
+        }
+
+
+def statistics_from_json(payload: Mapping[str, Any]) -> ObservationStatistics:
+    """Rebuild ``ObservationStatistics`` from ``to_json`` output, strictly.
+
+    Raises:
+        ValueError: Wrong or missing schema, a simulator version other than
+            the running one (the observation layout may differ), fields that
+            are not exactly ``OBSERVATION_FIELDS``, lengths that disagree, a
+            non-finite mean or standard deviation, a negative standard
+            deviation, or non-positive counts.
+    """
+    if payload.get("schema") != STATISTICS_SCHEMA:
+        raise ValueError(
+            f"statistics schema {payload.get('schema')!r} is not {STATISTICS_SCHEMA!r}"
+        )
+    if payload.get("simulator_version") != SIMULATOR_VERSION:
+        raise ValueError(
+            f"statistics were fitted under simulator {payload.get('simulator_version')!r}; "
+            f"this code observes under {SIMULATOR_VERSION!r} and does not reuse them"
+        )
+    required = ("fields", "mean", "std", "n_observations", "n_episodes", "policy", "seed")
+    missing = [k for k in required if k not in payload]
+    if missing:
+        raise ValueError(f"statistics file is missing {missing}")
+    fields = tuple(str(f) for f in payload["fields"])
+    if fields != OBSERVATION_FIELDS:
+        raise ValueError(
+            f"statistics fields {fields} are not OBSERVATION_FIELDS {OBSERVATION_FIELDS}"
+        )
+    mean = tuple(float(v) for v in payload["mean"])
+    std = tuple(float(v) for v in payload["std"])
+    if len(mean) != len(fields) or len(std) != len(fields):
+        raise ValueError("mean and std must have one value per field")
+    if not all(math.isfinite(v) for v in mean + std):
+        raise ValueError("mean and std must be finite")
+    if any(v < 0 for v in std):
+        raise ValueError("std must be non-negative")
+    n_observations, n_episodes = int(payload["n_observations"]), int(payload["n_episodes"])
+    if n_observations < 1 or n_episodes < 1:
+        raise ValueError("n_observations and n_episodes must be positive")
+    return ObservationStatistics(
+        fields=fields, mean=mean, std=std, n_observations=n_observations,
+        n_episodes=n_episodes, policy=str(payload["policy"]), seed=int(payload["seed"]),
+    )
+
+
+def save_statistics(statistics: ObservationStatistics, path: str | Path) -> Path:
+    """Write ``statistics.to_json()`` as indented, key-sorted JSON through a temporary file."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(json.dumps(statistics.to_json(), indent=2, sort_keys=True) + "\n")
+    tmp.replace(target)
+    return target
+
+
+def load_statistics(path: str | Path) -> ObservationStatistics:
+    """Read a file written by ``save_statistics`` (``statistics_from_json`` validates it).
+
+    Raises:
+        FileNotFoundError: No such file.
+        ValueError: The file is not JSON or fails validation.
+    """
+    try:
+        payload = json.loads(Path(path).read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} does not hold a JSON object")
+    return statistics_from_json(payload)
 
 
 def observation_statistics(

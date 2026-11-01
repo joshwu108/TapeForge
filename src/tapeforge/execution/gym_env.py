@@ -40,8 +40,14 @@ Reward:
 
 Episode end:
     ``terminated`` and ``truncated`` are the simulator's flags, never both.
-    On a truncated episode no residual term and no terminal mark are
-    invented; the info reports the fills so far. The terminal observation is
+    Under the ``terminal_settlement`` rule the horizon step settles the
+    unfilled quantity (its ``info["step_result"]`` carries the settlement
+    quantity, price, notional, fee and cap-override flag, and the reward of
+    that step includes the settlement cost); the settlement price is read
+    from the bucket after the horizon and therefore never enters an
+    observation the agent acted on. On a truncated episode nothing is
+    settled, no residual term and no terminal mark are invented; the info
+    reports the fills so far. The terminal observation is
     ``observe`` of the final state when its newest visible bucket exists in
     the slice; when it does not (a truncation with zero data delay and zero
     latency cuts the tape exactly there) the last observation the agent saw
@@ -449,6 +455,8 @@ class ExecutionEnv(gym.Env[np.ndarray, np.ndarray]):
             "target_qty_ticks": entry.spec.target_qty_ticks,
             "remaining_qty_ticks": remaining_qty_ticks(state, entry.spec),
             "newest_visible_bucket": newest_visible_bucket(state.step, entry.spec),
+            "terminal_rule": entry.spec.terminal_rule,
+            "terminal_surcharge_bps": entry.spec.terminal_surcharge_bps,
             "simulator_version": SIMULATOR_VERSION,
         }
         return observation.copy(), info
@@ -508,6 +516,7 @@ class ExecutionEnv(gym.Env[np.ndarray, np.ndarray]):
             "reward_unit": self.reward_unit,
             "newest_visible_bucket": newest_visible_bucket(state.step, spec),
             "terminal_observation_available": available,
+            "settled_qty_ticks": state.settled_qty_ticks,
             "is_done": is_done(state, spec),
         }
 

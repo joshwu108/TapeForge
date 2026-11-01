@@ -43,7 +43,15 @@ from tapeforge.execution.simulator import (  # noqa: E402
 )
 from tapeforge.execution.spec import EpisodeSpec  # noqa: E402
 from tapeforge.execution.splits import SplitDates, Splits, build_splits  # noqa: E402
-from test_execution.tapes import DEEP, P0, Q_STAR, slice_from_rows, worksheet_spec, worksheet_tape  # noqa: E402
+from test_execution.tapes import (  # noqa: E402
+    DEEP,
+    P0,
+    Q_STAR,
+    legacy_spec,
+    slice_from_rows,
+    worksheet_spec,
+    worksheet_tape,
+)
 
 SPEC = EpisodeSpec(side=1, target_qty_ticks=1, horizon_buckets=6, arrival_lookback=3)
 DATES = ("2024-01-01", "2024-01-02", "2024-01-03")
@@ -174,7 +182,13 @@ def test_every_baseline_replays_through_the_adapter_with_the_same_outcome(name: 
         assert infos[-1]["step_result"]["terminated"] == trajectory.last_result.terminated
         assert infos[-1]["step_result"]["truncated"] == trajectory.last_result.truncated
         assert infos[-1]["state"]["cash_ticks"] == trajectory.final_state.cash_ticks
-        assert infos[-1]["state"]["fees_ticks"] == summary.fees_ticks
+        assert infos[-1]["state"]["fill_fees_ticks"] == summary.fill_fees_ticks
+        assert infos[-1]["state"]["settlement_fees_ticks"] == summary.settlement_fees_ticks
+        assert infos[-1]["state"]["settled_qty_ticks"] == summary.settled_qty_ticks
+        assert infos[-1]["settled_qty_ticks"] == summary.settled_qty_ticks
+        assert infos[-1]["step_result"]["settlement_qty_ticks"] == (
+            trajectory.last_result.settlement_qty_ticks
+        )
         assert sum(rewards) == pytest.approx(
             summary.reward_sum_ticks * 10_000
             / (summary.arrival_price_ticks * summary.target_qty_ticks)
@@ -276,13 +290,63 @@ def test_termination_at_completion_and_at_the_horizon() -> None:
     assert infos[-1]["terminal_observation_available"] and observations[-1][0] == 0.0
     with pytest.raises(EpisodeOver, match="call reset"):
         env.step(0.5)
-    env.reset(seed=0)
+    legacy = ExecutionEnv(ListPool([("legacy", legacy_spec(side=1), worksheet_tape())]))
+    legacy.reset(seed=0)
     for _ in range(3):
-        obs, reward, terminated, truncated, info = env.step(0.0)   # Never trade.
+        obs, reward, terminated, truncated, info = legacy.step(0.0)   # Never trade.
     assert terminated and not truncated and info["remaining_qty_ticks"] == Q_STAR
     assert info["step_result"]["terminal_price_ticks"] == 10_010
     assert info["step_result"]["terminal_component"] == 10 * Q_STAR   # Perold term, mu = 0.
+    assert info["step_result"]["settlement_qty_ticks"] == 0 and info["settled_qty_ticks"] == 0
     assert obs[1] == 0.0   # Time remaining fraction at the horizon.
+
+
+def test_the_horizon_step_settles_the_residual_and_reports_it_exactly() -> None:
+    """Zero action at 25 bps: 300,000 settled at 10,036 above a 200,000 cap, cost 13,810,800."""
+    env = ExecutionEnv(_worksheet_pool(terminal_surcharge_bps=25), reward_unit="ticks")
+    _, info = env.reset(seed=0)
+    assert info["terminal_rule"] == "terminal_settlement" and info["terminal_surcharge_bps"] == 25
+    rewards = []
+    for _ in range(3):
+        obs, reward, terminated, truncated, info = env.step(0.0)
+        rewards.append(reward)
+    assert terminated and not truncated
+    result = info["step_result"]
+    assert info["remaining_qty_ticks"] == 0 and info["settled_qty_ticks"] == Q_STAR
+    assert result["settlement_qty_ticks"] == Q_STAR and result["settlement_price_ticks"] == 10_036
+    assert result["settlement_notional_ticks"] == 3_010_800_000
+    assert result["settlement_fee_ticks"] == 3_010_800
+    assert result["settlement_cap_qty_ticks"] == 200_000 and result["settlement_exceeds_cap"]
+    assert result["terminal_component"] == 13_810_800 and result["terminal_price_ticks"] == 10_010
+    assert rewards == [0.0, 0.0, -13_810_800.0]
+    assert info["state"]["filled_qty_ticks"] == 0 and info["state"]["inventory_ticks"] == Q_STAR
+    assert info["state"]["cash_ticks"] == -3_010_800_000 - 3_010_800
+    assert obs[0] == 0.0   # Remaining fraction after settlement.
+    with pytest.raises(EpisodeOver):
+        env.step(0.0)
+
+
+def test_settlement_prices_never_enter_an_observation_the_agent_acted_on() -> None:
+    """Perturbing the terminal bucket changes the settlement but no observation before it."""
+    spec = worksheet_spec(side=1, terminal_surcharge_bps=25)
+    base = ExecutionEnv(ListPool([("base", spec, worksheet_tape())]))
+    moved = ExecutionEnv(ListPool([("moved", spec, worksheet_tape(after=[(DEEP, 12_345)]))]))
+    obs_a, obs_b = [base.reset(seed=0)[0]], [moved.reset(seed=0)[0]]
+    done = False
+    while not done:
+        oa, ra, ta, tra, ia = base.step(0.2)
+        ob, rb, tb, trb, ib = moved.step(0.2)
+        obs_a.append(oa)
+        obs_b.append(ob)
+        done = ta or tra
+        if not done:
+            assert ra == rb and ia["reward_ticks"] == ib["reward_ticks"]
+    # Every observation the agent decided on is identical; only the terminal step differs.
+    for a, b in zip(obs_a[:-1], obs_b[:-1], strict=True):
+        np.testing.assert_array_equal(a, b)
+    assert ia["step_result"]["settlement_price_ticks"] == 10_036
+    assert ib["step_result"]["settlement_price_ticks"] == 12_376   # ceil(12,345 x 1.0025).
+    assert ia["reward_ticks"] != ib["reward_ticks"]
 
 
 def test_truncation_invents_no_residual_term_and_repeats_the_last_observation() -> None:
