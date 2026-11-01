@@ -2,9 +2,21 @@
 
 ``EpisodeSpec`` fixes everything about an episode that is not market data:
 side, target quantity, horizon, fill-rule parameters, latency, data delay,
-fees and the two experiment reward coefficients. It is a frozen dataclass of
-Python integers, so two specs compare equal field by field and a spec can be
-hashed into a replay key.
+fees, the terminal rule with its surcharge, and the two experiment reward
+coefficients. It is a frozen dataclass of Python integers, so two specs
+compare equal field by field and a spec can be hashed into a replay key.
+
+Terminal rules:
+    ``"terminal_settlement"`` (the primary research configuration) settles
+    whatever is still unfilled at the horizon in one synthetic fill at the
+    terminal mark moved against the side by ``terminal_surcharge_bps`` and
+    charged the ordinary fee, so the task always ends with the target
+    reached unless the tape runs out. ``"residual_perold"`` (the legacy rule)
+    leaves the residual unfilled and charges its opportunity cost at the
+    terminal mark plus ``residual_mu`` per residual tick. The two are
+    mutually exclusive parameterisations: ``residual_mu`` is meaningful
+    only under the legacy rule and ``terminal_surcharge_bps`` only under
+    settlement; a spec that mixes them is rejected rather than reinterpreted.
 
 Data contract:
     Units follow ``tapeforge.contract``: quantities in quantity ticks
@@ -31,6 +43,10 @@ from tapeforge.contract import INT64_MAX, PRICE_SCALE, QUANTITY_SCALE
 
 __all__ = [
     "ACCEPTED_FEE_BPS",
+    "ACCEPTED_TERMINAL_SURCHARGE_SMOKE_BPS",
+    "TERMINAL_RULES",
+    "TERMINAL_RULE_RESIDUAL_PEROLD",
+    "TERMINAL_RULE_SETTLEMENT",
     "ACCEPTED_HORIZON_BUCKETS",
     "ACCEPTED_PARTICIPATION_CAP_BPS",
     "ACCEPTED_TARGET_FRACTIONS_BPS",
@@ -45,6 +61,7 @@ __all__ = [
     "check_episode_bounds",
     "fee_ticks",
     "participation_cap_ticks",
+    "settlement_price_ticks",
 ]
 
 Side = Literal[1, -1]
@@ -65,6 +82,22 @@ ACCEPTED_HORIZON_BUCKETS: Final[int] = 300
 ACCEPTED_PARTICIPATION_CAP_BPS: Final[int] = 1_000   # 10 % of a bucket's total quantity.
 ACCEPTED_FEE_BPS: Final[int] = 10   # Taker fee; an assumed tier, not read from the exchange.
 ACCEPTED_TARGET_FRACTIONS_BPS: Final[tuple[int, ...]] = (200, 500, 1_000)  # Target fractions.
+
+# Terminal rules decide what happens to quantity still unfilled when the
+# horizon ends. They are named strings checked by ``EpisodeSpec``; the
+# simulator branches on them in ``step``. Changing a rule's meaning requires
+# a new name, so an old record can never be misread under a new rule.
+TerminalRule = Literal["terminal_settlement", "residual_perold"]
+TERMINAL_RULE_SETTLEMENT: Final[str] = "terminal_settlement"
+TERMINAL_RULE_RESIDUAL_PEROLD: Final[str] = "residual_perold"
+TERMINAL_RULES: Final[frozenset[str]] = frozenset(
+    {TERMINAL_RULE_SETTLEMENT, TERMINAL_RULE_RESIDUAL_PEROLD}
+)
+# Surcharge values of the smoke sensitivity configurations, in basis points of
+# the terminal mark. Experimental settings for comparison, not calibrated
+# market-impact estimates; 25 is the initial smoke setting, not a chosen
+# research coefficient.
+ACCEPTED_TERMINAL_SURCHARGE_SMOKE_BPS: Final[tuple[int, ...]] = (0, 10, 25, 50)
 
 # Fill rules are named strings, not a plugin registry. A second rule (for
 # example fill-at-touch, once best bid/ask data exists) is added as a second
@@ -106,8 +139,19 @@ class EpisodeSpec:
             quantity still unfilled after the step. Experiment parameter;
             zero disables the term.
         residual_mu: One-time charge at the horizon in cash ticks per
-            quantity tick of residual inventory. Experiment parameter; zero
-            disables the term.
+            quantity tick of residual inventory under the legacy
+            ``residual_perold`` rule. Experiment parameter; zero disables
+            the term. Must be zero under ``terminal_settlement``, which
+            leaves no residual to charge for.
+        terminal_rule: ``TERMINAL_RULE_SETTLEMENT`` (default) or
+            ``TERMINAL_RULE_RESIDUAL_PEROLD``; see the module docstring.
+        terminal_surcharge_bps: Adverse adjustment of the terminal mark for
+            the settlement price, in integer basis points, in
+            ``[0, BPS_DENOMINATOR)``: a buy settles at the mark rounded up
+            after adding the surcharge, a sell at the mark rounded down
+            after subtracting it (``settlement_price_ticks``). Separate from
+            ``slippage_ticks``, which applies to ordinary fills only. Must
+            be zero under ``residual_perold``, which settles nothing.
         arrival_lookback: How many buckets before the first visible bucket
             are searched for a valid arrival price, and how many buckets
             after the last fill bucket are searched for a valid terminal
@@ -128,18 +172,23 @@ class EpisodeSpec:
     residual_mu: int = 0
     arrival_lookback: int = 60
     fill_rule: str = FILL_RULE_BUCKET_VWAP_CAPPED
+    terminal_rule: str = TERMINAL_RULE_SETTLEMENT
+    terminal_surcharge_bps: int = 0
 
     def __post_init__(self) -> None:
         """Normalise NumPy integers to ``int`` and reject out-of-domain values.
 
         Raises:
             TypeError: A numeric field is not an integer (``bool`` and floats
-                included), or ``fill_rule`` is not a string.
-            ValueError: A field is outside its domain; the message names the
-                field and the offending value.
+                included), or ``fill_rule`` / ``terminal_rule`` is not a
+                string.
+            ValueError: A field is outside its domain, or ``residual_mu`` /
+                ``terminal_surcharge_bps`` is set under the terminal rule
+                that does not use it; the message names the field and the
+                offending value.
         """
         for field in fields(self):
-            if field.name == "fill_rule":
+            if field.name in ("fill_rule", "terminal_rule"):
                 continue
             value = getattr(self, field.name)
             if isinstance(value, bool) or not isinstance(value, int | np.integer):
@@ -164,7 +213,7 @@ class EpisodeSpec:
             raise ValueError(f"arrival_lookback must be positive, got {self.arrival_lookback}")
         for name in (
             "slippage_ticks", "fee_bps", "latency_buckets", "data_delay_buckets",
-            "risk_lambda", "residual_mu",
+            "risk_lambda", "residual_mu", "terminal_surcharge_bps",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be non-negative, got {getattr(self, name)}")
@@ -174,6 +223,38 @@ class EpisodeSpec:
             raise ValueError(
                 f"unknown fill_rule {self.fill_rule!r}; implemented: {sorted(_FILL_RULES)}"
             )
+        if not isinstance(self.terminal_rule, str):
+            raise TypeError(
+                f"terminal_rule must be a string, got {type(self.terminal_rule).__name__}"
+            )
+        if self.terminal_rule not in TERMINAL_RULES:
+            raise ValueError(
+                f"unknown terminal_rule {self.terminal_rule!r}; implemented: "
+                f"{sorted(TERMINAL_RULES)}"
+            )
+        # A surcharge of BPS_DENOMINATOR would settle a sell at price zero.
+        if self.terminal_surcharge_bps >= BPS_DENOMINATOR:
+            raise ValueError(
+                f"terminal_surcharge_bps must be below {BPS_DENOMINATOR}, "
+                f"got {self.terminal_surcharge_bps}"
+            )
+        if self.terminal_rule == TERMINAL_RULE_SETTLEMENT and self.residual_mu != 0:
+            raise ValueError(
+                f"residual_mu {self.residual_mu} is a parameter of the legacy "
+                f"{TERMINAL_RULE_RESIDUAL_PEROLD!r} rule; terminal settlement leaves no "
+                "residual to charge for. Set residual_mu = 0 or choose the legacy terminal_rule "
+                "explicitly"
+            )
+        if self.terminal_rule == TERMINAL_RULE_RESIDUAL_PEROLD and self.terminal_surcharge_bps:
+            raise ValueError(
+                f"terminal_surcharge_bps {self.terminal_surcharge_bps} applies to "
+                f"{TERMINAL_RULE_SETTLEMENT!r} only; the legacy rule settles nothing"
+            )
+
+    @property
+    def settles_at_horizon(self) -> bool:
+        """Return whether unfilled quantity is settled at the horizon (``terminal_settlement``)."""
+        return self.terminal_rule == TERMINAL_RULE_SETTLEMENT
 
     @property
     def initial_inventory_ticks(self) -> int:
@@ -223,6 +304,45 @@ def fee_ticks(notional_ticks: int, fee_bps: int) -> int:
     return -(-notional_ticks * fee_bps // BPS_DENOMINATOR)
 
 
+def settlement_price_ticks(terminal_mark_ticks: int, side: int, surcharge_bps: int) -> int:
+    """Return the synthetic settlement price: the terminal mark moved against the side.
+
+    A buy pays ``ceil(mark * (BPS_DENOMINATOR + surcharge) / BPS_DENOMINATOR)``
+    and a sell receives
+    ``floor(mark * (BPS_DENOMINATOR - surcharge) / BPS_DENOMINATOR)``, both in
+    integer arithmetic, so the rounding never favours the agent. A mark of
+    10,010 with 25 bps settles a buy at 10,036 (10,035.025 rounded up) and
+    a sell at 9,984 (9,984.975 rounded down).
+
+    This is a boundary condition of the task, not an executable price: it
+    ignores depth, impact and whether the quantity could trade at all.
+
+    Raises:
+        ValueError: The mark is not positive, the side is invalid, the
+            surcharge is outside ``[0, BPS_DENOMINATOR)``, or the adjusted
+            price is not positive (a sell of a one-tick mark with any
+            surcharge, for example).
+    """
+    if terminal_mark_ticks <= 0:
+        raise ValueError(f"terminal mark must be positive, got {terminal_mark_ticks}")
+    if side not in (SIDE_BUY, SIDE_SELL):
+        raise ValueError(f"side must be {SIDE_BUY} or {SIDE_SELL}, got {side}")
+    if not 0 <= surcharge_bps < BPS_DENOMINATOR:
+        raise ValueError(
+            f"surcharge must be in [0, {BPS_DENOMINATOR}) basis points, got {surcharge_bps}"
+        )
+    if side == SIDE_BUY:
+        price = -(-terminal_mark_ticks * (BPS_DENOMINATOR + surcharge_bps) // BPS_DENOMINATOR)
+    else:
+        price = terminal_mark_ticks * (BPS_DENOMINATOR - surcharge_bps) // BPS_DENOMINATOR
+    if price <= 0:
+        raise ValueError(
+            f"settlement price {price} is not positive: mark {terminal_mark_ticks} ticks, side "
+            f"{side}, surcharge {surcharge_bps} bps"
+        )
+    return price
+
+
 def check_episode_bounds(
     spec: EpisodeSpec, max_price_ticks: int, max_total_quantity_ticks: int
 ) -> None:
@@ -231,15 +351,22 @@ def check_episode_bounds(
     ``max_price_ticks`` and ``max_total_quantity_ticks`` are the largest VWAP
     and the largest bucket quantity anywhere in the tape the episode may fill
     against; ``slippage_ticks`` is added to the price here. With ``cap`` the
-    participation cap of the largest bucket and ``worst_price`` the largest
-    VWAP plus ``slippage_ticks``, the sufficient conditions, evaluated with
-    Python integers, are:
+    participation cap of the largest bucket, ``worst_price`` the largest
+    VWAP plus ``slippage_ticks`` and ``terminal_price`` the largest price the
+    terminal rule can charge the residual at (the buy-side settlement price
+    of the largest VWAP under settlement, the largest VWAP itself under the
+    legacy rule), the sufficient conditions, evaluated with Python integers,
+    are:
 
-    1. ``horizon_buckets * cap * worst_price <= INT64_MAX``: cash, executed
-       notional and the shortfall numerator cannot wrap, since no step fills
-       more than ``cap`` and no fill prices above ``worst_price``.
-    2. ``cap * worst_price * fee_bps <= INT64_MAX``: the fee intermediate
-       product cannot wrap.
+    1. ``horizon_buckets * cap * worst_price + target_qty_ticks *
+       terminal_price <= INT64_MAX``: cash, executed and settlement
+       notional and the shortfall numerator cannot wrap, since no step
+       fills more than ``cap``, no fill prices above ``worst_price`` and the
+       settled or marked residual is at most the target.
+    2. ``max(cap * worst_price, settled_bound) * fee_bps <= INT64_MAX``: the
+       fee intermediate products cannot wrap; ``settled_bound`` is
+       ``target_qty_ticks * terminal_price`` under settlement (the residual
+       pays the fee) and 0 under the legacy rule (it does not).
     3. ``max(risk_lambda, residual_mu) * target_qty_ticks <= INT64_MAX``: the
        risk and residual components are each at most a coefficient times the
        target.
@@ -252,16 +379,25 @@ def check_episode_bounds(
         raise ValueError("price and quantity maxima must be non-negative")
     cap = participation_cap_ticks(max_total_quantity_ticks, spec.participation_cap_bps)
     worst_price = max_price_ticks + spec.slippage_ticks
-    cash_bound = spec.horizon_buckets * cap * worst_price
+    terminal_price = max_price_ticks
+    if spec.settles_at_horizon and max_price_ticks > 0:
+        terminal_price = settlement_price_ticks(
+            max_price_ticks, SIDE_BUY, spec.terminal_surcharge_bps
+        )
+    residual_bound = spec.target_qty_ticks * terminal_price
+    cash_bound = spec.horizon_buckets * cap * worst_price + residual_bound
     if cash_bound > INT64_MAX:
         raise OverflowError(
             f"int64 cash bound exceeded: horizon {spec.horizon_buckets} x cap {cap} ticks x "
-            f"max price {worst_price} ticks = {cash_bound} > {INT64_MAX}"
+            f"max price {worst_price} ticks + target {spec.target_qty_ticks} x terminal price "
+            f"{terminal_price} = {cash_bound} > {INT64_MAX}"
         )
-    fee_bound = cap * worst_price * spec.fee_bps
+    settled_bound = residual_bound if spec.settles_at_horizon else 0
+    fee_bound = max(cap * worst_price, settled_bound) * spec.fee_bps
     if fee_bound > INT64_MAX:
         raise OverflowError(
-            f"int64 fee bound exceeded: cap {cap} ticks x max price {worst_price} ticks x "
+            f"int64 fee bound exceeded: max(cap {cap} ticks x max price {worst_price} ticks, "
+            f"settled {spec.target_qty_ticks} x settlement price {terminal_price}) x "
             f"fee {spec.fee_bps} bps = {fee_bound} > {INT64_MAX}"
         )
     coefficient_bound = max(spec.risk_lambda, spec.residual_mu) * spec.target_qty_ticks

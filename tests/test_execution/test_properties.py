@@ -12,8 +12,19 @@ import numpy as np
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from tapeforge.execution.simulator import implementation_shortfall, is_done, observe, reset, step
-from tapeforge.execution.spec import EpisodeSpec
+from tapeforge.execution.simulator import (
+    fill_shortfall,
+    implementation_shortfall,
+    is_done,
+    observe,
+    reset,
+    step,
+)
+from tapeforge.execution.spec import (
+    TERMINAL_RULE_RESIDUAL_PEROLD,
+    TERMINAL_RULE_SETTLEMENT,
+    EpisodeSpec,
+)
 from tapeforge.execution.state import MarketSlice
 from test_execution.tapes import frozen_bytes
 from test_execution.test_semantics import assert_step_invariants
@@ -21,7 +32,7 @@ from test_execution.test_semantics import assert_step_invariants
 # A bucket is None (empty), (count, total, signed, vwap) with total > 0, or a
 # zero-quantity valid bucket (count, 0, 0, 0).
 _priced = st.tuples(
-    st.integers(1, 50), st.integers(1, 5_000_000), st.just(0), st.integers(1, 20_000)
+    st.integers(1, 50), st.integers(1, 5_000_000), st.just(0), st.integers(2, 20_000)
 ).flatmap(
     lambda t: st.integers(-t[1], t[1]).map(lambda signed: (t[0], t[1], signed, t[3]))
 )
@@ -46,6 +57,7 @@ def episodes(draw: st.DrawFn) -> tuple[EpisodeSpec, MarketSlice, list[float]]:
     latency = draw(st.integers(0, 1))
     delay = draw(st.integers(0, 1))
     lookback = draw(st.integers(1, 3))
+    settles = draw(st.booleans())
     spec = EpisodeSpec(
         side=draw(st.sampled_from([1, -1])),
         target_qty_ticks=draw(st.integers(1, 2_000_000)),
@@ -56,8 +68,13 @@ def episodes(draw: st.DrawFn) -> tuple[EpisodeSpec, MarketSlice, list[float]]:
         latency_buckets=latency,
         data_delay_buckets=delay,
         risk_lambda=draw(st.integers(0, 50)),
-        residual_mu=draw(st.integers(0, 50)),
+        residual_mu=0 if settles else draw(st.integers(0, 50)),
         arrival_lookback=lookback,
+        terminal_rule=TERMINAL_RULE_SETTLEMENT if settles else TERMINAL_RULE_RESIDUAL_PEROLD,
+        # Marks are drawn from [1, 20,000]; surcharges stay below 1/20,000 x 10,000 = 5,000 bps
+        # of a one-tick mark only when 0, so a sell of a one-tick mark with a surcharge
+        # raises by design and is excluded here by keeping the mark at least 2 ticks.
+        terminal_surcharge_bps=draw(st.sampled_from([0, 10, 25, 50, 250])) if settles else 0,
     )
     n_before = lookback + delay + draw(st.integers(0, 2))
     before = draw(st.lists(_bucket, min_size=n_before, max_size=n_before))
@@ -101,10 +118,16 @@ def test_invariants_reward_identity_causality_and_replay(
     if last.terminated:
         terminal = last.terminal_price_ticks if last.terminal_price_ticks else None
         shortfall = implementation_shortfall(final, spec, terminal)
-    else:  # Truncated: the shortfall of the fills so far, with no residual term.
+        assert shortfall == fill_shortfall(final, spec) + last.terminal_component
+        if spec.settles_at_horizon:   # Final completion is certain; by fills it need not be.
+            assert final.filled_qty_ticks + final.settled_qty_ticks == spec.target_qty_ticks
+            assert final.settled_qty_ticks == last.settlement_qty_ticks
+    else:  # Truncated: the shortfall of the fills so far, nothing settled, no residual term.
+        assert final.settled_qty_ticks == 0
         shortfall = spec.side * (
             final.exec_notional_ticks - final.arrival_price_ticks * final.filled_qty_ticks
-        ) + final.fees_ticks
+        ) + final.fill_fees_ticks
+        assert shortfall == fill_shortfall(final, spec)
     assert sum(r.reward_ticks for r in results) == -shortfall - total_risk
 
     # Deterministic replay: the same inputs reproduce the sequences byte for byte.

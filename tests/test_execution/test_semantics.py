@@ -22,8 +22,9 @@ from tapeforge.execution.simulator import (
     reset,
     step,
     terminal_mark,
+    terminal_mark_bucket,
 )
-from tapeforge.execution.spec import EpisodeSpec
+from tapeforge.execution.spec import EpisodeSpec, settlement_price_ticks
 from tapeforge.execution.state import MarketSlice, State, StepResult
 from test_execution.policies import (
     Policy,
@@ -37,6 +38,7 @@ from test_execution.tapes import (
     DEEP,
     P0,
     frozen_bytes,
+    legacy_spec,
     slice_from_rows,
     worksheet_spec,
     worksheet_tape,
@@ -51,11 +53,14 @@ def assert_step_invariants(
     Submitted quantity is bounded by what remains; the fill by the remaining
     quantity and the participation cap of the fill bucket (zero for an invalid
     or missing bucket); the fee by the ceiling rule; inventory by the side and
-    the fill count. Terminated and truncated are mutually exclusive, the reward
-    is the negated sum of its components, and the running accounting identity
-    holds.
+    the fill and settlement counts. A settlement happens only on a terminating
+    horizon step under ``terminal_settlement``, covers exactly the residual,
+    is priced at the surcharged terminal mark and pays the ceiling fee.
+    Terminated and truncated are mutually exclusive, the reward is the
+    negated sum of its components, and the running accounting identity holds.
     """
-    remaining_before = spec.target_qty_ticks - before.filled_qty_ticks
+    remaining_before = spec.target_qty_ticks - before.filled_qty_ticks - before.settled_qty_ticks
+    assert before.settled_qty_ticks == 0   # Nothing is settled before the final step.
     assert 0 <= result.submitted_qty_ticks <= remaining_before
     assert result.fill_qty_ticks <= min(remaining_before, result.cap_qty_ticks)
     if market.has_bucket(result.fill_bucket):
@@ -72,19 +77,51 @@ def assert_step_invariants(
     assert result.notional_ticks == result.fill_price_ticks * result.fill_qty_ticks
     assert abs(after.inventory_ticks) <= spec.target_qty_ticks
     assert 0 <= after.filled_qty_ticks <= spec.target_qty_ticks
-    expected_inventory = spec.initial_inventory_ticks + spec.side * after.filled_qty_ticks
-    assert after.inventory_ticks == expected_inventory
+    assert 0 <= after.filled_qty_ticks + after.settled_qty_ticks <= spec.target_qty_ticks
+    traded = after.filled_qty_ticks + after.settled_qty_ticks
+    assert after.inventory_ticks == spec.initial_inventory_ticks + spec.side * traded
     assert not (result.terminated and result.truncated)
     assert result.reward_ticks == -(
         result.cost_component + result.risk_component + result.terminal_component
     )
+    # Settlement: only on a terminating step under terminal_settlement, exactly the residual
+    # left after this step's fill, priced at the surcharged mark, fee by the ceiling rule.
+    remaining_after_fill = remaining_before - result.fill_qty_ticks
+    if result.settlement_qty_ticks:
+        assert spec.settles_at_horizon and result.terminated and remaining_after_fill > 0
+        assert result.settlement_qty_ticks == remaining_after_fill == after.settled_qty_ticks
+        assert result.settlement_price_ticks == settlement_price_ticks(
+            result.terminal_price_ticks, spec.side, spec.terminal_surcharge_bps
+        )
+        assert result.settlement_notional_ticks == (
+            result.settlement_price_ticks * result.settlement_qty_ticks
+        )
+        assert (
+            result.settlement_fee_ticks * 10_000 >= result.settlement_notional_ticks * spec.fee_bps
+        )
+        assert (
+            result.settlement_fee_ticks * 10_000
+            < result.settlement_notional_ticks * spec.fee_bps + 10_000
+        )
+        assert result.settlement_exceeds_cap == (
+            result.settlement_qty_ticks > result.settlement_cap_qty_ticks
+        )
+        assert result.terminal_component == spec.side * (
+            result.settlement_notional_ticks - P0_of(after) * result.settlement_qty_ticks
+        ) + result.settlement_fee_ticks
+    else:
+        assert result.settlement_price_ticks == result.settlement_notional_ticks == 0
+        assert result.settlement_fee_ticks == 0 and not result.settlement_exceeds_cap
+        assert after.settled_qty_ticks == 0
+        if result.terminated and spec.settles_at_horizon:
+            assert remaining_after_fill == 0   # Terminated without settling: completed by fills.
     # Running accounting identity: the paper portfolio at the arrival price minus the real
-    # one equals the shortfall of the fills so far (residual term excluded).
+    # one equals the shortfall of the fills and the settlement so far (no residual term).
     paper = after.cash_ticks + after.inventory_ticks * P0_of(after)
     initial = spec.initial_inventory_ticks * P0_of(after)
     shortfall_so_far = spec.side * (
-        after.exec_notional_ticks - P0_of(after) * after.filled_qty_ticks
-    ) + after.fees_ticks
+        after.exec_notional_ticks + after.settlement_notional_ticks - P0_of(after) * traded
+    ) + after.fill_fees_ticks + after.settlement_fees_ticks
     assert paper - initial == -shortfall_so_far
 
 
@@ -110,8 +147,12 @@ def _run_checked(
 @pytest.mark.parametrize(
     "policy", [twap_policy, immediate_policy, zero_policy, schedule_policy(70_001)]
 )
-def test_invariants_hold_on_the_worksheet_tape(side: int, policy: Policy) -> None:
-    spec = worksheet_spec(side=side, risk_lambda=3, residual_mu=5)
+@pytest.mark.parametrize("rule", ["settlement", "legacy"])
+def test_invariants_hold_on_the_worksheet_tape(side: int, policy: Policy, rule: str) -> None:
+    spec = (
+        worksheet_spec(side=side, risk_lambda=3, terminal_surcharge_bps=25)
+        if rule == "settlement" else legacy_spec(side=side, risk_lambda=3, residual_mu=5)
+    )
     states, results = _run_checked(spec, worksheet_tape(), policy)
     assert results[-1].terminated
     total_risk = sum(r.risk_component for r in results)
@@ -161,16 +202,17 @@ def test_short_slice_truncates_when_the_fill_bucket_is_missing() -> None:
     # No terminal price exists, so the shortfall of the fills is what can be reported.
     assert sum(r.reward_ticks for r in results) == -(
         spec.side * (states[-1].exec_notional_ticks - P0 * states[-1].filled_qty_ticks)
-        + states[-1].fees_ticks
+        + states[-1].fill_fees_ticks
     )
 
 
-def test_missing_terminal_mark_truncates_instead_of_terminating() -> None:
-    spec = worksheet_spec(side=1)
+@pytest.mark.parametrize("spec", [worksheet_spec(side=1), legacy_spec(side=1)])
+def test_missing_terminal_mark_truncates_instead_of_terminating(spec: EpisodeSpec) -> None:
     market = worksheet_tape(after=[])  # Fills exist; no bucket after the horizon.
     _, results = rollout(spec, market, zero_policy)
     assert results[-1].truncated and not results[-1].terminated
     assert results[-1].terminal_component == 0 and results[-1].terminal_price_ticks == 0
+    assert results[-1].settlement_qty_ticks == 0
     assert terminal_mark(market, spec) is None
 
 
@@ -181,8 +223,11 @@ def test_terminal_mark_skips_unpriced_buckets_within_the_lookback() -> None:
         [(DEEP, 10_002), (DEEP, 10_005), (DEEP, 10_001), None, (0, 0), (DEEP, 10_020)],
     )
     assert terminal_mark(market, spec) == 10_020
+    assert terminal_mark_bucket(market, spec) == 5
     _, results = rollout(spec, market, zero_policy)
     assert results[-1].terminated and results[-1].terminal_price_ticks == 10_020
+    # The settlement is priced from the same bucket that supplies the mark.
+    assert results[-1].settlement_price_ticks == 10_020 and results[-1].settlement_qty_ticks
     # With lookback 2 the search covers buckets 3 and 4 only and never reaches 10,020.
     beyond = worksheet_spec(side=1, arrival_lookback=2)
     assert terminal_mark(market, beyond) is None
@@ -380,7 +425,7 @@ def test_latency_terminal_mark_starts_after_the_last_fill_bucket() -> None:
 
 
 def test_identical_inputs_give_byte_identical_sequences() -> None:
-    spec, market = worksheet_spec(side=-1, risk_lambda=2, residual_mu=9), worksheet_tape(
+    spec, market = legacy_spec(side=-1, risk_lambda=2, residual_mu=9), worksheet_tape(
         totals=[600_000, 400_000, 800_000]
     )
     first = rollout(spec, market, schedule_policy(100_000))

@@ -2,10 +2,12 @@
 exactly in cash ticks.
 
 Cases: (a) a buy under TWAP, (b) the same episode as a sell, (c) partial
-completion under the three residual rules, (e) an invalid bucket and the
+completion under the three legacy residual rules and under terminal settlement
+at 0 / 10 / 25 / 50 bps for both sides, (e) an invalid bucket and the
 5,002.5 -> 5,003 fee case, plus the TWAP, immediate and all-zero policies on
-the case (a) tape. Every expected value is a row of the reference tables in
-``test_execution.tapes``.
+the case (a) tape under both terminal rules. Every expected value is a row of
+the reference tables in ``test_execution.tapes`` or a hand calculation
+written out next to the assertion.
 """
 
 from __future__ import annotations
@@ -14,10 +16,12 @@ import pytest
 
 from tapeforge.execution.simulator import (
     EpisodeOver,
+    fill_shortfall,
     implementation_shortfall,
     residual_fixed_penalty,
     residual_forced_liquidation,
     residual_perold,
+    settlement_shortfall,
     shortfall_bps,
     step,
 )
@@ -33,6 +37,7 @@ from test_execution.tapes import (
     P0,
     P_T,
     Q_STAR,
+    legacy_spec,
     slice_from_rows,
     worksheet_spec,
     worksheet_tape,
@@ -63,7 +68,7 @@ def test_example_a_buy_twap_table() -> None:
         assert spec.target_qty_ticks - state.filled_qty_ticks == remaining
     final = states[-1]
     assert final.exec_notional_ticks == 3_000_800_000
-    assert final.fees_ticks == 3_000_800
+    assert final.fill_fees_ticks == 3_000_800
     assert implementation_shortfall(final, spec) == BUY_IS
     assert shortfall_bps(BUY_IS, P0, Q_STAR) == pytest.approx(12.669, abs=1e-3)
     # The paper portfolio at the arrival price minus the real portfolio is the shortfall.
@@ -136,8 +141,8 @@ RESIDUAL = 120_000
 
 
 def _partial(mu: int = 0) -> tuple[list, list, object]:
-    """Run the case (c) fixed schedule on the thin tape with ``residual_mu`` set to ``mu``."""
-    spec = worksheet_spec(side=1, residual_mu=mu)
+    """Run the case (c) schedule on the thin tape under the legacy rule with ``residual_mu`` mu."""
+    spec = legacy_spec(side=1, residual_mu=mu)
     market = worksheet_tape(totals=[row[0] for row in PARTIAL_TABLE])
     states, results = rollout(spec, market, schedule_policy(100_000))
     return states, results, spec
@@ -157,9 +162,11 @@ def test_example_c_cap_binds_and_the_horizon_ends_with_residual() -> None:
     final = states[-1]
     assert final.filled_qty_ticks == 180_000
     assert final.exec_notional_ticks == 1_800_400_000
-    assert final.fees_ticks == 1_800_400
+    assert final.fill_fees_ticks == 1_800_400
+    assert final.settled_qty_ticks == 0 and final.settlement_fees_ticks == 0
     assert results[-1].terminated and not results[-1].truncated
     assert results[-1].terminal_price_ticks == P_T
+    assert results[-1].settlement_qty_ticks == 0 and not results[-1].settlement_exceeds_cap
 
 
 def test_example_c_residual_rules_reproduce_the_table() -> None:
@@ -195,10 +202,10 @@ def test_example_c_accepted_rule_is_perold_with_mu() -> None:
 def test_example_c_falling_terminal_price_rewards_inaction_when_mu_is_zero() -> None:
     """A terminal mark of 9,990 with ``residual_mu`` 0 pushes the shortfall below the filled value.
 
-    This is the documented incentive of the residual rule, not a defect: a zero
-    ``residual_mu`` rewards leaving quantity unfilled when the price falls.
+    This is the documented incentive of the legacy residual rule, not a defect:
+    a zero ``residual_mu`` rewards leaving quantity unfilled when the price falls.
     """
-    spec = worksheet_spec(side=1, residual_mu=0)
+    spec = legacy_spec(side=1, residual_mu=0)
     market = worksheet_tape(totals=[row[0] for row in PARTIAL_TABLE], after=[(DEEP, 9_990)])
     states, results = rollout(spec, market, schedule_policy(100_000))
     assert results[-1].terminal_component == -1_200_000
@@ -277,16 +284,192 @@ def test_immediate_baseline_fills_as_fast_as_the_cap_allows() -> None:
         step(states[-1], 1.0, market, spec)
 
 
-def test_all_zero_baseline_pays_only_the_residual_term() -> None:
-    spec, market = worksheet_spec(side=1, residual_mu=20), worksheet_tape()
+def test_all_zero_baseline_pays_only_the_residual_term_under_the_legacy_rule() -> None:
+    spec, market = legacy_spec(side=1, residual_mu=20), worksheet_tape()
     states, results = rollout(spec, market, zero_policy)
     assert [r.fill_qty_ticks for r in results] == [0, 0, 0]
-    assert states[-1].cash_ticks == 0 and states[-1].fees_ticks == 0
+    assert states[-1].cash_ticks == 0 and states[-1].fill_fees_ticks == 0
+    assert states[-1].settled_qty_ticks == 0 and states[-1].inventory_ticks == 0
     residual = residual_perold(1, P0, P_T, Q_STAR, mu=20)
     assert residual == (P_T - P0) * Q_STAR + 20 * Q_STAR == 9_000_000
     assert results[-1].terminal_component == residual
     assert implementation_shortfall(states[-1], spec, P_T) == residual
     assert sum(r.reward_ticks for r in results) == -residual
+
+
+# --- case (s): terminal settlement of the case (c) residual ----------------------------
+#
+# The case (c) schedule fills 180,000 of 300,000 and leaves 120,000 at the horizon. Under
+# terminal settlement the residual is settled at the terminal bucket (DEEP = 2,000,000 at
+# P_T = 10,010; its 10 % cap is 200,000 >= 120,000) at the surcharged mark. Per row:
+# surcharge, settlement price, notional = price x 120,000, fee = ceil(notional x 10 / 10,000),
+# settlement cost = side x (notional - 10,000 x 120,000) + fee, total IS = fills IS + cost.
+# Buy fills IS is 2,200,400 (case c); sell fills IS is
+# -(1,800,400,000 - 1,800,000,000) + 1,800,400 = 1,400,400.
+BUY_SETTLEMENT_TABLE = [
+    #  bps, price,  notional,       fee,       cost,       total IS
+    (0, 10_010, 1_201_200_000, 1_201_200, 2_401_200, 4_601_600),   # 10,010.000 exact.
+    (10, 10_021, 1_202_520_000, 1_202_520, 3_722_520, 5_922_920),  # 10,020.01 -> 10,021.
+    (25, 10_036, 1_204_320_000, 1_204_320, 5_524_320, 7_724_720),  # 10,035.025 -> 10,036.
+    (50, 10_061, 1_207_320_000, 1_207_320, 8_527_320, 10_727_720),  # 10,060.05 -> 10,061.
+]
+SELL_SETTLEMENT_TABLE = [
+    (0, 10_010, 1_201_200_000, 1_201_200, 1_200, 1_401_600),      # Favourable move nets the fee.
+    (10, 9_999, 1_199_880_000, 1_199_880, 1_319_880, 2_720_280),  # 9,999.99 -> 9,999.
+    (25, 9_984, 1_198_080_000, 1_198_080, 3_118_080, 4_518_480),  # 9,984.975 -> 9,984.
+    (50, 9_959, 1_195_080_000, 1_195_080, 6_115_080, 7_515_480),  # 9,959.95 -> 9,959.
+]
+PARTIAL_TOTALS = [row[0] for row in PARTIAL_TABLE]
+
+
+@pytest.mark.parametrize("row", BUY_SETTLEMENT_TABLE)
+def test_example_s_buy_residual_is_settled_at_the_surcharged_mark(row: tuple[int, ...]) -> None:
+    bps, price, notional, fee, cost, total = row
+    spec = worksheet_spec(side=1, terminal_surcharge_bps=bps)
+    states, results = rollout(spec, worksheet_tape(totals=PARTIAL_TOTALS), schedule_policy(100_000))
+    last, final = results[-1], states[-1]
+    assert [r.fill_qty_ticks for r in results] == [60_000, 40_000, 80_000]
+    assert last.terminated and not last.truncated
+    assert last.terminal_price_ticks == P_T
+    assert last.settlement_qty_ticks == RESIDUAL == 120_000
+    assert last.settlement_price_ticks == price
+    assert last.settlement_notional_ticks == notional == price * RESIDUAL
+    assert last.settlement_fee_ticks == fee
+    assert last.terminal_component == cost
+    assert last.settlement_cap_qty_ticks == 200_000 and not last.settlement_exceeds_cap
+    # Ordinary fills and the settlement stay in separate accounts; cash and inventory hold both.
+    assert final.filled_qty_ticks == 180_000 and final.settled_qty_ticks == RESIDUAL
+    assert final.exec_notional_ticks == 1_800_400_000 and final.fill_fees_ticks == 1_800_400
+    assert final.settlement_notional_ticks == notional and final.settlement_fees_ticks == fee
+    assert final.inventory_ticks == Q_STAR
+    assert final.cash_ticks == -(1_800_400_000 + notional) - 1_800_400 - fee
+    assert spec.target_qty_ticks - final.filled_qty_ticks - final.settled_qty_ticks == 0
+    # Shortfall decomposition and identities.
+    assert fill_shortfall(final, spec) == IS_FILLED
+    assert settlement_shortfall(final, spec) == cost
+    assert implementation_shortfall(final, spec) == total == IS_FILLED + cost
+    assert final.cash_ticks + final.inventory_ticks * P0 == -total   # Paper portfolio identity.
+    assert sum(r.reward_ticks for r in results) == -total
+    # The legacy opportunity-cost term is not charged on top of the settlement.
+    assert total - IS_FILLED == cost != residual_perold(1, P0, P_T, RESIDUAL, 0) + cost
+
+
+@pytest.mark.parametrize("row", SELL_SETTLEMENT_TABLE)
+def test_example_s_sell_residual_is_settled_below_the_mark(row: tuple[int, ...]) -> None:
+    bps, price, notional, fee, cost, total = row
+    spec = worksheet_spec(side=-1, terminal_surcharge_bps=bps)
+    states, results = rollout(spec, worksheet_tape(totals=PARTIAL_TOTALS), schedule_policy(100_000))
+    last, final = results[-1], states[-1]
+    assert last.settlement_qty_ticks == RESIDUAL and last.settlement_price_ticks == price
+    assert last.settlement_notional_ticks == notional and last.settlement_fee_ticks == fee
+    assert last.terminal_component == cost
+    assert final.inventory_ticks == 0   # Liquidated to zero through fills plus settlement.
+    assert final.cash_ticks == 1_800_400_000 + notional - 1_800_400 - fee
+    assert fill_shortfall(final, spec) == 1_400_400
+    assert implementation_shortfall(final, spec) == total == 1_400_400 + cost
+    assert P0 * Q_STAR - final.cash_ticks == total   # Paper proceeds minus real cash.
+    assert sum(r.reward_ticks for r in results) == -total
+
+
+def test_example_s_settlement_fee_follows_the_same_ceiling_rule() -> None:
+    """A 500-tick residual settled at 10,005 has notional 5,002,500 and pays 5,003, not 5,002."""
+    spec = worksheet_spec(side=1, target_qty_ticks=500)
+    _, results = rollout(spec, worksheet_tape(after=[(DEEP, 10_005)]), zero_policy)
+    last = results[-1]
+    assert last.settlement_qty_ticks == 500 and last.settlement_price_ticks == 10_005
+    assert last.settlement_notional_ticks == 5_002_500
+    assert last.settlement_fee_ticks == 5_003
+    assert last.terminal_component == (5_002_500 - 500 * P0) + 5_003 == 2_500 + 5_003
+
+
+def test_example_s_zero_action_settles_the_whole_target_above_the_cap() -> None:
+    """Never trading settles 300,000 at 10,036: 200,000 is the terminal bucket's cap, so the
+    synthetic settlement exceeds it and the record says so. Cost 10,800,000 + fee 3,010,800."""
+    spec, market = worksheet_spec(side=1, terminal_surcharge_bps=25), worksheet_tape()
+    states, results = rollout(spec, market, zero_policy)
+    last, final = results[-1], states[-1]
+    assert [r.fill_qty_ticks for r in results] == [0, 0, 0]
+    assert last.settlement_qty_ticks == Q_STAR and last.settlement_price_ticks == 10_036
+    assert last.settlement_notional_ticks == 3_010_800_000
+    assert last.settlement_fee_ticks == 3_010_800
+    assert last.settlement_cap_qty_ticks == 200_000 and last.settlement_exceeds_cap
+    assert last.terminal_component == 10_800_000 + 3_010_800 == 13_810_800
+    assert final.filled_qty_ticks == 0 and final.settled_qty_ticks == Q_STAR
+    assert final.inventory_ticks == Q_STAR and final.fill_fees_ticks == 0
+    assert implementation_shortfall(final, spec) == 13_810_800
+    assert shortfall_bps(13_810_800, P0, Q_STAR) == pytest.approx(46.036, abs=1e-3)
+    # Under the legacy rule with mu 0 the same inaction paid 3,000,000 and no fee at all.
+    assert residual_perold(1, P0, P_T, Q_STAR, 0) == 3_000_000
+
+
+def test_example_s_favourable_terminal_move_makes_inaction_cheap_but_not_fee_free() -> None:
+    """With the mark at 9,990 a buy settles below arrival: -3,000,000 of price gain offsets the
+    2,997,000 fee at 0 bps (cost -3,000); at 25 bps the surcharge dominates (cost 7,504,500).
+
+    Favourable market movement can make delaying execution beneficial; the
+    settlement rule does not and should not force every zero-action episode to
+    lose. What it removes is the fee avoidance: the residual pays the fee.
+    """
+    falling = worksheet_tape(after=[(DEEP, 9_990)])
+    states, results = rollout(worksheet_spec(side=1), falling, zero_policy)
+    assert results[-1].settlement_price_ticks == 9_990
+    assert results[-1].settlement_notional_ticks == 2_997_000_000
+    assert results[-1].settlement_fee_ticks == 2_997_000
+    assert results[-1].terminal_component == -3_000_000 + 2_997_000 == -3_000
+    assert states[-1].settlement_fees_ticks == 2_997_000 > 0
+    _, surcharged = rollout(worksheet_spec(side=1, terminal_surcharge_bps=25), falling, zero_policy)
+    assert surcharged[-1].settlement_price_ticks == 10_015
+    assert surcharged[-1].terminal_component == 4_500_000 + 3_004_500 == 7_504_500
+
+
+def test_example_s_early_completion_settles_nothing() -> None:
+    spec, market = worksheet_spec(side=1, terminal_surcharge_bps=25), worksheet_tape()
+    states, results = rollout(spec, market, twap_policy)
+    last, final = results[-1], states[-1]
+    assert last.terminated and final.filled_qty_ticks == Q_STAR
+    assert last.settlement_qty_ticks == last.settlement_price_ticks == last.terminal_component == 0
+    assert last.terminal_price_ticks == 0 and not last.settlement_exceeds_cap
+    assert final.settled_qty_ticks == 0 and final.settlement_fees_ticks == 0
+    assert implementation_shortfall(final, spec) == BUY_IS   # Same as under the legacy rule.
+    _, immediate_results = rollout(spec, market, immediate_policy)
+    assert immediate_results[-1].terminated and immediate_results[-1].settlement_qty_ticks == 0
+
+
+def test_example_s_missing_terminal_data_truncates_and_settles_nothing() -> None:
+    spec = worksheet_spec(side=1, terminal_surcharge_bps=25)
+    market = worksheet_tape(totals=PARTIAL_TOTALS, after=[])   # No bucket after the horizon.
+    states, results = rollout(spec, market, schedule_policy(100_000))
+    last, final = results[-1], states[-1]
+    assert last.truncated and not last.terminated
+    assert last.settlement_qty_ticks == 0 and last.terminal_component == 0
+    assert last.settlement_price_ticks == 0 and last.terminal_price_ticks == 0
+    assert final.settled_qty_ticks == 0 and final.filled_qty_ticks == 180_000
+    assert spec.target_qty_ticks - final.filled_qty_ticks == RESIDUAL   # Not completed.
+    assert fill_shortfall(final, spec) == IS_FILLED
+    with pytest.raises(ValueError, match="neither filled nor settled"):
+        implementation_shortfall(final, spec, P_T)   # No settled shortfall exists to report.
+
+
+def test_example_s_invalid_settlement_price_is_rejected_not_truncated() -> None:
+    """A one-tick terminal mark cannot absorb a sell surcharge: the step raises."""
+    spec = worksheet_spec(side=-1, terminal_surcharge_bps=1)
+    market = worksheet_tape(after=[(DEEP, 1)])
+    with pytest.raises(ValueError, match="settlement price 0 is not positive"):
+        rollout(spec, market, zero_policy)
+
+
+def test_example_s_risk_term_is_charged_on_the_pre_settlement_residual() -> None:
+    """The horizon step's risk term prices the 120,000 still unfilled after its fill; the
+    settlement that follows in the same step does not reduce it, so both terminal rules
+    charge identical risk."""
+    settling = worksheet_spec(side=1, risk_lambda=7, terminal_surcharge_bps=25)
+    legacy = legacy_spec(side=1, risk_lambda=7)
+    market = worksheet_tape(totals=PARTIAL_TOTALS)
+    _, settled = rollout(settling, market, schedule_policy(100_000))
+    _, unsettled = rollout(legacy, market, schedule_policy(100_000))
+    assert [r.risk_component for r in settled] == [7 * 240_000, 7 * 200_000, 7 * 120_000]
+    assert [r.risk_component for r in settled] == [r.risk_component for r in unsettled]
+    assert sum(r.reward_ticks for r in settled) == -(7_724_720 + 7 * 560_000)
 
 
 def test_sub_tick_slice_rows_helper_matches_the_worksheet_layout() -> None:

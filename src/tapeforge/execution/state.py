@@ -257,22 +257,37 @@ class MarketSlice:
 class State:
     """Accounting state after ``step`` decisions. Every field is a Python ``int``.
 
-    ``cash_ticks`` falls by ``side * notional + fee`` on every fill and
-    ``inventory_ticks`` rises by ``side * fill``. ``exec_notional_ticks``,
-    ``filled_qty_ticks`` and ``fees_ticks`` accumulate the same fills, so the
-    implementation shortfall can be read without replaying. The mark price is
-    the VWAP of the newest *priced* bucket (valid, with quantity) the policy
-    has been allowed to see, and ``mark_age`` counts how many visible buckets
-    have passed since it (0 when the newest visible bucket is itself priced).
+    ``cash_ticks`` falls by ``side * notional + fee`` on every fill and on the
+    terminal settlement, and ``inventory_ticks`` rises by ``side * quantity``
+    on both. Ordinary fills and the terminal settlement are accumulated in
+    separate fields (``filled_qty_ticks`` / ``exec_notional_ticks`` /
+    ``fill_fees_ticks`` against ``settled_qty_ticks`` /
+    ``settlement_notional_ticks`` / ``settlement_fees_ticks``), so the
+    implementation shortfall and the share of the target reached through
+    the synthetic settlement can both be read without replaying. The mark
+    price is the VWAP of the newest *priced* bucket (valid, with quantity)
+    the policy has been allowed to see, and ``mark_age`` counts how many
+    visible buckets have passed since it (0 when the newest visible bucket
+    is itself priced).
 
     Attributes:
         step: Decisions taken so far, in ``[0, horizon_buckets]``.
-        inventory_ticks: Signed position, in quantity ticks.
-        cash_ticks: Signed cash balance, in cash ticks; zero at reset.
-        fees_ticks: Cumulative fees paid, in cash ticks.
-        filled_qty_ticks: Cumulative filled quantity, in quantity ticks;
-            never negative.
-        exec_notional_ticks: Cumulative ``sum(fill_price * fill_qty)``, in
+        inventory_ticks: Signed position, in quantity ticks; includes the
+            settled quantity.
+        cash_ticks: Signed cash balance, in cash ticks; zero at reset;
+            includes the settlement notional and fee.
+        fill_fees_ticks: Cumulative fees of ordinary fills, in cash ticks.
+        filled_qty_ticks: Cumulative quantity of ordinary fills, in quantity
+            ticks; never negative.
+        exec_notional_ticks: Cumulative ``sum(fill_price * fill_qty)`` of
+            ordinary fills, in cash ticks.
+        settled_qty_ticks: Quantity settled at the horizon under the
+            ``terminal_settlement`` rule, in quantity ticks; 0 before the
+            horizon, after early completion, under the legacy rule and when
+            the episode truncated.
+        settlement_notional_ticks: ``settlement_price * settled_qty``, in
+            cash ticks.
+        settlement_fees_ticks: Fee charged on the settlement notional, in
             cash ticks.
         arrival_price_ticks: Arrival price in price ticks, fixed at reset.
         mark_price_ticks: VWAP of the newest priced visible bucket, in price
@@ -281,14 +296,27 @@ class State:
     """
 
     step: int                     # Decisions taken so far, 0 .. horizon_buckets.
-    inventory_ticks: int          # Signed position, quantity ticks.
-    cash_ticks: int               # Signed, cash ticks.
-    fees_ticks: int               # Cumulative fees paid, cash ticks.
-    filled_qty_ticks: int         # Cumulative filled quantity, >= 0.
+    inventory_ticks: int          # Signed position, quantity ticks (fills + settlement).
+    cash_ticks: int               # Signed, cash ticks (fills + settlement).
+    fill_fees_ticks: int          # Cumulative fees of ordinary fills, cash ticks.
+    filled_qty_ticks: int         # Cumulative ordinary fill quantity, >= 0.
     exec_notional_ticks: int      # Cumulative sum(fill_price * fill_qty), cash ticks.
+    settled_qty_ticks: int        # Quantity settled at the horizon, >= 0.
+    settlement_notional_ticks: int  # settlement_price * settled_qty, cash ticks.
+    settlement_fees_ticks: int    # Fee on the settlement notional, cash ticks.
     arrival_price_ticks: int      # Arrival price, fixed at reset.
     mark_price_ticks: int         # Newest priced visible VWAP, price ticks.
     mark_age: int                 # Visible buckets since the mark bucket closed.
+
+    @property
+    def total_fees_ticks(self) -> int:
+        """Return ordinary-fill fees plus settlement fees, in cash ticks."""
+        return self.fill_fees_ticks + self.settlement_fees_ticks
+
+    @property
+    def traded_qty_ticks(self) -> int:
+        """Return the quantity reached through fills and settlement together, in quantity ticks."""
+        return self.filled_qty_ticks + self.settled_qty_ticks
 
 
 @dataclass(frozen=True)
@@ -298,16 +326,23 @@ class StepResult:
     Signs: ``cost_component`` is
     ``side * (notional_ticks - arrival_price_ticks * fill_qty_ticks) + fee_ticks``
     (positive is a cost for both sides), ``risk_component`` is
-    ``risk_lambda * remaining_after`` (``>= 0``) and ``terminal_component`` is
-    the residual term at the horizon (zero before it and when nothing is
-    left). ``reward_ticks == -(cost_component + risk_component +
+    ``risk_lambda * remaining_after`` (``>= 0``, with ``remaining_after`` the
+    quantity still unfilled after the ordinary fill of this step and before
+    any settlement) and ``terminal_component`` is the terminal term at the
+    horizon (zero before it and when nothing is left): under
+    ``terminal_settlement`` the shortfall of the settlement fill against the
+    arrival price including its fee, under ``residual_perold`` the
+    opportunity cost of the residual plus ``residual_mu`` per tick.
+    ``reward_ticks == -(cost_component + risk_component +
     terminal_component)`` exactly, so over a terminated episode
     ``sum(reward_ticks) == -shortfall - risk_lambda * sum(remaining_after)``,
     with ``shortfall`` the implementation shortfall.
 
     ``terminated`` and ``truncated`` are never both set. ``fill_price_ticks``
     and ``terminal_price_ticks`` are 0 when there was no fill or no terminal
-    mark was needed or available.
+    mark was needed or available. The ``settlement_*`` fields are 0 and
+    ``settlement_exceeds_cap`` is ``False`` on every step that settled
+    nothing.
 
     Attributes:
         step: The decision index ``t``, in ``[0, horizon_buckets)``.
@@ -325,10 +360,25 @@ class StepResult:
         cost_component: Shortfall of this fill against the arrival price plus
             the fee, in cash ticks.
         risk_component: ``risk_lambda * remaining_after``, in cash ticks.
-        terminal_component: Residual term charged at the horizon, in cash
+        terminal_component: Terminal term charged at the horizon, in cash
             ticks; zero otherwise.
-        terminal_price_ticks: Terminal mark used for the residual term; 0
-            when none was needed or available.
+        terminal_price_ticks: Terminal mark (first priced bucket after the
+            last fill bucket) the terminal term was computed from; 0 when
+            none was needed or available.
+        settlement_qty_ticks: Quantity settled at the horizon, in quantity
+            ticks (the whole residual under ``terminal_settlement``).
+        settlement_price_ticks: Settlement price in price ticks: the terminal
+            mark moved against the side by ``terminal_surcharge_bps``
+            (``spec.settlement_price_ticks``); 0 without a settlement.
+        settlement_notional_ticks: ``settlement_price_ticks *
+            settlement_qty_ticks``, in cash ticks.
+        settlement_fee_ticks: Fee on the settlement notional, in cash ticks
+            (same rate and ceiling as ordinary fills).
+        settlement_cap_qty_ticks: Participation cap of the terminal-mark
+            bucket, in quantity ticks, recorded so the override is visible.
+        settlement_exceeds_cap: ``settlement_qty_ticks >
+            settlement_cap_qty_ticks``: the synthetic settlement traded more
+            than the ordinary fill rule would have allowed in that bucket.
         reward_ticks: ``-(cost_component + risk_component +
             terminal_component)``.
         terminated: The target was filled or the horizon was reached, with a
@@ -349,6 +399,12 @@ class StepResult:
     risk_component: int
     terminal_component: int
     terminal_price_ticks: int
+    settlement_qty_ticks: int
+    settlement_price_ticks: int
+    settlement_notional_ticks: int
+    settlement_fee_ticks: int
+    settlement_cap_qty_ticks: int
+    settlement_exceeds_cap: bool
     reward_ticks: int
     terminated: bool
     truncated: bool

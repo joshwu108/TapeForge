@@ -14,7 +14,7 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from tapeforge.execution.spec import EpisodeSpec
+from tapeforge.execution.spec import TERMINAL_RULE_RESIDUAL_PEROLD, EpisodeSpec
 from tapeforge.execution.state import MarketSlice
 
 Row = tuple[int, int] | None
@@ -72,20 +72,26 @@ def worksheet_tape(
     return slice_from_rows([(DEEP, P0)], [*zip(totals, vwaps, strict=True), *after])
 
 
-def worksheet_spec(side: int = 1, **overrides: int) -> EpisodeSpec:
+def worksheet_spec(side: int = 1, **overrides: int | str) -> EpisodeSpec:
     """Build the reference spec: target 300,000, horizon 3, arrival lookback 1.
 
-    ``risk_lambda`` and ``residual_mu`` keep their zero defaults, which switch
-    the corresponding reward terms off. ``overrides`` replace any field.
+    The terminal rule is the spec default (``terminal_settlement`` with a zero
+    surcharge); ``risk_lambda`` keeps its zero default, which switches the
+    risk term off. ``overrides`` replace any field.
     """
-    params: dict[str, int] = {
+    params: dict[str, int | str] = {
         "side": side,
         "target_qty_ticks": Q_STAR,
         "horizon_buckets": 3,
         "arrival_lookback": 1,
     }
     params.update(overrides)
-    return EpisodeSpec(**params)
+    return EpisodeSpec(**params)  # type: ignore[arg-type]
+
+
+def legacy_spec(side: int = 1, **overrides: int | str) -> EpisodeSpec:
+    """Build the reference spec under the legacy ``residual_perold`` rule (``residual_mu`` 0)."""
+    return worksheet_spec(side, terminal_rule=TERMINAL_RULE_RESIDUAL_PEROLD, **overrides)
 
 
 def frozen_bytes(objects: Sequence[object]) -> bytes:

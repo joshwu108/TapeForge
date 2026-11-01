@@ -40,12 +40,15 @@ import numpy as np
 
 from tapeforge.execution.sampling import EpisodeDraw, materialize, sample_episodes
 from tapeforge.execution.simulator import (
+    SIMULATOR_VERSION,
+    fill_shortfall,
     implementation_shortfall,
     is_done,
     newest_visible_bucket,
     observe,
     remaining_qty_ticks,
     reset,
+    settlement_shortfall,
     shortfall_bps,
     step,
 )
@@ -70,7 +73,10 @@ __all__ = [
     "write_run_record",
 ]
 
-RUN_RECORD_SCHEMA: Final[str] = "tapeforge.execution.run/1"  # Schema tag of every run record.
+# Schema tag of every run record. Version 2 adds the terminal rule, the
+# settlement accounting and the split of fees and completion into ordinary
+# fills and terminal settlement; version 1 records are not read by this code.
+RUN_RECORD_SCHEMA: Final[str] = "tapeforge.execution.run/2"
 TAIL_PERCENTILES: Final[tuple[int, ...]] = (50, 95, 99)  # Percentiles reported by SetSummary.
 
 
@@ -198,30 +204,58 @@ def run_episode(spec: EpisodeSpec, market: MarketSlice, policy: Policy) -> Traje
 class EpisodeSummary:
     """Integer accounting of one episode plus the shortfall in basis points.
 
+    Ordinary fills and the terminal settlement are kept apart everywhere, and
+    completion is recorded twice: ``completed_by_fills`` says whether the
+    ordinary fills alone reached the target, ``completed`` whether the
+    target was reached by the end (fills plus settlement). A policy with
+    ``completed`` on every episode but a large ``settlement_fraction``
+    reached the target through the synthetic boundary condition, not
+    through execution.
+
     Attributes:
         n_steps: Decisions taken.
         terminated: The episode ended by filling the target or reaching the
-            horizon.
+            horizon (with a terminal mark where one was needed).
         truncated: The tape ran out before the task did.
+        terminal_rule: ``spec.terminal_rule``.
+        terminal_surcharge_bps: ``spec.terminal_surcharge_bps``.
         arrival_price_ticks: Arrival price in price ticks.
-        terminal_price_ticks: Terminal mark used for the residual term; 0
+        terminal_price_ticks: Terminal mark used for the terminal term; 0
             when none was needed or available.
         target_qty_ticks: Target quantity in quantity ticks.
-        filled_qty_ticks: Filled quantity in quantity ticks.
-        residual_qty_ticks: ``target_qty_ticks - filled_qty_ticks``.
-        completed: ``residual_qty_ticks == 0``.
-        exec_notional_ticks: Cumulative fill notional in cash ticks.
-        fees_ticks: Cumulative fees in cash ticks.
+        filled_qty_ticks: Quantity of ordinary fills, in quantity ticks.
+        settled_qty_ticks: Quantity settled at the horizon, in quantity
+            ticks.
+        residual_qty_ticks: ``target - filled - settled``: quantity neither
+            filled nor settled (legacy rule at the horizon, or truncation).
+        completed_by_fills: ``filled_qty_ticks == target_qty_ticks``.
+        completed: ``residual_qty_ticks == 0`` (final completion).
+        filled_fraction: ``filled_qty_ticks / target_qty_ticks``.
+        settlement_fraction: ``settled_qty_ticks / target_qty_ticks``.
+        exec_notional_ticks: Cumulative ordinary-fill notional in cash ticks.
+        settlement_price_ticks: Settlement price in price ticks; 0 without a
+            settlement.
+        settlement_notional_ticks: Settlement notional in cash ticks.
+        settlement_exceeds_cap: The settlement traded more than the terminal
+            bucket's participation cap.
+        fill_fees_ticks: Fees of ordinary fills in cash ticks.
+        settlement_fees_ticks: Fee of the settlement in cash ticks.
+        fees_ticks: ``fill_fees_ticks + settlement_fees_ticks``.
+        fill_shortfall_ticks: Shortfall of the ordinary fills alone (fills
+            against the arrival price plus their fees), in cash ticks.
+        terminal_component_ticks: Terminal term of the last step: the
+            settlement cost (its shortfall against arrival including the fee)
+            or the legacy residual term; 0 when none was charged.
         shortfall_ticks: Implementation shortfall against the arrival price,
-            in cash ticks: including the residual term when the episode
-            terminated with residual inventory, and the shortfall of the
-            fills alone when it truncated.
+            in cash ticks: ``fill_shortfall_ticks + terminal_component_ticks``
+            for a terminated episode, ``fill_shortfall_ticks`` alone when it
+            truncated (no terminal term exists).
         shortfall_bps: ``shortfall_ticks`` as basis points of the arrival
             notional.
         cost_sum_ticks: Sum of ``cost_component`` over the steps.
         risk_sum_ticks: Sum of ``risk_component`` over the steps.
-        terminal_component_ticks: ``terminal_component`` of the last step.
-        reward_sum_ticks: Sum of ``reward_ticks`` over the steps.
+        reward_sum_ticks: Sum of ``reward_ticks`` over the steps; equals
+            ``-(shortfall_ticks + risk_sum_ticks)`` for a terminated episode.
         n_capped_steps: Fills cut by the participation cap
             (``fill_qty_ticks == cap_qty_ticks < submitted_qty_ticks``).
     """
@@ -229,19 +263,31 @@ class EpisodeSummary:
     n_steps: int
     terminated: bool
     truncated: bool
+    terminal_rule: str
+    terminal_surcharge_bps: int
     arrival_price_ticks: int
     terminal_price_ticks: int
     target_qty_ticks: int
     filled_qty_ticks: int
+    settled_qty_ticks: int
     residual_qty_ticks: int
+    completed_by_fills: bool
     completed: bool
+    filled_fraction: float
+    settlement_fraction: float
     exec_notional_ticks: int
+    settlement_price_ticks: int
+    settlement_notional_ticks: int
+    settlement_exceeds_cap: bool
+    fill_fees_ticks: int
+    settlement_fees_ticks: int
     fees_ticks: int
+    fill_shortfall_ticks: int
+    terminal_component_ticks: int
     shortfall_ticks: int
     shortfall_bps: float
     cost_sum_ticks: int
     risk_sum_ticks: int
-    terminal_component_ticks: int
     reward_sum_ticks: int
     n_capped_steps: int
 
@@ -254,36 +300,55 @@ def summarize_episode(trajectory: Trajectory) -> EpisodeSummary:
     """Reduce a trajectory to its accounting; every integer is exact.
 
     A truncated episode reports the shortfall of its fills alone, because no
-    terminal mark exists to price the residual.
+    terminal mark exists to settle or price the residual. For a terminated
+    episode the shortfall is ``implementation_shortfall`` and equals
+    ``fill_shortfall + terminal_component`` by construction.
     """
     spec, final, last = trajectory.spec, trajectory.final_state, trajectory.last_result
     residual = remaining_qty_ticks(final, spec)
+    fills_only = fill_shortfall(final, spec)
     if last.truncated:
-        shortfall = spec.side * (
-            final.exec_notional_ticks - final.arrival_price_ticks * final.filled_qty_ticks
-        ) + final.fees_ticks
+        shortfall = fills_only
     else:
         shortfall = implementation_shortfall(
             final, spec, last.terminal_price_ticks if residual else None
         )
+        # Decomposition identity: the terminal component of the last step is exactly the
+        # settlement shortfall (or the legacy residual term), so the two definitions agree.
+        if shortfall != fills_only + last.terminal_component or (
+            spec.settles_at_horizon and settlement_shortfall(final, spec) != last.terminal_component
+        ):  # pragma: no cover - guards the simulator's own invariant
+            raise AssertionError("shortfall decomposition does not match the step records")
     results = trajectory.results
     return EpisodeSummary(
         n_steps=len(results),
         terminated=last.terminated,
         truncated=last.truncated,
+        terminal_rule=spec.terminal_rule,
+        terminal_surcharge_bps=spec.terminal_surcharge_bps,
         arrival_price_ticks=final.arrival_price_ticks,
         terminal_price_ticks=last.terminal_price_ticks,
         target_qty_ticks=spec.target_qty_ticks,
         filled_qty_ticks=final.filled_qty_ticks,
+        settled_qty_ticks=final.settled_qty_ticks,
         residual_qty_ticks=residual,
+        completed_by_fills=final.filled_qty_ticks == spec.target_qty_ticks,
         completed=residual == 0,
+        filled_fraction=final.filled_qty_ticks / spec.target_qty_ticks,
+        settlement_fraction=final.settled_qty_ticks / spec.target_qty_ticks,
         exec_notional_ticks=final.exec_notional_ticks,
-        fees_ticks=final.fees_ticks,
+        settlement_price_ticks=last.settlement_price_ticks,
+        settlement_notional_ticks=final.settlement_notional_ticks,
+        settlement_exceeds_cap=last.settlement_exceeds_cap,
+        fill_fees_ticks=final.fill_fees_ticks,
+        settlement_fees_ticks=final.settlement_fees_ticks,
+        fees_ticks=final.total_fees_ticks,
+        fill_shortfall_ticks=fills_only,
+        terminal_component_ticks=last.terminal_component,
         shortfall_ticks=shortfall,
         shortfall_bps=shortfall_bps(shortfall, final.arrival_price_ticks, spec.target_qty_ticks),
         cost_sum_ticks=sum(r.cost_component for r in results),
         risk_sum_ticks=sum(r.risk_component for r in results),
-        terminal_component_ticks=last.terminal_component,
         reward_sum_ticks=sum(r.reward_ticks for r in results),
         n_capped_steps=sum(
             1 for r in results if r.fill_qty_ticks == r.cap_qty_ticks < r.submitted_qty_ticks
@@ -312,12 +377,18 @@ def nearest_rank_percentile(values: Sequence[float], percentile: int) -> float:
 class SetSummary:
     """Aggregate of an episode set.
 
-    Percentiles are nearest-rank over ``shortfall_bps``.
+    Percentiles are nearest-rank over ``shortfall_bps``. Completion is
+    aggregated twice, by ordinary fills and finally, so reliance on the
+    terminal settlement is visible next to the cost.
 
     Attributes:
         n_episodes: Episodes in the set.
-        n_completed: Episodes with ``completed`` set.
+        n_completed_by_fills: Episodes whose ordinary fills reached the
+            target.
+        n_completed: Episodes with ``completed`` set (final completion).
+        n_settled: Episodes with a non-zero settled quantity.
         n_truncated: Episodes with ``truncated`` set.
+        completion_by_fills_rate: ``n_completed_by_fills / n_episodes``.
         completion_rate: ``n_completed / n_episodes``.
         mean_shortfall_bps: Mean of ``shortfall_bps``.
         p50_shortfall_bps: 50th nearest-rank percentile of ``shortfall_bps``.
@@ -325,15 +396,25 @@ class SetSummary:
         p99_shortfall_bps: 99th nearest-rank percentile.
         max_shortfall_bps: Largest ``shortfall_bps``.
         total_shortfall_ticks: Sum of ``shortfall_ticks``, in cash ticks.
+        total_fill_fees_ticks: Sum of ``fill_fees_ticks``, in cash ticks.
+        total_settlement_fees_ticks: Sum of ``settlement_fees_ticks``.
         total_fees_ticks: Sum of ``fees_ticks``, in cash ticks.
+        total_terminal_component_ticks: Sum of ``terminal_component_ticks``
+            (settlement cost or legacy residual term), in cash ticks.
+        total_risk_ticks: Sum of ``risk_sum_ticks``, in cash ticks.
+        mean_filled_fraction: Mean of ``filled_fraction``.
+        mean_settlement_fraction: Mean of ``settlement_fraction``.
         mean_residual_fraction: Mean of
             ``residual_qty_ticks / target_qty_ticks``.
         mean_capped_steps: Mean of ``n_capped_steps``.
     """
 
     n_episodes: int
+    n_completed_by_fills: int
     n_completed: int
+    n_settled: int
     n_truncated: int
+    completion_by_fills_rate: float
     completion_rate: float
     mean_shortfall_bps: float
     p50_shortfall_bps: float
@@ -341,7 +422,13 @@ class SetSummary:
     p99_shortfall_bps: float
     max_shortfall_bps: float
     total_shortfall_ticks: int
+    total_fill_fees_ticks: int
+    total_settlement_fees_ticks: int
     total_fees_ticks: int
+    total_terminal_component_ticks: int
+    total_risk_ticks: int
+    mean_filled_fraction: float
+    mean_settlement_fraction: float
     mean_residual_fraction: float
     mean_capped_steps: float
 
@@ -363,18 +450,29 @@ def summarize_set(summaries: Sequence[EpisodeSummary]) -> SetSummary:
     n = len(summaries)
     bps = [s.shortfall_bps for s in summaries]
     p50, p95, p99 = (nearest_rank_percentile(bps, p) for p in TAIL_PERCENTILES)
+    n_completed = sum(1 for s in summaries if s.completed)
+    n_by_fills = sum(1 for s in summaries if s.completed_by_fills)
     return SetSummary(
         n_episodes=n,
-        n_completed=sum(1 for s in summaries if s.completed),
+        n_completed_by_fills=n_by_fills,
+        n_completed=n_completed,
+        n_settled=sum(1 for s in summaries if s.settled_qty_ticks),
         n_truncated=sum(1 for s in summaries if s.truncated),
-        completion_rate=sum(1 for s in summaries if s.completed) / n,
+        completion_by_fills_rate=n_by_fills / n,
+        completion_rate=n_completed / n,
         mean_shortfall_bps=sum(bps) / n,
         p50_shortfall_bps=p50,
         p95_shortfall_bps=p95,
         p99_shortfall_bps=p99,
         max_shortfall_bps=max(bps),
         total_shortfall_ticks=sum(s.shortfall_ticks for s in summaries),
+        total_fill_fees_ticks=sum(s.fill_fees_ticks for s in summaries),
+        total_settlement_fees_ticks=sum(s.settlement_fees_ticks for s in summaries),
         total_fees_ticks=sum(s.fees_ticks for s in summaries),
+        total_terminal_component_ticks=sum(s.terminal_component_ticks for s in summaries),
+        total_risk_ticks=sum(s.risk_sum_ticks for s in summaries),
+        mean_filled_fraction=sum(s.filled_fraction for s in summaries) / n,
+        mean_settlement_fraction=sum(s.settlement_fraction for s in summaries) / n,
         mean_residual_fraction=sum(s.residual_qty_ticks / s.target_qty_ticks for s in summaries)
         / n,
         mean_capped_steps=sum(s.n_capped_steps for s in summaries) / n,
@@ -458,6 +556,7 @@ def run_policy(
         episodes.append(_episode_json(draw, spec, summarize_episode(trajectory)))
     record = {
         "schema": RUN_RECORD_SCHEMA,
+        "simulator_version": SIMULATOR_VERSION,
         "created_utc": datetime.now(UTC).isoformat(timespec="seconds"),
         "code_revision": code_revision(),
         "config": {

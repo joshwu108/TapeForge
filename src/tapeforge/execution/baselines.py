@@ -1,4 +1,5 @@
-"""Signal-free baseline policies: TWAP, immediate, and a participation-cap-aware TWAP.
+"""Signal-free baseline policies: TWAP, immediate, a participation-cap-aware TWAP, and a
+zero-action diagnostic.
 
 Each baseline is a plain function ``Observation -> action`` for
 ``runner.run_episode``. They read the exact integers on the observation
@@ -27,6 +28,13 @@ Policies:
       everything is submitted (the fill is still capped by the real bucket).
       This definition is a candidate pending review, not part of the default
       production configuration.
+    * ``zero_action``: never submit anything. A diagnostic, not a strategy:
+      under ``terminal_settlement`` it isolates the cost of settling the whole
+      target at the horizon (surcharge plus fee plus the price move from
+      arrival to the terminal mark), and under the legacy rule it isolates
+      the residual term. Its shortfall can be negative when the market moves
+      in the agent's favour; the baseline exists to make that visible, not to
+      be beaten.
 """
 
 from __future__ import annotations
@@ -39,11 +47,13 @@ from tapeforge.execution.spec import participation_cap_ticks
 
 __all__ = [
     "BASELINES",
+    "DIAGNOSTIC_POLICIES",
     "cap_aware_twap",
     "cap_aware_twap_quantity",
     "immediate",
     "twap",
     "twap_quantity",
+    "zero_action",
 ]
 
 
@@ -109,9 +119,18 @@ def cap_aware_twap(observation: Observation) -> float:
     return action_for_quantity(quantity, observation.remaining_qty_ticks)
 
 
+def zero_action(observation: Observation) -> float:
+    """Submit nothing; the terminal rule alone decides the outcome (diagnostic, not a strategy)."""
+    return 0.0
+
+
 # Policy names used in run records; a learned policy is recorded under its own name.
 BASELINES: Final[dict[str, Policy]] = {
     "twap": twap,
     "immediate": immediate,
     "cap_aware_twap": cap_aware_twap,
+    "zero_action": zero_action,
 }
+# Baselines that exist to expose a reward-rule property rather than to execute
+# the target; reports label them so they are not read as competing strategies.
+DIAGNOSTIC_POLICIES: Final[frozenset[str]] = frozenset({"zero_action"})

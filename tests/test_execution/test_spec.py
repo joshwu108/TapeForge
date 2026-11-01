@@ -1,5 +1,5 @@
 """Tests for tapeforge.execution.spec: EpisodeSpec defaults, validation and normalisation, the fee
-ceiling, the participation-cap floor and the int64 bounds check.
+ceiling, the participation-cap floor, the settlement price rounding and the int64 bounds check.
 
 Rounding and bound cases are pinned with exact integers; no fixtures are needed.
 """
@@ -14,11 +14,15 @@ from tapeforge.execution.spec import (
     ACCEPTED_FEE_BPS,
     ACCEPTED_HORIZON_BUCKETS,
     ACCEPTED_PARTICIPATION_CAP_BPS,
+    BPS_DENOMINATOR,
     CASH_SCALE,
+    TERMINAL_RULE_RESIDUAL_PEROLD,
+    TERMINAL_RULE_SETTLEMENT,
     EpisodeSpec,
     check_episode_bounds,
     fee_ticks,
     participation_cap_ticks,
+    settlement_price_ticks,
 )
 
 
@@ -31,7 +35,33 @@ def test_defaults_are_the_accepted_configuration() -> None:
     assert spec.latency_buckets == 0 and spec.data_delay_buckets == 0
     assert spec.risk_lambda == 0 and spec.residual_mu == 0
     assert spec.fill_rule == "bucket_vwap_capped"
+    # The primary terminal rule is the default; the surcharge has no accepted value and is 0.
+    assert spec.terminal_rule == TERMINAL_RULE_SETTLEMENT == "terminal_settlement"
+    assert spec.terminal_surcharge_bps == 0 and spec.settles_at_horizon
     assert CASH_SCALE == contract.PRICE_SCALE * contract.QUANTITY_SCALE == 10_000_000
+
+
+def test_terminal_rules_are_explicit_and_their_parameters_exclusive() -> None:
+    legacy = EpisodeSpec(side=1, target_qty_ticks=1, terminal_rule=TERMINAL_RULE_RESIDUAL_PEROLD,
+                         residual_mu=20)
+    assert not legacy.settles_at_horizon and legacy.residual_mu == 20
+    settling = EpisodeSpec(side=1, target_qty_ticks=1, terminal_surcharge_bps=25)
+    assert settling.settles_at_horizon and settling.terminal_surcharge_bps == 25
+    # residual_mu belongs to the legacy rule; a settlement spec must not carry it silently.
+    with pytest.raises(ValueError, match="residual_mu 5 is a parameter of the legacy"):
+        EpisodeSpec(side=1, target_qty_ticks=1, residual_mu=5)
+    # The surcharge belongs to settlement; the legacy rule settles nothing.
+    with pytest.raises(ValueError, match="applies to 'terminal_settlement' only"):
+        EpisodeSpec(side=1, target_qty_ticks=1, terminal_rule=TERMINAL_RULE_RESIDUAL_PEROLD,
+                    terminal_surcharge_bps=1)
+    with pytest.raises(ValueError, match="unknown terminal_rule"):
+        EpisodeSpec(side=1, target_qty_ticks=1, terminal_rule="forced_liquidation")
+    with pytest.raises(TypeError, match="terminal_rule must be a string"):
+        EpisodeSpec(side=1, target_qty_ticks=1, terminal_rule=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="terminal_surcharge_bps must be below 10000"):
+        EpisodeSpec(side=1, target_qty_ticks=1, terminal_surcharge_bps=BPS_DENOMINATOR)
+    with pytest.raises(ValueError, match="terminal_surcharge_bps must be non-negative"):
+        EpisodeSpec(side=1, target_qty_ticks=1, terminal_surcharge_bps=-1)
 
 
 def test_inventory_endpoints_follow_the_side() -> None:
@@ -65,6 +95,7 @@ def test_numpy_integers_are_normalised_to_int() -> None:
         ({"residual_mu": -1}, "residual_mu must be non-negative"),
         ({"slippage_ticks": -1}, "slippage_ticks must be non-negative"),
         ({"fill_rule": "fill_at_touch"}, "unknown fill_rule"),
+        ({"terminal_rule": "none"}, "unknown terminal_rule"),
     ],
 )
 def test_out_of_domain_fields_raise(overrides: dict[str, object], match: str) -> None:
@@ -178,9 +209,78 @@ def test_slippage_counts_toward_the_worst_price() -> None:
 
 
 def test_reward_coefficient_bound() -> None:
-    spec = EpisodeSpec(side=1, target_qty_ticks=10**10, residual_mu=10**9)
+    spec = EpisodeSpec(side=1, target_qty_ticks=10**10, residual_mu=10**9,
+                       terminal_rule=TERMINAL_RULE_RESIDUAL_PEROLD)
     with pytest.raises(OverflowError, match="int64 reward bound exceeded"):
         check_episode_bounds(spec, 1, 1)
+
+
+# --- settlement price -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "mark, side, surcharge, expected",
+    [
+        (10_010, 1, 0, 10_010),      # No surcharge: the mark itself.
+        (10_010, -1, 0, 10_010),
+        (10_010, 1, 25, 10_036),     # 10,035.025 rounded up against the buyer.
+        (10_010, -1, 25, 9_984),     # 9,984.975 rounded down against the seller.
+        (10_010, 1, 10, 10_021),     # 10,020.01 -> 10,021.
+        (10_010, -1, 10, 9_999),     # 9,999.99 -> 9,999.
+        (10_010, 1, 50, 10_061),     # 10,060.05 -> 10,061.
+        (10_010, -1, 50, 9_959),     # 9,959.95 -> 9,959.
+        (9_990, 1, 25, 10_015),      # 10,014.975 -> 10,015.
+        (4_000, 1, 25, 4_010),       # Exact product: no rounding needed.
+        (4_000, -1, 25, 3_990),
+        (1, -1, 0, 1),               # A one-tick mark survives without a surcharge.
+    ],
+)
+def test_settlement_price_moves_the_mark_against_the_side_and_rounds_against_it(
+    mark: int, side: int, surcharge: int, expected: int
+) -> None:
+    price = settlement_price_ticks(mark, side, surcharge)
+    assert price == expected
+    # Never favourable: a buyer pays at least the exact adjusted mark, a seller gets at most it.
+    exact = mark * (BPS_DENOMINATOR + side * surcharge) / BPS_DENOMINATOR
+    assert (price >= exact) if side == 1 else (price <= exact)
+    assert abs(price - exact) < 1
+
+
+def test_settlement_price_rejects_invalid_inputs() -> None:
+    with pytest.raises(ValueError, match="is not positive"):
+        settlement_price_ticks(1, -1, 1)        # floor(0.9999) = 0.
+    with pytest.raises(ValueError, match="terminal mark must be positive"):
+        settlement_price_ticks(0, 1, 0)
+    with pytest.raises(ValueError, match="side must be"):
+        settlement_price_ticks(10, 0, 0)
+    with pytest.raises(ValueError, match="surcharge must be in"):
+        settlement_price_ticks(10, 1, BPS_DENOMINATOR)
+    with pytest.raises(ValueError, match="surcharge must be in"):
+        settlement_price_ticks(10, 1, -1)
+
+
+def test_settlement_bound_counts_the_settled_target_at_the_surcharged_price() -> None:
+    """The residual can be settled in full at the buy-side settlement price of the max VWAP."""
+    spec = EpisodeSpec(side=-1, target_qty_ticks=10**9, horizon_buckets=1,
+                       participation_cap_bps=0, fee_bps=0, terminal_surcharge_bps=25)
+    # 10**9 ticks x ceil(10**10 x 1.0025) = 1.0025e19 > INT64_MAX although nothing can fill.
+    with pytest.raises(OverflowError, match="int64 cash bound exceeded"):
+        check_episode_bounds(spec, 10**10, 10**6)
+    check_episode_bounds(spec, 9 * 10**8, 10**6)   # 9.0225e17 fits.
+    legacy = EpisodeSpec(side=-1, target_qty_ticks=10**9, horizon_buckets=1,
+                         participation_cap_bps=0, fee_bps=0,
+                         terminal_rule=TERMINAL_RULE_RESIDUAL_PEROLD)
+    check_episode_bounds(legacy, 921 * 10**7, 10**6)   # 9.21e18 at the mark itself fits...
+    with pytest.raises(OverflowError, match="int64 cash bound exceeded"):
+        check_episode_bounds(spec, 921 * 10**7, 10**6)   # ...but 9.233e18 at 1.0025 x it does not.
+    # The settlement fee product is checked on its own; the legacy residual pays no fee.
+    fee_heavy = EpisodeSpec(side=1, target_qty_ticks=10**9, horizon_buckets=1,
+                            participation_cap_bps=0, fee_bps=10_000)
+    with pytest.raises(OverflowError, match="int64 fee bound exceeded"):
+        check_episode_bounds(fee_heavy, 10**9, 10**6)
+    check_episode_bounds(EpisodeSpec(side=1, target_qty_ticks=10**9, horizon_buckets=1,
+                                     participation_cap_bps=0, fee_bps=10_000,
+                                     terminal_rule=TERMINAL_RULE_RESIDUAL_PEROLD), 10**9, 10**6)
 
 
 def test_negative_maxima_are_rejected() -> None:

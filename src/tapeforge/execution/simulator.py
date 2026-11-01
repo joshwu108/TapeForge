@@ -26,17 +26,40 @@ Accounting:
     rounding; the action is the only float and is converted once, by
     ``floor(action * remaining)``.
 
+Terminal rules (``spec.terminal_rule``):
+    ``"terminal_settlement"`` (primary): quantity still unfilled when the
+    horizon ends is settled in one synthetic fill at the terminal mark (the
+    first priced bucket at or after bucket ``horizon_buckets +
+    latency_buckets``, searched over ``arrival_lookback`` buckets) moved
+    against the side by ``terminal_surcharge_bps`` and rounded against the
+    agent (``spec.settlement_price_ticks``), with the ordinary fee and its
+    ceiling. Inventory, cash, the settled quantity, the settlement notional
+    and the settlement fee are updated; the residual becomes zero; the
+    legacy opportunity-cost term is *not* charged as well. The settlement
+    ignores the participation cap of the terminal bucket and the record
+    says so (``settlement_exceeds_cap``). It is a boundary condition that
+    makes the task "complete the target", not a model of executable depth,
+    impact or guaranteed liquidity. Early completion settles nothing.
+    ``"residual_perold"`` (legacy, explicit): the residual stays unfilled
+    and ``residual_perold`` charges its opportunity cost at the terminal
+    mark plus ``residual_mu`` per tick. Under either rule a missing terminal
+    mark truncates the episode: nothing is settled or charged and the record
+    reports the fills only.
+
 Reward:
     Per step, ``reward = -(cost + risk + terminal)`` where
     ``cost = side * (notional - arrival_price_ticks * fill) + fee``,
-    ``risk = risk_lambda * remaining_after`` and ``terminal`` is the
-    residual-inventory term of the implementation-shortfall decomposition
-    (``residual_perold``),
+    ``risk = risk_lambda * remaining_after`` (``remaining_after`` is the
+    quantity unfilled after this step's ordinary fill, before settlement, so
+    the risk term is the same under both terminal rules) and ``terminal`` is
+    charged once at the horizon: the settlement's shortfall against the
+    arrival price including its fee,
+    ``side * (settlement_notional - arrival_price_ticks * settled) +
+    settlement_fee``, or the legacy term
     ``side * (terminal_mark - arrival_price_ticks) * residual +
-    residual_mu * residual``, charged once at the horizon. Summed over a
-    terminated episode this is exactly
-    ``-shortfall - risk_lambda * sum(remaining_after)``, with ``shortfall``
-    the implementation shortfall against the arrival price.
+    residual_mu * residual``. Summed over a terminated episode this is
+    exactly ``-shortfall - risk_lambda * sum(remaining_after)``, with
+    ``shortfall`` the implementation shortfall against the arrival price.
 
 Episode end:
     ``remaining == 0`` or ``step == horizon_buckets`` terminates. A fill
@@ -47,16 +70,19 @@ Episode end:
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Final
 
 import numpy as np
 
+from tapeforge.contract import INT64_MAX
 from tapeforge.execution.spec import (
     FILL_RULE_BUCKET_VWAP_CAPPED,
     EpisodeSpec,
     check_episode_bounds,
     fee_ticks,
     participation_cap_ticks,
+    settlement_price_ticks,
 )
 from tapeforge.execution.state import MarketSlice, State, StepResult
 
@@ -66,6 +92,7 @@ __all__ = [
     "SIMULATOR_VERSION",
     "EpisodeOver",
     "action_for_quantity",
+    "fill_shortfall",
     "implementation_shortfall",
     "is_done",
     "newest_visible_bucket",
@@ -75,15 +102,22 @@ __all__ = [
     "residual_fixed_penalty",
     "residual_forced_liquidation",
     "residual_perold",
+    "settlement_shortfall",
+    "settlement_terms",
     "shortfall_bps",
     "step",
     "terminal_mark",
+    "terminal_mark_bucket",
 ]
 
 # Version tag of the transition semantics, recorded in every experiment
 # manifest so a result can be matched to the rules that produced it. Bump it
-# whenever a fill, accounting, reward or termination rule changes.
-SIMULATOR_VERSION: Final[str] = "tapeforge.execution.simulator/1"
+# whenever a fill, accounting, reward or termination rule changes. Version 1
+# had the legacy residual rule only and no settlement fields; its records
+# and configurations are rejected by this version's readers rather than
+# reinterpreted (``residual_perold`` with ``terminal_surcharge_bps = 0``
+# reproduces its transitions when named explicitly).
+SIMULATOR_VERSION: Final[str] = "tapeforge.execution.simulator/2"
 
 # What the fill model does and does not represent, in the words an experiment
 # record should carry. Every entry is a limitation of the synthetic fill rule,
@@ -96,10 +130,24 @@ SIMULATOR_ASSUMPTIONS: Final[dict[str, str]] = {
     ),
     "fee": "ceil(notional * fee_bps / 10_000) cash ticks; the only rounding in the accounting",
     "arrival_price": "VWAP of the newest priced bucket visible before the first decision",
-    "residual_rule": (
-        "Perold opportunity cost side * (terminal_mark - arrival) * residual + "
-        "residual_mu * residual at the horizon; terminal_mark is the first priced bucket "
-        "after the last fill bucket"
+    "terminal_mark": (
+        "VWAP of the first priced bucket at or after bucket horizon + latency, searched over "
+        "arrival_lookback buckets; a missing mark truncates the episode"
+    ),
+    "terminal_rule_terminal_settlement": (
+        "synthetic boundary condition, the primary research configuration: quantity still "
+        "unfilled at the horizon is settled in one fill at the terminal mark moved against "
+        "the side by terminal_surcharge_bps (buy rounded up, sell rounded down) and charged "
+        "the ordinary fee; cash, inventory, settled quantity, notional and fee are updated "
+        "and no opportunity-cost term is charged in addition. The settlement ignores the "
+        "participation cap of the terminal bucket and the record flags when it exceeds it. "
+        "It does not model executable depth, market impact or guaranteed liquidity; the "
+        "surcharge is an experimental setting, not a calibrated impact estimate"
+    ),
+    "terminal_rule_residual_perold": (
+        "legacy rule, named explicitly: the residual stays unfilled and is charged "
+        "side * (terminal_mark - arrival) * residual + residual_mu * residual; with "
+        "residual_mu = 0 unfilled quantity avoids fees and a favourable move rewards inaction"
     ),
     "not_modelled": (
         "bid/ask spread, queue position, passive or limit orders, market impact, the "
@@ -140,9 +188,11 @@ def newest_visible_bucket(state_step: int, spec: EpisodeSpec) -> int:
 def remaining_qty_ticks(state: State, spec: EpisodeSpec) -> int:
     """Return the quantity still to trade, in quantity ticks.
 
-    ``target_qty_ticks - filled_qty_ticks``; never negative.
+    ``target_qty_ticks - filled_qty_ticks - settled_qty_ticks``; never
+    negative. Zero after a terminal settlement even when no ordinary fill
+    reached the target.
     """
-    return spec.target_qty_ticks - state.filled_qty_ticks
+    return spec.target_qty_ticks - state.filled_qty_ticks - state.settled_qty_ticks
 
 
 def is_done(state: State, spec: EpisodeSpec) -> bool:
@@ -185,25 +235,35 @@ def _latest_priced_bucket(
     return None
 
 
-def terminal_mark(market: MarketSlice, spec: EpisodeSpec) -> int | None:
-    """Return the terminal mark: the VWAP of the first priced bucket after the last fill bucket.
+def terminal_mark_bucket(market: MarketSlice, spec: EpisodeSpec) -> int | None:
+    """Return the episode bucket that supplies the terminal mark, or ``None``.
 
     The search starts at bucket ``horizon_buckets + latency_buckets`` and
     covers ``arrival_lookback`` buckets or the end of the slice, whichever
-    comes first.
-
-    Returns:
-        The mark in price ticks, or ``None`` when the slice holds no such
-        bucket, which truncates an episode that still has residual inventory.
+    comes first; the first priced bucket wins. The same bucket prices the
+    terminal settlement and supplies the participation cap the settlement is
+    compared against.
     """
     first = spec.horizon_buckets + spec.latency_buckets
     for bucket in range(first, first + spec.arrival_lookback):
         if not market.has_bucket(bucket):
             return None
-        i = market.index(bucket)
-        if _priced(market, i):
-            return int(market.vwap_ticks[i])
+        if _priced(market, market.index(bucket)):
+            return bucket
     return None
+
+
+def terminal_mark(market: MarketSlice, spec: EpisodeSpec) -> int | None:
+    """Return the terminal mark: the VWAP of the first priced bucket after the last fill bucket.
+
+    See ``terminal_mark_bucket`` for the search.
+
+    Returns:
+        The mark in price ticks, or ``None`` when the slice holds no such
+        bucket, which truncates an episode that still has residual inventory.
+    """
+    bucket = terminal_mark_bucket(market, spec)
+    return None if bucket is None else int(market.vwap_ticks[market.index(bucket)])
 
 
 # --- reset / observe / step -----------------------------------------------------
@@ -244,9 +304,12 @@ def reset(spec: EpisodeSpec, market: MarketSlice) -> State:
         step=0,
         inventory_ticks=spec.initial_inventory_ticks,
         cash_ticks=0,
-        fees_ticks=0,
+        fill_fees_ticks=0,
         filled_qty_ticks=0,
         exec_notional_ticks=0,
+        settled_qty_ticks=0,
+        settlement_notional_ticks=0,
+        settlement_fees_ticks=0,
         arrival_price_ticks=arrival,
         mark_price_ticks=arrival,
         mark_age=age,
@@ -337,6 +400,57 @@ def _mark_after(
     return found
 
 
+@dataclass(frozen=True)
+class _Settlement:
+    """The terminal settlement of one step; all zero when nothing was settled."""
+
+    quantity: int = 0
+    price: int = 0
+    notional: int = 0
+    fee: int = 0
+    cap: int = 0
+
+    @property
+    def exceeds_cap(self) -> bool:
+        """Return whether the settled quantity is above the terminal bucket's participation cap."""
+        return self.quantity > self.cap
+
+
+def settlement_terms(
+    market: MarketSlice, spec: EpisodeSpec, arrival: int, residual: int
+) -> tuple[_Settlement, int, int] | None:
+    """Return the settlement of ``residual`` ticks at the terminal mark, or ``None`` without a mark.
+
+    Returns ``(settlement, mark, terminal_component)`` where ``settlement``
+    holds the quantity, price (``spec.settlement_price_ticks`` of the mark),
+    notional, fee and the terminal bucket's participation cap, ``mark`` is the
+    terminal mark in price ticks and ``terminal_component`` is
+    ``side * (notional - arrival * residual) + fee``, the settlement's
+    shortfall against the arrival price.
+
+    Raises:
+        ValueError: The settlement price is not positive (see
+            ``spec.settlement_price_ticks``).
+        OverflowError: The settlement notional does not fit int64; the bound
+            check in ``reset`` makes this unreachable for a slice it accepted.
+    """
+    bucket = terminal_mark_bucket(market, spec)
+    if bucket is None:
+        return None
+    i = market.index(bucket)
+    mark = int(market.vwap_ticks[i])
+    price = settlement_price_ticks(mark, spec.side, spec.terminal_surcharge_bps)
+    notional = price * residual
+    if notional > INT64_MAX:
+        raise OverflowError(
+            f"settlement notional {price} x {residual} = {notional} exceeds int64"
+        )
+    fee = fee_ticks(notional, spec.fee_bps)
+    cap = participation_cap_ticks(int(market.total_quantity[i]), spec.participation_cap_bps)
+    settlement = _Settlement(quantity=residual, price=price, notional=notional, fee=fee, cap=cap)
+    return settlement, mark, spec.side * (notional - arrival * residual) + fee
+
+
 def step(
     state: State, action: float, market: MarketSlice, spec: EpisodeSpec
 ) -> tuple[State, StepResult]:
@@ -345,7 +459,7 @@ def step(
     ``action`` is the fraction of the remaining quantity to submit, in
     ``[0, 1]``; it is floored to quantity ticks once, after which every
     number is an integer. See the module docstring for the fill rule, the
-    accounting and the reward decomposition.
+    terminal rules, the accounting and the reward decomposition.
 
     Returns:
         ``(new_state, result)``; ``result.terminated`` or ``result.truncated``
@@ -355,7 +469,8 @@ def step(
         EpisodeOver: The target is filled or ``horizon_buckets`` decisions
             were already taken.
         TypeError: ``action`` is not a real number.
-        ValueError: ``action`` is not a finite fraction in ``[0, 1]``.
+        ValueError: ``action`` is not a finite fraction in ``[0, 1]``, or the
+            settlement price of this tape is not positive.
     """
     if is_done(state, spec):
         raise EpisodeOver(
@@ -381,27 +496,42 @@ def step(
 
     remaining_after = remaining_before - fill
     cost = side * (notional - arrival * fill) + fee
+    # The risk term prices the exposure carried through this step; it is taken
+    # before any settlement so both terminal rules charge the same risk.
     risk = spec.risk_lambda * remaining_after
 
     terminated = not truncated and (remaining_after == 0 or new_step == spec.horizon_buckets)
     terminal = 0
     terminal_price = 0
+    settlement = _Settlement()
     if terminated and remaining_after > 0:
-        mark = terminal_mark(market, spec)
-        if mark is None:
-            terminated, truncated = False, True
+        if spec.settles_at_horizon:
+            settled = settlement_terms(market, spec, arrival, remaining_after)
+            if settled is None:
+                terminated, truncated = False, True
+            else:
+                settlement, terminal_price, terminal = settled
         else:
-            terminal_price = mark
-            terminal = residual_perold(side, arrival, mark, remaining_after, spec.residual_mu)
+            mark = terminal_mark(market, spec)
+            if mark is None:
+                terminated, truncated = False, True
+            else:
+                terminal_price = mark
+                terminal = residual_perold(side, arrival, mark, remaining_after, spec.residual_mu)
 
     mark_price, mark_age = _mark_after(state, market, spec, new_step)
     new_state = State(
         step=new_step,
-        inventory_ticks=state.inventory_ticks + side * fill,
-        cash_ticks=state.cash_ticks - side * notional - fee,
-        fees_ticks=state.fees_ticks + fee,
+        inventory_ticks=state.inventory_ticks + side * (fill + settlement.quantity),
+        cash_ticks=(
+            state.cash_ticks - side * (notional + settlement.notional) - fee - settlement.fee
+        ),
+        fill_fees_ticks=state.fill_fees_ticks + fee,
         filled_qty_ticks=state.filled_qty_ticks + fill,
         exec_notional_ticks=state.exec_notional_ticks + notional,
+        settled_qty_ticks=state.settled_qty_ticks + settlement.quantity,
+        settlement_notional_ticks=state.settlement_notional_ticks + settlement.notional,
+        settlement_fees_ticks=state.settlement_fees_ticks + settlement.fee,
         arrival_price_ticks=arrival,
         mark_price_ticks=mark_price,
         mark_age=mark_age,
@@ -419,6 +549,12 @@ def step(
         risk_component=risk,
         terminal_component=terminal,
         terminal_price_ticks=terminal_price,
+        settlement_qty_ticks=settlement.quantity,
+        settlement_price_ticks=settlement.price,
+        settlement_notional_ticks=settlement.notional,
+        settlement_fee_ticks=settlement.fee,
+        settlement_cap_qty_ticks=settlement.cap,
+        settlement_exceeds_cap=settlement.exceeds_cap,
         reward_ticks=-(cost + risk + terminal),
         terminated=terminated,
         truncated=truncated,
@@ -487,27 +623,59 @@ def residual_fixed_penalty(residual: int, mu: int) -> int:
     return mu * residual
 
 
+def fill_shortfall(state: State, spec: EpisodeSpec) -> int:
+    """Return the shortfall of the ordinary fills alone, in cash ticks.
+
+    ``side * (exec_notional_ticks - arrival_price_ticks * filled_qty_ticks) +
+    fill_fees_ticks``: no terminal term, no settlement. This is the only
+    shortfall a truncated episode can report.
+    """
+    return spec.side * (
+        state.exec_notional_ticks - state.arrival_price_ticks * state.filled_qty_ticks
+    ) + state.fill_fees_ticks
+
+
+def settlement_shortfall(state: State, spec: EpisodeSpec) -> int:
+    """Return the shortfall of the terminal settlement against the arrival price, in cash ticks.
+
+    ``side * (settlement_notional_ticks - arrival_price_ticks *
+    settled_qty_ticks) + settlement_fees_ticks``; zero when nothing was
+    settled. Equals the ``terminal_component`` of the settling step.
+    """
+    return spec.side * (
+        state.settlement_notional_ticks - state.arrival_price_ticks * state.settled_qty_ticks
+    ) + state.settlement_fees_ticks
+
+
 def implementation_shortfall(
     state: State, spec: EpisodeSpec, terminal_price_ticks: int | None = None
 ) -> int:
     """Return the implementation shortfall in cash ticks.
 
-    Computes ``side * (exec_notional_ticks - arrival_price_ticks *
-    filled_qty_ticks) + fees_ticks + residual term``. Positive is a cost for
-    both sides. The residual term is ``residual_perold`` at
-    ``terminal_price_ticks`` with ``spec.residual_mu``; it is zero when
-    nothing is left, in which case the price may be omitted.
+    ``fill_shortfall + settlement_shortfall + residual term``, positive is a
+    cost for both sides. The residual term applies to quantity that is
+    neither filled nor settled: under the legacy ``residual_perold`` rule it
+    is ``residual_perold`` at ``terminal_price_ticks`` with
+    ``spec.residual_mu``; under ``terminal_settlement`` a terminated episode
+    has no residual, so none is accepted. The price may be omitted when
+    nothing is left.
 
     Raises:
-        ValueError: Residual inventory remains and ``terminal_price_ticks``
-            is ``None``.
+        ValueError: Residual inventory remains and either no
+            ``terminal_price_ticks`` was given (legacy rule) or the spec
+            settles at the horizon (the residual should have been settled or
+            the episode truncated, whose shortfall is ``fill_shortfall``).
     """
-    filled = state.filled_qty_ticks
-    shortfall = spec.side * (state.exec_notional_ticks - state.arrival_price_ticks * filled)
-    shortfall += state.fees_ticks
+    shortfall = fill_shortfall(state, spec) + settlement_shortfall(state, spec)
     residual = remaining_qty_ticks(state, spec)
     if residual == 0:
         return shortfall
+    if spec.settles_at_horizon:
+        raise ValueError(
+            f"{residual} ticks remain neither filled nor settled under "
+            f"{spec.terminal_rule!r}; a terminated episode settles its residual and a "
+            "truncated one reports fill_shortfall only"
+        )
     if terminal_price_ticks is None:
         raise ValueError(
             f"{residual} ticks remain unfilled; the shortfall needs a terminal price"

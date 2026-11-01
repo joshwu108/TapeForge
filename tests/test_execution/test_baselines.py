@@ -11,15 +11,25 @@ import pytest
 
 from tapeforge.execution.baselines import (
     BASELINES,
+    DIAGNOSTIC_POLICIES,
     cap_aware_twap,
     cap_aware_twap_quantity,
     immediate,
     twap,
     twap_quantity,
+    zero_action,
 )
 from tapeforge.execution.runner import Observation, run_episode, summarize_episode
 from tapeforge.execution.spec import EpisodeSpec
-from test_execution.tapes import DEEP, P0, Q_STAR, slice_from_rows, worksheet_spec, worksheet_tape
+from test_execution.tapes import (
+    DEEP,
+    P0,
+    Q_STAR,
+    legacy_spec,
+    slice_from_rows,
+    worksheet_spec,
+    worksheet_tape,
+)
 
 
 def _observation(remaining: int, time_remaining: int, newest_total: int = DEEP,
@@ -65,7 +75,15 @@ def test_twap_leaves_a_residual_only_when_the_cap_binds() -> None:
     assert [r.fill_qty_ticks for r in trajectory.results] == [50_000, 50_000, 50_000]
     assert [r.submitted_qty_ticks for r in trajectory.results] == [100_000, 125_000, 200_000]
     summary = summarize_episode(trajectory)
-    assert summary.residual_qty_ticks == 150_000 and summary.n_capped_steps == 3
+    # Under terminal settlement the 150,000 left are settled at the horizon: completion by
+    # fills is false, final completion true, and the settled fraction says how much.
+    assert summary.filled_qty_ticks == 150_000 and summary.n_capped_steps == 3
+    assert summary.settled_qty_ticks == 150_000 and summary.residual_qty_ticks == 0
+    assert not summary.completed_by_fills and summary.completed
+    assert summary.settlement_fraction == 0.5
+    legacy = summarize_episode(run_episode(legacy_spec(side=1), thin, twap))
+    assert legacy.residual_qty_ticks == 150_000 and legacy.settled_qty_ticks == 0
+    assert not legacy.completed_by_fills and not legacy.completed
 
 
 def test_immediate_hits_the_cap_when_it_binds() -> None:
@@ -130,10 +148,22 @@ def test_cap_aware_twap_catches_up_after_a_thin_bucket() -> None:
     assert trajectory.final_state.filled_qty_ticks == 300_000
 
 
-def test_baseline_registry_names_the_three_policies() -> None:
-    assert set(BASELINES) == {"twap", "immediate", "cap_aware_twap"}
+def test_baseline_registry_names_the_policies_and_flags_the_diagnostic() -> None:
+    assert set(BASELINES) == {"twap", "immediate", "cap_aware_twap", "zero_action"}
     assert BASELINES["twap"] is twap and BASELINES["immediate"] is immediate
     assert BASELINES["cap_aware_twap"] is cap_aware_twap
+    assert BASELINES["zero_action"] is zero_action and {"zero_action"} == DIAGNOSTIC_POLICIES
+    assert zero_action(_observation(5, 1)) == 0.0
+
+
+def test_zero_action_settles_everything_at_the_horizon_under_the_primary_rule() -> None:
+    spec, market = worksheet_spec(side=1, terminal_surcharge_bps=25), worksheet_tape()
+    summary = summarize_episode(run_episode(spec, market, zero_action))
+    assert summary.filled_qty_ticks == 0 and summary.settled_qty_ticks == Q_STAR
+    assert summary.settlement_fraction == 1.0 and summary.completed
+    assert not summary.completed_by_fills
+    assert summary.settlement_exceeds_cap   # 300,000 settled against a 200,000 cap.
+    assert summary.fees_ticks == summary.settlement_fees_ticks == 3_010_800
 
 
 def test_baselines_return_actions_inside_the_unit_interval() -> None:

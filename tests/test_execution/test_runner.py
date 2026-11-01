@@ -31,7 +31,7 @@ from tapeforge.execution.runner import (
     summarize_set,
     write_run_record,
 )
-from tapeforge.execution.simulator import OBSERVATION_FIELDS, observe, reset
+from tapeforge.execution.simulator import OBSERVATION_FIELDS, SIMULATOR_VERSION, observe, reset
 from tapeforge.execution.spec import EpisodeSpec
 from tapeforge.execution.splits import SplitDates, Splits, build_splits
 from tapeforge.execution.state import MarketSlice
@@ -40,6 +40,7 @@ from test_execution.tapes import (
     DEEP,
     P0,
     Q_STAR,
+    legacy_spec,
     slice_from_rows,
     worksheet_spec,
     worksheet_tape,
@@ -118,24 +119,51 @@ def test_episode_summary_of_the_worksheet_buy_table() -> None:
     summary = summarize_episode(run_episode(spec, market, twap))
     assert isinstance(summary, EpisodeSummary)
     assert summary.shortfall_ticks == 3_800_800 and summary.completed
+    assert summary.completed_by_fills and summary.settled_qty_ticks == 0
+    assert summary.filled_fraction == 1.0 and summary.settlement_fraction == 0.0
     assert summary.shortfall_bps == pytest.approx(12.669, abs=1e-3)
-    assert summary.fees_ticks == 3_000_800 and summary.exec_notional_ticks == 3_000_800_000
+    assert summary.fees_ticks == summary.fill_fees_ticks == 3_000_800
+    assert summary.settlement_fees_ticks == 0 and summary.settlement_notional_ticks == 0
+    assert summary.exec_notional_ticks == 3_000_800_000
     assert summary.filled_qty_ticks == Q_STAR and summary.residual_qty_ticks == 0
     assert summary.n_steps == 3 and summary.terminated and not summary.truncated
     assert summary.reward_sum_ticks == -3_800_800 and summary.cost_sum_ticks == 3_800_800
     assert summary.risk_sum_ticks == 0 and summary.terminal_component_ticks == 0
+    assert summary.fill_shortfall_ticks == 3_800_800
     assert summary.n_capped_steps == 0 and summary.terminal_price_ticks == 0
+    assert summary.settlement_price_ticks == 0 and not summary.settlement_exceeds_cap
+    assert summary.terminal_rule == "terminal_settlement" and summary.terminal_surcharge_bps == 0
 
 
 def test_episode_summary_includes_the_residual_term_when_the_horizon_ends() -> None:
-    spec, market = worksheet_spec(side=1, residual_mu=5), worksheet_tape()
+    spec, market = legacy_spec(side=1, residual_mu=5), worksheet_tape()
     summary = summarize_episode(run_episode(spec, market, lambda _: 0.0))
     # Nothing filled: shortfall = side x (terminal mark - arrival price) x target
     # + residual_mu x target = 10 x 300,000 + 5 x 300,000.
     assert summary.shortfall_ticks == 3_000_000 + 1_500_000
     assert summary.terminal_price_ticks == 10_010 and not summary.completed
+    assert not summary.completed_by_fills and summary.settled_qty_ticks == 0
     assert summary.residual_qty_ticks == Q_STAR and summary.terminal_component_ticks == 4_500_000
+    assert summary.fill_shortfall_ticks == 0 and summary.fees_ticks == 0
     assert summary.reward_sum_ticks == -summary.shortfall_ticks
+    assert summary.terminal_rule == "residual_perold"
+
+
+def test_episode_summary_separates_settlement_from_fills_and_completion_twice() -> None:
+    """Zero action under settlement at 25 bps: 300,000 settled at 10,036, fee 3,010,800."""
+    spec, market = worksheet_spec(side=1, terminal_surcharge_bps=25), worksheet_tape()
+    summary = summarize_episode(run_episode(spec, market, lambda _: 0.0))
+    assert summary.filled_qty_ticks == 0 and summary.settled_qty_ticks == Q_STAR
+    assert summary.residual_qty_ticks == 0
+    assert not summary.completed_by_fills and summary.completed   # Reached only by settlement.
+    assert summary.filled_fraction == 0.0 and summary.settlement_fraction == 1.0
+    assert summary.settlement_price_ticks == 10_036 and summary.terminal_price_ticks == 10_010
+    assert summary.settlement_notional_ticks == 3_010_800_000
+    assert summary.fill_fees_ticks == 0 and summary.settlement_fees_ticks == 3_010_800
+    assert summary.fees_ticks == 3_010_800 and summary.settlement_exceeds_cap
+    assert summary.fill_shortfall_ticks == 0 and summary.terminal_component_ticks == 13_810_800
+    assert summary.shortfall_ticks == 13_810_800 == -summary.reward_sum_ticks
+    assert summary.terminal_surcharge_bps == 25
 
 
 def test_episode_summary_of_a_truncated_episode_reports_the_fills_only() -> None:
@@ -144,7 +172,9 @@ def test_episode_summary_of_a_truncated_episode_reports_the_fills_only() -> None
     summary = summarize_episode(run_episode(spec, market, twap))
     assert summary.truncated and not summary.terminated and not summary.completed
     assert summary.shortfall_ticks == (2 * 100_000 + 5 * 100_000) + 1_000_200 + 1_000_500
+    assert summary.shortfall_ticks == summary.fill_shortfall_ticks
     assert summary.residual_qty_ticks == 100_000 and summary.terminal_price_ticks == 0
+    assert summary.settled_qty_ticks == 0 and summary.settlement_fees_ticks == 0
 
 
 def test_episode_summary_counts_capped_fills() -> None:
@@ -178,35 +208,58 @@ def test_set_summary_matches_a_plain_loop_over_the_trajectories() -> None:
     assert record["summary"] == got.to_json()
 
     n = len(trajectories)
-    bps, completed, truncated, fees, shortfall, residual_fraction, capped = [], 0, 0, 0, 0, 0.0, 0
+    bps, completed, by_fills, settled, truncated = [], 0, 0, 0, 0
+    fees, fill_fees, settle_fees, shortfall, terminal, risk = 0, 0, 0, 0, 0, 0
+    settle_fractions: list[float] = []
+    filled_fractions: list[float] = []
+    capped = 0
     for trajectory in trajectories:
         final, spec = trajectory.final_state, trajectory.spec
+        last = trajectory.results[-1]
+        # Fills against arrival plus their fees, then the settlement fill against arrival plus
+        # its fee (the only terminal term under terminal_settlement).
         is_ticks = spec.side * (
             final.exec_notional_ticks - final.arrival_price_ticks * final.filled_qty_ticks
-        ) + final.fees_ticks
-        left = spec.target_qty_ticks - final.filled_qty_ticks
-        last = trajectory.results[-1]
-        if left and last.terminated:
-            is_ticks += spec.side * (last.terminal_price_ticks - final.arrival_price_ticks) * left
+        ) + final.fill_fees_ticks
+        is_ticks += spec.side * (
+            final.settlement_notional_ticks - final.arrival_price_ticks * final.settled_qty_ticks
+        ) + final.settlement_fees_ticks
+        left = spec.target_qty_ticks - final.filled_qty_ticks - final.settled_qty_ticks
+        assert left == 0 or last.truncated
         bps.append(is_ticks * 10_000 / (final.arrival_price_ticks * spec.target_qty_ticks))
         completed += left == 0
+        by_fills += final.filled_qty_ticks == spec.target_qty_ticks
+        settled += final.settled_qty_ticks > 0
         truncated += last.truncated
-        fees += final.fees_ticks
+        fill_fees += final.fill_fees_ticks
+        settle_fees += final.settlement_fees_ticks
+        fees += final.fill_fees_ticks + final.settlement_fees_ticks
         shortfall += is_ticks
-        residual_fraction += left / spec.target_qty_ticks
+        terminal += last.terminal_component
+        risk += sum(r.risk_component for r in trajectory.results)
+        settle_fractions.append(final.settled_qty_ticks / spec.target_qty_ticks)
+        filled_fractions.append(final.filled_qty_ticks / spec.target_qty_ticks)
         for r in trajectory.results:
             capped += r.fill_qty_ticks == r.cap_qty_ticks < r.submitted_qty_ticks
     ordered = sorted(bps)
     assert got.n_episodes == n and got.n_completed == completed and got.n_truncated == truncated
+    assert got.n_completed_by_fills == by_fills and got.n_settled == settled
     assert got.completion_rate == completed / n
+    assert got.completion_by_fills_rate == by_fills / n
     assert got.mean_shortfall_bps == sum(bps) / n
     assert got.p50_shortfall_bps == ordered[math.ceil(0.5 * n) - 1]
     assert got.p95_shortfall_bps == ordered[math.ceil(0.95 * n) - 1]
     assert got.p99_shortfall_bps == ordered[math.ceil(0.99 * n) - 1]
     assert got.max_shortfall_bps == ordered[-1]
     assert got.total_shortfall_ticks == shortfall and got.total_fees_ticks == fees
-    assert got.mean_residual_fraction == residual_fraction / n
+    assert got.total_fill_fees_ticks == fill_fees and got.total_settlement_fees_ticks == settle_fees
+    assert got.total_terminal_component_ticks == terminal and got.total_risk_ticks == risk
+    # ``sum`` over a list (compensated in Python 3.12) reproduces the summary's own arithmetic.
+    assert got.mean_settlement_fraction == sum(settle_fractions) / n
+    assert got.mean_filled_fraction == sum(filled_fractions) / n
+    assert got.mean_residual_fraction == 0.0 or truncated
     assert got.mean_capped_steps == capped / n
+    assert settled > 0   # The synthetic tape leaves residuals under the cap: settlement happens.
 
 
 def test_set_summary_rejects_an_empty_set() -> None:
@@ -225,9 +278,10 @@ def _without_volatile_fields(record: dict) -> dict:
 def test_run_record_has_the_documented_shape() -> None:
     splits = _synthetic_splits()
     record, trajectories = run_policy(splits, "validation", twap, "twap", SPEC, 5, seed=9)
-    assert record["schema"] == RUN_RECORD_SCHEMA
-    assert set(record) == {"schema", "created_utc", "code_revision", "config", "split",
-                           "observation_statistics", "episodes", "summary"}
+    assert record["schema"] == RUN_RECORD_SCHEMA == "tapeforge.execution.run/2"
+    assert record["simulator_version"] == SIMULATOR_VERSION
+    assert set(record) == {"schema", "simulator_version", "created_utc", "code_revision",
+                           "config", "split", "observation_statistics", "episodes", "summary"}
     assert record["config"] == {
         "policy": "twap", "role": "validation", "n_episodes": 5, "seed": 9,
         "rho_choices_bps": [200, 500, 1_000],
@@ -235,6 +289,7 @@ def test_run_record_has_the_documented_shape() -> None:
             "horizon_buckets": 5, "participation_cap_bps": 1_000, "slippage_ticks": 0,
             "fee_bps": 10, "latency_buckets": 0, "data_delay_buckets": 0, "risk_lambda": 0,
             "residual_mu": 0, "arrival_lookback": 3, "fill_rule": "bucket_vwap_capped",
+            "terminal_rule": "terminal_settlement", "terminal_surcharge_bps": 0,
         },
     }
     assert record["split"] == splits.record.to_json()
