@@ -43,7 +43,8 @@ def synthetic_mapping(**overrides: Any) -> dict[str, Any]:
             "evaluate_roles": ["train", "validation"],
         },
         "policies": {"names": ["twap", "immediate", "cap_aware_twap"]},
-        "template": {"horizon_buckets": 12, "arrival_lookback": 4},
+        "template": {"horizon_buckets": 12, "arrival_lookback": 4,
+                     "terminal_rule": "terminal_settlement", "terminal_surcharge_bps": 25},
         "output_dir": "runs",
     }
     mapping.update(deepcopy(overrides))

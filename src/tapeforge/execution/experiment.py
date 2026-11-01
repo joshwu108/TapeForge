@@ -29,6 +29,16 @@ Episode identifiers:
     The identifier plus the manifest rebuilds the episode exactly
     (``replay``).
 
+Versions:
+    Configuration schema 2 requires ``template.terminal_rule`` to be named
+    (``"terminal_settlement"`` with an explicit ``terminal_surcharge_bps``,
+    or the legacy ``"residual_perold"``); schema 1 files, which predate the
+    terminal rule, are rejected with the migration hint rather than read
+    under either rule. Manifests carry the simulator version that produced
+    them; a manifest of another schema or simulator version is rejected by
+    ``load_manifest`` so an old run is never replayed or reported under
+    changed semantics.
+
 Not covered:
     Reporting (``report``) and step-level inspection (``replay``) read the
     directory this module writes; nothing here trains a policy.
@@ -67,7 +77,12 @@ from tapeforge.execution.days import DayTape, day_from_archive, synthetic_day
 from tapeforge.execution.runner import code_revision, run_policy
 from tapeforge.execution.sampling import sample_episodes
 from tapeforge.execution.simulator import SIMULATOR_ASSUMPTIONS, SIMULATOR_VERSION
-from tapeforge.execution.spec import ACCEPTED_TARGET_FRACTIONS_BPS, EpisodeSpec
+from tapeforge.execution.spec import (
+    ACCEPTED_TARGET_FRACTIONS_BPS,
+    TERMINAL_RULE_SETTLEMENT,
+    TERMINAL_RULES,
+    EpisodeSpec,
+)
 from tapeforge.execution.splits import ROLES, SplitDates, Splits, build_splits
 from tapeforge.ingest import MARKET_BASE_URLS
 
@@ -75,6 +90,8 @@ __all__ = [
     "EXPERIMENT_CONFIG_SCHEMA",
     "EXPERIMENT_MANIFEST_SCHEMA",
     "LABELS",
+    "LEGACY_CONFIG_SCHEMAS",
+    "LEGACY_MANIFEST_SCHEMAS",
     "ConfigError",
     "DataConfig",
     "ExperimentConfig",
@@ -82,6 +99,7 @@ __all__ = [
     "acquire_days",
     "compare_experiments",
     "config_from_mapping",
+    "config_mapping_from_manifest",
     "create_run_directory",
     "episode_identifier",
     "load_config",
@@ -92,8 +110,19 @@ __all__ = [
     "write_json_atomic",
 ]
 
-EXPERIMENT_CONFIG_SCHEMA: Final[str] = "tapeforge.execution.experiment-config/1"
-EXPERIMENT_MANIFEST_SCHEMA: Final[str] = "tapeforge.execution.experiment/1"
+EXPERIMENT_CONFIG_SCHEMA: Final[str] = "tapeforge.execution.experiment-config/2"
+EXPERIMENT_MANIFEST_SCHEMA: Final[str] = "tapeforge.execution.experiment/2"
+# Schemas this code refuses with a migration hint instead of a bare mismatch.
+LEGACY_CONFIG_SCHEMAS: Final[frozenset[str]] = frozenset(
+    {"tapeforge.execution.experiment-config/1"}
+)
+LEGACY_MANIFEST_SCHEMAS: Final[frozenset[str]] = frozenset({"tapeforge.execution.experiment/1"})
+LEGACY_HINT: Final[str] = (
+    "it predates the terminal rule (simulator/1 charged the Perold residual term for every "
+    "episode). Re-run under schema 2 naming template.terminal_rule explicitly: "
+    "\"residual_perold\" reproduces the old transitions, \"terminal_settlement\" with "
+    "terminal_surcharge_bps is the primary configuration"
+)
 
 # A smoke run demonstrates that the pipeline works end to end; a research run
 # is the configuration whose numbers may be interpreted. Both need explicit
@@ -335,6 +364,8 @@ def config_from_mapping(mapping: Mapping[str, Any]) -> ExperimentConfig:
         "top level",
     )
     schema = mapping.get("schema", EXPERIMENT_CONFIG_SCHEMA)
+    if schema in LEGACY_CONFIG_SCHEMAS:
+        raise ConfigError(f"configuration schema {schema!r} is not read: {LEGACY_HINT}")
     if schema != EXPERIMENT_CONFIG_SCHEMA:
         raise ConfigError(f"schema {schema!r} is not {EXPERIMENT_CONFIG_SCHEMA!r}")
 
@@ -389,6 +420,22 @@ def config_from_mapping(mapping: Mapping[str, Any]) -> ExperimentConfig:
         f.name for f in fields(EpisodeSpec) if f.name not in ("side", "target_qty_ticks")
     ]
     _reject_unknown(template_map, spec_fields, "template")
+    # The terminal rule is the one spec field without a configuration default:
+    # an experiment must say which rule produced its numbers, and a settlement
+    # run must name its surcharge rather than inherit zero.
+    if "terminal_rule" not in template_map:
+        raise ConfigError(
+            "missing required key template.terminal_rule; choose one of "
+            f"{sorted(TERMINAL_RULES)} explicitly"
+        )
+    if (
+        template_map["terminal_rule"] == TERMINAL_RULE_SETTLEMENT
+        and "terminal_surcharge_bps" not in template_map
+    ):
+        raise ConfigError(
+            "missing required key template.terminal_surcharge_bps: a terminal_settlement "
+            "configuration names its surcharge in integer basis points (0 is allowed)"
+        )
     try:
         template = EpisodeSpec(side=1, target_qty_ticks=1, **template_map)
     except (TypeError, ValueError) as exc:
@@ -413,6 +460,42 @@ def config_from_mapping(mapping: Mapping[str, Any]) -> ExperimentConfig:
         template=template,
         output_dir=str(mapping.get("output_dir", "runs")),
     )
+
+
+def config_mapping_from_manifest(config_json: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a manifest's resolved ``config`` in the mapping layout ``config_from_mapping`` reads.
+
+    ``replay`` and ``evaluation`` rebuild the configuration of a run from its
+    manifest with this; the round trip ``config_from_mapping(
+    config_mapping_from_manifest(config.to_json()))`` reproduces the
+    configuration.
+    """
+    data = dict(config_json["data"])
+    synthetic_days = data.pop("synthetic_days", [])
+    n_buckets = data.pop("synthetic_n_buckets", 0)
+    profile = data.pop("synthetic_profile", "uniform")
+    mapping: dict[str, Any] = {
+        "schema": config_json.get("schema"),
+        "name": config_json["name"],
+        "label": config_json["label"],
+        "description": config_json.get("description", ""),
+        "data": data,
+        "split": config_json["split"],
+        "episodes": {
+            "seeds": config_json["seeds"],
+            "episodes_per_day": config_json["episodes_per_day"],
+            "rho_choices_bps": config_json["rho_choices_bps"],
+            "evaluate_roles": config_json["evaluate_roles"],
+        },
+        "policies": {"names": config_json["policies"]},
+        "template": config_json["template"],
+        "output_dir": config_json.get("output_dir", "runs"),
+    }
+    if data["source"] == "synthetic":
+        mapping["data"]["synthetic"] = {
+            "n_buckets": n_buckets, "profile": profile, "days": synthetic_days,
+        }
+    return mapping
 
 
 def load_config(path: str | Path) -> ExperimentConfig:
@@ -725,14 +808,24 @@ def load_manifest(run_dir: str | Path) -> dict[str, Any]:
 
     Raises:
         FileNotFoundError: No manifest.
-        ValueError: The manifest's schema is not ``EXPERIMENT_MANIFEST_SCHEMA``.
+        ValueError: The manifest's schema is not ``EXPERIMENT_MANIFEST_SCHEMA``
+            or its simulator version is not ``SIMULATOR_VERSION``; a legacy
+            schema gets the migration hint.
     """
     path = Path(run_dir) / MANIFEST_NAME
     manifest: dict[str, Any] = json.loads(path.read_text())
-    if manifest.get("schema") != EXPERIMENT_MANIFEST_SCHEMA:
+    schema = manifest.get("schema")
+    if schema in LEGACY_MANIFEST_SCHEMAS:
+        raise ValueError(f"{path} has manifest schema {schema!r}, which is not read: {LEGACY_HINT}")
+    if schema != EXPERIMENT_MANIFEST_SCHEMA:
         raise ValueError(
-            f"{path} has schema {manifest.get('schema')!r}; this code reads "
-            f"{EXPERIMENT_MANIFEST_SCHEMA!r}"
+            f"{path} has schema {schema!r}; this code reads {EXPERIMENT_MANIFEST_SCHEMA!r}"
+        )
+    version = (manifest.get("simulator") or {}).get("version")
+    if version != SIMULATOR_VERSION:
+        raise ValueError(
+            f"{path} was produced by simulator {version!r}; this code replays and reports "
+            f"{SIMULATOR_VERSION!r} only, and a run is never reinterpreted under other rules"
         )
     return manifest
 
@@ -806,13 +899,21 @@ def main(argv: list[str] | None = None) -> int:
                 command=[sys.argv[0], *(argv if argv is not None else sys.argv[1:])],
             )
             manifest = load_manifest(run_dir)
-            print(f"run directory: {run_dir}")
+            template = manifest["config"]["template"]
+            print(
+                f"run directory: {run_dir}  (terminal_rule {template['terminal_rule']}, "
+                f"surcharge {template['terminal_surcharge_bps']} bps, residual_mu "
+                f"{template['residual_mu']})"
+            )
             for entry in manifest["runs"]:
                 summary = entry["summary"]
                 tag = " (held out)" if entry["held_out"] else ""
                 print(
                     f"  {entry['policy']:16s} {entry['role']:10s} seed {entry['seed']:<4d}"
-                    f" n={summary['n_episodes']:<4d} completion {summary['completion_rate']:.3f}"
+                    f" n={summary['n_episodes']:<4d}"
+                    f" completed-by-fills {summary['completion_by_fills_rate']:.3f}"
+                    f" final {summary['completion_rate']:.3f}"
+                    f" settled {summary['mean_settlement_fraction']:.3f}"
                     f" mean IS {summary['mean_shortfall_bps']:.3f} bps"
                     f" p50 {summary['p50_shortfall_bps']:.3f}  {entry['seconds']:.2f}s{tag}"
                 )

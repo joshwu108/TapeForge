@@ -68,14 +68,25 @@ def test_step_rows_show_observation_availability_actions_fills_and_rewards(run_d
     assert "shortfall" in text and "reward sum" in text and "arrival price" in text
 
 
-def test_the_terminal_handling_is_spelled_out_for_residual_inventory(run_dir: Path) -> None:
-    replay = replay_episode(run_dir, "train/s1/i0", "twap")
-    summary = summarize_episode(replay.trajectory)
-    text = format_replay(replay)
-    if summary.residual_qty_ticks and summary.terminated:
-        assert "terminal mark" in text and "residual term" in text
-    elif summary.completed:
-        assert "completed 0" in text
+def test_the_terminal_handling_is_spelled_out_for_settlement_and_residuals(run_dir: Path) -> None:
+    for policy in ("twap", "zero_action"):
+        replay = replay_episode(run_dir, "train/s1/i0", policy)
+        summary = summarize_episode(replay.trajectory)
+        text = format_replay(replay)
+        assert "terminal rule terminal_settlement" in text and "surcharge 25 bps" in text
+        if summary.settled_qty_ticks:
+            assert "terminal settlement (synthetic boundary condition)" in text
+            assert f"{summary.settled_qty_ticks} ticks at {summary.settlement_price_ticks}" in text
+            assert "exceeded: " in text and "not completed by fills" in text
+            assert "final completion yes" in text
+        elif summary.completed_by_fills:
+            assert "(completed by fills); settled 0" in text
+        rows = step_rows(replay.trajectory, replay.market)
+        assert sum(r["settled_qty_ticks"] for r in rows) == summary.settled_qty_ticks
+        assert all(r["settled_qty_ticks"] == 0 for r in rows[:-1])
+    zero = replay_episode(run_dir, "train/s1/i0", "zero_action")
+    assert summarize_episode(zero.trajectory).settlement_fraction == 1.0
+    assert "exceeded: yes" in format_replay(zero) or "exceeded: no" in format_replay(zero)
 
 
 def test_unknown_identifiers_and_policies_fail_with_a_reason(run_dir: Path) -> None:

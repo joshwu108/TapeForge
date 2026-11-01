@@ -14,9 +14,12 @@ Columns of a step row:
     decision could read, ``t - 1 - data_delay``), ``visible_valid``,
     ``visible_qty_ticks``, ``mark_price_ticks``, ``mark_age``, ``action``,
     ``submitted_qty_ticks``, ``cap_qty_ticks``, ``fill_qty_ticks``,
-    ``fill_price_ticks``, ``fee_ticks``, ``remaining_after``,
-    ``inventory_after``, ``cash_after``, ``cost``, ``risk``, ``terminal``,
-    ``reward_ticks``, ``terminated``, ``truncated``.
+    ``fill_price_ticks``, ``fee_ticks``, ``settled_qty_ticks``,
+    ``settlement_price_ticks``, ``settlement_fee_ticks``,
+    ``remaining_after`` (neither filled nor settled), ``inventory_after``,
+    ``cash_after``, ``cost``, ``risk``, ``terminal``, ``reward_ticks``,
+    ``terminated``, ``truncated``. The settlement columns are non-zero on
+    the horizon step of a ``terminal_settlement`` episode only.
 
 Not covered:
     Nothing here changes a record; the tool reads the run directory and the
@@ -35,6 +38,7 @@ from typing import Any
 from tapeforge.execution.baselines import BASELINES
 from tapeforge.execution.experiment import (
     config_from_mapping,
+    config_mapping_from_manifest,
     load_manifest,
     parse_episode_identifier,
     rebuild_splits,
@@ -58,7 +62,8 @@ __all__ = [
 STEP_COLUMNS: tuple[str, ...] = (
     "step", "fill_bucket", "visible_bucket", "visible_valid", "visible_qty_ticks",
     "mark_price_ticks", "mark_age", "action", "submitted_qty_ticks", "cap_qty_ticks",
-    "fill_qty_ticks", "fill_price_ticks", "fee_ticks", "remaining_after", "inventory_after",
+    "fill_qty_ticks", "fill_price_ticks", "fee_ticks", "settled_qty_ticks",
+    "settlement_price_ticks", "settlement_fee_ticks", "remaining_after", "inventory_after",
     "cash_after", "cost", "risk", "terminal", "reward_ticks", "terminated", "truncated",
 )
 
@@ -109,6 +114,9 @@ def step_rows(trajectory: Trajectory, market: MarketSlice) -> list[dict[str, Any
                 "fill_qty_ticks": result.fill_qty_ticks,
                 "fill_price_ticks": result.fill_price_ticks,
                 "fee_ticks": result.fee_ticks,
+                "settled_qty_ticks": result.settlement_qty_ticks,
+                "settlement_price_ticks": result.settlement_price_ticks,
+                "settlement_fee_ticks": result.settlement_fee_ticks,
                 "remaining_after": remaining_qty_ticks(state_after, spec),
                 "inventory_after": state_after.inventory_ticks,
                 "cash_after": state_after.cash_ticks,
@@ -150,7 +158,7 @@ def replay_episode(
             f"seeds {sorted(manifest['episodes'].get(role, {}))}, "
             f"{len(listed or [])} episode(s) for that role and seed"
         )
-    config = config_from_mapping(_config_mapping(manifest["config"]))
+    config = config_from_mapping(config_mapping_from_manifest(manifest["config"]))
     if splits is None:
         splits = rebuild_splits(config)
     if json.loads(json.dumps(splits.record.to_json())) != manifest["split"]:
@@ -162,36 +170,6 @@ def replay_episode(
     spec, market = materialize(splits, draw, config.template)
     trajectory = run_episode(spec, market, BASELINES[policy])
     return Replay(episode_id, policy, draw, spec, market, trajectory)
-
-
-def _config_mapping(config_json: dict[str, Any]) -> dict[str, Any]:
-    """Return the manifest's resolved config in the mapping layout ``config_from_mapping`` reads."""
-    data = dict(config_json["data"])
-    synthetic_days = data.pop("synthetic_days", [])
-    n_buckets = data.pop("synthetic_n_buckets", 0)
-    profile = data.pop("synthetic_profile", "uniform")
-    mapping = {
-        "schema": config_json.get("schema"),
-        "name": config_json["name"],
-        "label": config_json["label"],
-        "description": config_json.get("description", ""),
-        "data": data,
-        "split": config_json["split"],
-        "episodes": {
-            "seeds": config_json["seeds"],
-            "episodes_per_day": config_json["episodes_per_day"],
-            "rho_choices_bps": config_json["rho_choices_bps"],
-            "evaluate_roles": config_json["evaluate_roles"],
-        },
-        "policies": {"names": config_json["policies"]},
-        "template": config_json["template"],
-        "output_dir": config_json.get("output_dir", "runs"),
-    }
-    if data["source"] == "synthetic":
-        mapping["data"]["synthetic"] = {
-            "n_buckets": n_buckets, "profile": profile, "days": synthetic_days,
-        }
-    return mapping
 
 
 def verify_against_record(replay: Replay, run_dir: str | Path) -> list[str]:
@@ -236,7 +214,8 @@ def format_replay(replay: Replay) -> str:
         f"  target {spec.target_qty_ticks} qty ticks  horizon {spec.horizon_buckets}  "
         f"latency {spec.latency_buckets}  data delay {spec.data_delay_buckets}  "
         f"cap {spec.participation_cap_bps} bps  fee {spec.fee_bps} bps  "
-        f"lambda {spec.risk_lambda}  mu {spec.residual_mu}",
+        f"lambda {spec.risk_lambda}  terminal rule {spec.terminal_rule}  "
+        f"surcharge {spec.terminal_surcharge_bps} bps  mu {spec.residual_mu}",
         f"  arrival price {trajectory.states[0].arrival_price_ticks} ticks "
         f"(mark age at reset {trajectory.states[0].mark_age})  slice buckets "
         f"[{-replay.market.origin}, {replay.market.n_after})",
@@ -248,28 +227,44 @@ def format_replay(replay: Replay) -> str:
     for row in rows:
         lines.append("  ".join(_cell(row[c]).rjust(widths[c]) for c in STEP_COLUMNS))
     ending = "terminated" if last.terminated else "truncated" if last.truncated else "unfinished"
+    by_fills = "completed by fills" if summary.completed_by_fills else "not completed by fills"
     lines += [
         "",
-        f"ending: {ending} after {summary.n_steps} step(s); filled {summary.filled_qty_ticks} of "
-        f"{spec.target_qty_ticks} ({'completed' if summary.completed else 'residual'} "
-        f"{summary.residual_qty_ticks})",
+        f"ending: {ending} after {summary.n_steps} step(s); ordinary fills "
+        f"{summary.filled_qty_ticks} of {spec.target_qty_ticks} ({by_fills}); settled "
+        f"{summary.settled_qty_ticks}; residual {summary.residual_qty_ticks}; final completion "
+        f"{'yes' if summary.completed else 'no'}",
     ]
-    if last.terminated and summary.residual_qty_ticks:
+    if last.settlement_qty_ticks:
         lines.append(
-            f"  terminal mark {last.terminal_price_ticks} ticks; residual term "
-            f"{last.terminal_component} cash ticks = side {spec.side} x "
+            f"  terminal settlement (synthetic boundary condition): {last.settlement_qty_ticks} "
+            f"ticks at {last.settlement_price_ticks} = mark {last.terminal_price_ticks} "
+            f"{'+' if spec.side == 1 else '-'} {spec.terminal_surcharge_bps} bps rounded "
+            f"{'up' if spec.side == 1 else 'down'}; notional {last.settlement_notional_ticks}; "
+            f"fee {last.settlement_fee_ticks}; settlement cost {last.terminal_component} cash "
+            f"ticks = side {spec.side} x ({last.settlement_notional_ticks} - "
+            f"{final.arrival_price_ticks} x {last.settlement_qty_ticks}) + "
+            f"{last.settlement_fee_ticks}; terminal bucket cap {last.settlement_cap_qty_ticks} "
+            f"ticks, exceeded: {'yes' if last.settlement_exceeds_cap else 'no'}"
+        )
+    elif last.terminated and summary.residual_qty_ticks:
+        lines.append(
+            f"  legacy residual rule: terminal mark {last.terminal_price_ticks} ticks; residual "
+            f"term {last.terminal_component} cash ticks = side {spec.side} x "
             f"({last.terminal_price_ticks} - {final.arrival_price_ticks}) x "
             f"{summary.residual_qty_ticks} + mu {spec.residual_mu} x {summary.residual_qty_ticks}"
         )
     if last.truncated:
         lines.append(
-            "  the tape ended before the fill bucket or the terminal mark; no residual term, no "
-            "terminal mark, shortfall of the fills only"
+            "  the tape ended before the fill bucket or the terminal mark; nothing settled, no "
+            "terminal term, no terminal mark, shortfall of the fills only"
         )
     lines += [
-        f"  cash {final.cash_ticks}  inventory {final.inventory_ticks}  fees {final.fees_ticks}  "
-        f"exec notional {final.exec_notional_ticks}",
-        f"  shortfall {summary.shortfall_ticks} cash ticks = {summary.shortfall_bps:.4f} bps; "
+        f"  cash {final.cash_ticks}  inventory {final.inventory_ticks}  fill fees "
+        f"{final.fill_fees_ticks}  settlement fees {final.settlement_fees_ticks}  exec notional "
+        f"{final.exec_notional_ticks}  settlement notional {final.settlement_notional_ticks}",
+        f"  shortfall {summary.shortfall_ticks} cash ticks = {summary.shortfall_bps:.4f} bps = "
+        f"fills {summary.fill_shortfall_ticks} + terminal {summary.terminal_component_ticks}; "
         f"reward sum {summary.reward_sum_ticks} = -(cost {summary.cost_sum_ticks} + risk "
         f"{summary.risk_sum_ticks} + terminal {summary.terminal_component_ticks})",
     ]

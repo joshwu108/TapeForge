@@ -1,7 +1,7 @@
 # Synthetic smoke configuration: three seeded generator days, no data download.
 # A demonstration that the experiment, report and replay tools run end to end;
 # synthetic prices are a random walk, so the figures carry no market information.
-schema = "tapeforge.execution.experiment-config/1"
+schema = "tapeforge.execution.experiment-config/2"
 name = "smoke-synthetic"
 label = "smoke"
 description = "three synthetic days (uniform profile); demonstration only"
@@ -31,10 +31,12 @@ rho_choices_bps = [200, 500, 1000]
 evaluate_roles = ["train", "validation"]
 
 [policies]
-names = ["twap", "immediate", "cap_aware_twap"]
+names = ["twap", "immediate", "cap_aware_twap", "zero_action"]  # zero_action is a diagnostic
 
-# The accepted first configuration (README, "Execution simulator"); the two
-# swept coefficients stay at zero (off). Omitted keys take the EpisodeSpec defaults.
+# The accepted first configuration (README, "Execution model") under the primary
+# terminal rule: quantity left at the horizon is settled at the terminal mark moved
+# 25 bps against the side (an initial smoke setting, not a chosen coefficient).
+# risk_lambda stays at zero (off); residual_mu is a legacy-rule parameter and must be 0.
 [template]
 horizon_buckets = 300
 participation_cap_bps = 1000
@@ -46,3 +48,5 @@ risk_lambda = 0
 residual_mu = 0
 arrival_lookback = 60
 fill_rule = "bucket_vwap_capped"
+terminal_rule = "terminal_settlement"
+terminal_surcharge_bps = 25

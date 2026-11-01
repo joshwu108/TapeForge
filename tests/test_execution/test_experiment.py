@@ -108,17 +108,20 @@ def test_archive_source_needs_a_known_market_and_synthetic_source_needs_days() -
 def test_load_config_reads_toml_and_names_syntax_errors(tmp_path: Path) -> None:
     path = tmp_path / "exp.toml"
     path.write_text(
-        'schema = "tapeforge.execution.experiment-config/1"\nname = "t"\nlabel = "smoke"\n'
+        'schema = "tapeforge.execution.experiment-config/2"\nname = "t"\nlabel = "smoke"\n'
         "[data]\nsource = \"synthetic\"\nmarket = \"synthetic\"\n[data.synthetic]\n"
         "n_buckets = 100\ndays = [{ date = \"2024-01-01\", seed = 1 }, "
         "{ date = \"2024-01-02\", seed = 2 }]\n"
         "[split]\ntrain = [\"2024-01-01\"]\nvalidation = [\"2024-01-02\"]\n"
         "[episodes]\nseeds = [3]\nepisodes_per_day = 2\n[policies]\nnames = [\"twap\"]\n"
         "[template]\nhorizon_buckets = 5\narrival_lookback = 2\n"
+        'terminal_rule = "terminal_settlement"\nterminal_surcharge_bps = 25\n'
     )
     config = load_config(path)
     assert config.seeds == (3,) and config.rho_choices_bps == (200, 500, 1000)
     assert config.evaluate_roles == ("train", "validation")
+    assert config.template.terminal_rule == "terminal_settlement"
+    assert config.template.terminal_surcharge_bps == 25
     path.write_text("name = [un终\n")
     with pytest.raises(ConfigError, match="not valid TOML"):
         load_config(path)
@@ -134,6 +137,34 @@ def test_episode_identifiers_round_trip() -> None:
 
 
 # --- running --------------------------------------------------------------------------
+
+
+def test_the_terminal_rule_is_named_explicitly_and_legacy_schemas_are_refused() -> None:
+    """No configuration default decides which terminal rule produced a run's numbers."""
+    without_rule = synthetic_mapping(template={"horizon_buckets": 12, "arrival_lookback": 4})
+    with pytest.raises(ConfigError, match="missing required key template.terminal_rule"):
+        config_from_mapping(without_rule)
+    without_surcharge = synthetic_mapping(
+        template={"horizon_buckets": 12, "arrival_lookback": 4,
+                  "terminal_rule": "terminal_settlement"}
+    )
+    with pytest.raises(ConfigError, match="template.terminal_surcharge_bps"):
+        config_from_mapping(without_surcharge)
+    mixed = synthetic_mapping(
+        template={"horizon_buckets": 12, "arrival_lookback": 4, "residual_mu": 5,
+                  "terminal_rule": "terminal_settlement", "terminal_surcharge_bps": 0}
+    )
+    with pytest.raises(ConfigError, match="residual_mu 5 is a parameter of the legacy"):
+        config_from_mapping(mixed)
+    legacy = synthetic_mapping(
+        template={"horizon_buckets": 12, "arrival_lookback": 4, "residual_mu": 5,
+                  "terminal_rule": "residual_perold"}
+    )
+    assert config_from_mapping(legacy).template.residual_mu == 5
+    old_schema = synthetic_mapping(schema="tapeforge.execution.experiment-config/1")
+    with pytest.raises(ConfigError, match="predates the terminal rule"):
+        config_from_mapping(old_schema)
+    assert "tapeforge.execution.experiment-config/1" in experiment.LEGACY_CONFIG_SCHEMAS
 
 
 @pytest.fixture(scope="module")
@@ -236,7 +267,8 @@ def test_incompatible_data_is_rejected_before_anything_is_written(tmp_path: Path
     missing_seed["data"]["synthetic"]["days"] = missing_seed["data"]["synthetic"]["days"][:2]
     with pytest.raises(ConfigError, match="no entry in data.synthetic.days"):
         run_experiment(config_from_mapping(missing_seed), output_dir=tmp_path)
-    too_short = synthetic_config(template={"horizon_buckets": 200, "arrival_lookback": 4})
+    too_short = synthetic_config(template={"horizon_buckets": 200, "arrival_lookback": 4,
+                                           "terminal_rule": "residual_perold"})
     with pytest.raises(ValueError, match="no admissible episode start"):
         run_experiment(too_short, output_dir=tmp_path)
     out_of_order = synthetic_config(split={"train": [DATES[2]], "validation": [DATES[0], DATES[1]]})
@@ -281,10 +313,20 @@ def test_compare_reports_data_and_schema_differences(tmp_path: Path, run_dir: Pa
     write_json_atomic(other / "manifest.json", manifest)
     with pytest.raises(ValueError, match="this code reads"):
         load_manifest(other)
+    # A legacy manifest is refused with the migration hint; an unknown simulator version too.
+    manifest["schema"] = "tapeforge.execution.experiment/1"
+    write_json_atomic(other / "manifest.json", manifest)
+    with pytest.raises(ValueError, match="predates the terminal rule"):
+        load_manifest(other)
+    manifest["schema"] = EXPERIMENT_MANIFEST_SCHEMA
+    manifest["simulator"]["version"] = "tapeforge.execution.simulator/1"
+    write_json_atomic(other / "manifest.json", manifest)
+    with pytest.raises(ValueError, match="never reinterpreted"):
+        load_manifest(other)
 
 
 TOML = """
-schema = "tapeforge.execution.experiment-config/1"
+schema = "tapeforge.execution.experiment-config/2"
 name = "cli-check"
 label = "smoke"
 
@@ -310,6 +352,8 @@ names = ["twap", "immediate"]
 [template]
 horizon_buckets = 10
 arrival_lookback = 3
+terminal_rule = "terminal_settlement"
+terminal_surcharge_bps = 10
 """
 
 

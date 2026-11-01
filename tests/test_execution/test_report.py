@@ -27,63 +27,105 @@ from tapeforge.execution.report import (
     group_statistics,
     load_records,
     paired_differences,
+    settlement_label,
     write_report,
 )
 from test_execution.configs import DATES, synthetic_config
 
 
 def _row(policy: str, episode_id: str, date: str, outcome: str, shortfall: int,
-         terminal: int = 0, target: int = 1_000, arrival: int = 10_000) -> EpisodeRow:
-    """Build a row whose shortfall in bps is ``shortfall / (arrival * target) * 1e4``."""
+         terminal: int = 0, target: int = 1_000, arrival: int = 10_000,
+         risk: int = 0) -> EpisodeRow:
+    """Build a row whose shortfall in bps is ``shortfall / (arrival * target) * 1e4``.
+
+    A ``completed`` row filled everything; ``settled`` filled half and settled
+    the other half (fee 40 of the 100 total); ``incomplete`` filled half under
+    the legacy rule; ``truncated`` filled half and settled nothing.
+    """
     role, seed, index = episode_id.split("/")
+    filled = target if outcome == "completed" else target // 2
+    settled = target - filled if outcome == "settled" else 0
+    settlement_fee = 40 if settled else 0
     return EpisodeRow(
         policy=policy, role=role, held_out=False, episode_id=episode_id, seed=int(seed[1:]),
         index=int(index[1:]), date=date, side=1, rho_bps=500, target_qty_ticks=target,
-        arrival_price_ticks=arrival, outcome=outcome, n_steps=3,
-        filled_qty_ticks=target if outcome == "completed" else target // 2,
-        residual_qty_ticks=0 if outcome == "completed" else target - target // 2,
-        fees_ticks=100, shortfall_ticks=shortfall,
+        arrival_price_ticks=arrival, terminal_rule="terminal_settlement",
+        terminal_surcharge_bps=25, outcome=outcome,
+        completed_by_fills=outcome == "completed", completed=outcome in ("completed", "settled"),
+        n_steps=3, filled_qty_ticks=filled, settled_qty_ticks=settled,
+        residual_qty_ticks=target - filled - settled, filled_fraction=filled / target,
+        settlement_fraction=settled / target, fill_fees_ticks=100 - settlement_fee,
+        settlement_fees_ticks=settlement_fee, fees_ticks=100, shortfall_ticks=shortfall,
         shortfall_bps=shortfall * 10_000 / (arrival * target),
         fill_shortfall_ticks=shortfall - terminal, terminal_component_ticks=terminal,
-        terminal_price_ticks=10_010 if terminal else 0, n_capped_steps=1, risk_sum_ticks=0,
-        reward_sum_ticks=-shortfall,
+        terminal_price_ticks=10_010 if terminal else 0,
+        settlement_price_ticks=10_036 if settled else 0, settlement_exceeds_cap=False,
+        n_capped_steps=1, risk_sum_ticks=risk, reward_sum_ticks=-shortfall - risk,
     )
 
 
 # --- hand-calculated statistics -------------------------------------------------------
 
 
-def test_group_statistics_keep_the_three_outcome_classes_apart() -> None:
+def test_group_statistics_keep_the_four_outcome_classes_apart() -> None:
     # Arrival notional 10,000 x 1,000 = 1e7 cash ticks, so 1,000 ticks = 1 bps.
     rows = [
-        _row("twap", "train/s1/i0", DATES[0], "completed", 2_000),
+        _row("twap", "train/s1/i0", DATES[0], "completed", 2_000, risk=500),
         _row("twap", "train/s1/i1", DATES[0], "completed", 4_000),
-        _row("twap", "train/s1/i2", DATES[1], "incomplete", 9_000, terminal=3_000),
-        _row("twap", "train/s1/i3", DATES[1], "truncated", 1_000),
+        _row("twap", "train/s1/i2", DATES[1], "settled", 9_000, terminal=3_000),
+        _row("twap", "train/s1/i3", DATES[1], "incomplete", 6_000, terminal=1_000),
+        _row("twap", "train/s1/i4", DATES[1], "truncated", 1_000),
     ]
     stats = group_statistics(rows)
-    assert (stats["n_episodes"], stats["n_completed"], stats["n_incomplete"],
-            stats["n_truncated"]) == (4, 2, 1, 1)
-    assert stats["completion_rate"] == 0.5 and stats["truncation_rate"] == 0.25
+    assert (stats["n_episodes"], stats["n_completed"], stats["n_settled"], stats["n_incomplete"],
+            stats["n_truncated"]) == (5, 2, 1, 1, 1)
+    # Completion by fills (2 of 5) and final completion (3 of 5: the settled one counts).
+    assert stats["completion_by_fills_rate"] == 0.4 and stats["final_completion_rate"] == 0.6
+    assert stats["truncation_rate"] == 0.2
     assert stats["n_days"] == 2 and stats["mean_steps"] == 3.0 and stats["mean_capped_steps"] == 1.0
     terminated = stats["terminated"]
-    assert terminated["n"] == 3 and terminated["total_shortfall_ticks"] == 15_000
-    assert terminated["mean_shortfall_bps"] == pytest.approx(5.0)   # (2 + 4 + 9) / 3.
-    assert terminated["median_shortfall_bps"] == 4.0                # Nearest rank of 3 values.
+    assert terminated["n"] == 4 and terminated["total_shortfall_ticks"] == 21_000
+    assert terminated["mean_shortfall_bps"] == pytest.approx(5.25)   # (2 + 4 + 9 + 6) / 4.
+    assert terminated["median_shortfall_bps"] == 4.0                 # Nearest rank of 4 values.
     assert terminated["p95_shortfall_bps"] == terminated["max_shortfall_bps"] == 9.0
-    assert terminated["mean_terminal_component_bps"] == pytest.approx(1.0)   # 3,000 / 3 rows.
-    assert terminated["mean_reward_bps"] == pytest.approx(-5.0)
+    assert terminated["mean_terminal_component_bps"] == pytest.approx(1.0)   # 4,000 / 4 rows.
+    assert terminated["total_terminal_component_ticks"] == 4_000
+    assert terminated["mean_fill_shortfall_bps"] == pytest.approx(4.25)       # 17,000 / 4.
+    assert terminated["mean_reward_bps"] == pytest.approx(-(21_000 + 500) / 4 / 1_000)
     assert terminated["mean_shortfall_bps_uncertainty"]["status"] == "insufficient_days"
     assert stats["completed"] == {"n": 2, "mean_shortfall_bps": 3.0, "median_shortfall_bps": 2.0}
+    assert stats["settled"] == {"n": 1, "mean_shortfall_bps": 9.0, "mean_settlement_fraction": 0.5,
+                                "mean_settlement_cost_bps": 3.0}
     assert stats["truncated"]["n"] == 1 and stats["truncated"]["mean_fill_shortfall_bps"] == 1.0
     assert stats["truncated"]["mean_filled_fraction"] == 0.5
-    assert stats["mean_residual_fraction"] == pytest.approx((0 + 0 + 0.5 + 0.5) / 4)
-    assert stats["total_fees_ticks"] == 400 and stats["mean_fees_bps"] == pytest.approx(0.1)
+    assert stats["mean_filled_fraction"] == pytest.approx((1 + 1 + 0.5 + 0.5 + 0.5) / 5)
+    assert stats["mean_settlement_fraction"] == pytest.approx(0.5 / 5)
+    assert stats["mean_residual_fraction"] == pytest.approx((0 + 0 + 0 + 0.5 + 0.5) / 5)
+    assert stats["settlement_label"] == "heavy"   # 0.10 of the target on average.
+    assert stats["n_settlements_exceeding_cap"] == 0
+    assert stats["total_fees_ticks"] == 500 and stats["mean_fees_bps"] == pytest.approx(0.1)
+    assert stats["total_fill_fees_ticks"] == 460 and stats["total_settlement_fees_ticks"] == 40
+    assert stats["mean_settlement_fees_bps"] == pytest.approx(0.04 / 5)
+    assert stats["total_risk_ticks"] == 500 and stats["mean_risk_bps"] == pytest.approx(0.1)
+    # Six completed rows and one half-settled row average 0.5 / 7 < 0.10 of the target: light.
+    light = group_statistics(
+        [_row("twap", f"train/s1/i{i}", DATES[0], "completed", 2_000) for i in range(6)]
+        + [rows[2]]
+    )
+    assert light["settlement_label"] == "light" and light["n_settled"] == 1
+    assert group_statistics(rows[:2])["settlement_label"] == "none"
+
+
+def test_settlement_label_thresholds() -> None:
+    assert settlement_label(None, 0) == "none" and settlement_label(0.0, 0) == "none"
+    assert settlement_label(0.05, 3) == "light"
+    assert settlement_label(0.10, 1) == "heavy" and settlement_label(0.9, 1) == "heavy"
 
 
 def test_group_statistics_of_an_empty_group_are_none_not_zero() -> None:
     stats = group_statistics([])
-    assert stats["n_episodes"] == 0 and stats["completion_rate"] is None
+    assert stats["n_episodes"] == 0 and stats["completion_by_fills_rate"] is None
+    assert stats["final_completion_rate"] is None and stats["settlement_label"] == "none"
     assert stats["terminated"]["mean_shortfall_bps"] is None
     assert stats["terminated"]["median_shortfall_bps"] is None
 
@@ -93,7 +135,7 @@ def test_paired_differences_are_taken_on_identical_episode_ids_only() -> None:
         _row("twap", "train/s1/i0", DATES[0], "completed", 2_000),
         _row("twap", "train/s1/i1", DATES[0], "completed", 4_000),
         _row("twap", "train/s1/i2", DATES[1], "truncated", 1_000),
-        _row("twap", "train/s1/i3", DATES[1], "incomplete", 6_000, terminal=1_000),
+        _row("twap", "train/s1/i3", DATES[1], "settled", 6_000, terminal=1_000),
         _row("immediate", "train/s1/i0", DATES[0], "completed", 5_000),   # +3 bps.
         _row("immediate", "train/s1/i1", DATES[0], "completed", 3_000),   # -1 bps.
         _row("immediate", "train/s1/i2", DATES[1], "completed", 2_000),   # Reference truncated.
@@ -102,7 +144,8 @@ def test_paired_differences_are_taken_on_identical_episode_ids_only() -> None:
     (paired,) = paired_differences(rows, "twap")
     assert paired["policy"] == "immediate" and paired["reference"] == "twap"
     assert paired["n_pairs"] == 3 and paired["n_excluded_truncated"] == 1
-    assert paired["n_missing"] == 0 and paired["n_both_completed"] == 2
+    assert paired["n_missing"] == 0 and paired["n_both_completed_by_fills"] == 2
+    assert paired["n_either_settled"] == 1
     assert paired["mean_diff_bps"] == pytest.approx((3 - 1 + 0) / 3)
     assert paired["median_diff_bps"] == 0.0 and paired["total_diff_ticks"] == 2_000
     assert paired["fraction_policy_cheaper"] == pytest.approx(1 / 3)
@@ -151,8 +194,18 @@ def test_report_metrics_are_reconstructed_from_the_records_by_a_plain_loop(run_d
         ]
         assert group["n_episodes"] == len(episodes)
         terminated = [e["summary"] for e in episodes if not e["summary"]["truncated"]]
-        completed = [s for s in terminated if s["completed"]]
-        assert group["n_completed"] == len(completed)
+        completed = [s for s in terminated if s["completed_by_fills"]]
+        settled = [s for s in terminated if s["settled_qty_ticks"] and not s["completed_by_fills"]]
+        assert group["n_completed"] == len(completed) and group["n_settled"] == len(settled)
+        assert group["final_completion_rate"] == pytest.approx(
+            sum(e["summary"]["completed"] for e in episodes) / len(episodes)
+        )
+        assert group["mean_settlement_fraction"] == pytest.approx(
+            sum(e["summary"]["settlement_fraction"] for e in episodes) / len(episodes)
+        )
+        assert group["total_settlement_fees_ticks"] == sum(
+            e["summary"]["settlement_fees_ticks"] for e in episodes
+        )
         assert group["n_truncated"] == sum(e["summary"]["truncated"] for e in episodes)
         bps = sorted(s["shortfall_bps"] for s in terminated)
         assert group["terminated"]["mean_shortfall_bps"] == pytest.approx(sum(bps) / len(bps))
@@ -222,9 +275,11 @@ def test_write_report_exports_json_csv_and_valid_rst(run_dir: Path, tmp_path: Pa
     with paths["policies"].open() as handle:
         policies = list(csv.DictReader(handle))
     assert {p["policy"] for p in policies} == {"twap", "immediate", "cap_aware_twap"}
-    assert "terminated.mean_shortfall_bps" in policies[0]
+    assert "terminated.mean_shortfall_bps" in policies[0] and "settlement_label" in policies[0]
     text = paths["rst"].read_text()
     assert "Smoke run" in text and "insufficient" in text and "Paired differences" in text
+    assert "terminal_settlement" in text and "settlement frac" in text
+    assert "completed by fills" in text and "either settled" in text
     assert not any(line != line.rstrip() for line in text.splitlines())
     problems: list[str] = []
 
@@ -238,6 +293,22 @@ def test_write_report_exports_json_csv_and_valid_rst(run_dir: Path, tmp_path: Pa
     )
     assert not problems, "".join(problems)
     assert not list((tmp_path / "report").glob("*.tmp"))
+
+
+def test_diagnostic_and_settlement_heavy_policies_are_labelled(tmp_path: Path) -> None:
+    config = synthetic_config(policies={"names": ["twap", "zero_action"]})
+    run_dir = run_experiment(config, output_dir=tmp_path)
+    report = build_report(run_dir)
+    zero = [g for g in report["per_policy"] if g["policy"] == "zero_action"]
+    assert zero and all(g["diagnostic"] and g["settlement_label"] == "heavy" for g in zero)
+    assert all(g["mean_settlement_fraction"] == 1.0 and g["completion_by_fills_rate"] == 0.0
+               and g["final_completion_rate"] == 1.0 for g in zero)
+    assert all(not g["diagnostic"] for g in report["per_policy"] if g["policy"] == "twap")
+    text = report_module.render_rst(report)
+    assert "zero_action (diagnostic)" in text and "Diagnostic policies" in text
+    assert "Settlement-heavy" in text and "``zero_action`` (train)" in text
+    (paired,) = [p for p in report["paired"] if p["role"] == "train"]
+    assert paired["policy"] == "zero_action" and paired["n_either_settled"] >= 1
 
 
 def test_cli_writes_the_report_under_the_run_directory(

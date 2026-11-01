@@ -5,21 +5,30 @@ produces per-policy, per-day and paired statistics; ``write_report`` exports
 them as JSON (``REPORT_SCHEMA``), CSV tables and a readable RST page.
 
 Outcome classes (never mixed in one statistic):
-    * ``completed``: terminated with no residual; shortfall is fills plus
-      fees.
-    * ``incomplete``: terminated at the horizon with residual inventory;
-      shortfall adds the residual term (Perold opportunity cost at the
-      terminal mark plus ``residual_mu`` per residual tick) under the
-      configured ``residual_mu``.
+    * ``completed``: the ordinary fills reached the target; shortfall is
+      fills plus fees.
+    * ``settled``: terminated at the horizon with quantity left and the
+      ``terminal_settlement`` rule settled it; the target was reached, but
+      through the synthetic boundary condition, and the shortfall adds the
+      settlement cost (surcharge, fee and price move against arrival).
+    * ``incomplete``: terminated at the horizon with residual inventory
+      under the legacy ``residual_perold`` rule; shortfall adds the
+      residual term (Perold opportunity cost at the terminal mark plus
+      ``residual_mu`` per residual tick).
     * ``truncated``: the tape ran out; the record carries the shortfall of
       the fills alone, which is a different quantity, so truncated episodes
       are counted and described separately and excluded from the shortfall
       statistics and from pairing.
 
-    The "terminated" statistics pool completed and incomplete episodes, which
-    share one definition (implementation shortfall including the residual
-    term); the completed-only statistics are shown beside them so the
-    residual term's share is visible.
+    The "terminated" statistics pool completed, settled and incomplete
+    episodes, which share one definition (implementation shortfall including
+    the terminal term); the completed-only statistics are shown beside them
+    so the terminal term's share is visible. Completion is reported twice,
+    by ordinary fills and finally, with the mean settlement fraction and a
+    ``settlement_label`` (``"heavy"`` from ``SETTLEMENT_HEAVY_FRACTION`` of
+    the target on average) so a 100 % final completion rate cannot hide
+    reliance on the settlement. Diagnostic policies (``zero_action``) are
+    flagged as such.
 
 Paired differences:
     Every policy of a run replays the same episode identifiers, so a policy
@@ -61,6 +70,7 @@ from typing import Any, Final
 
 import numpy as np
 
+from tapeforge.execution.baselines import DIAGNOSTIC_POLICIES
 from tapeforge.execution.experiment import (
     EXPERIMENT_MANIFEST_SCHEMA,
     load_manifest,
@@ -71,6 +81,7 @@ from tapeforge.execution.runner import RUN_RECORD_SCHEMA, nearest_rank_percentil
 __all__ = [
     "MIN_DAYS_FOR_UNCERTAINTY",
     "REPORT_SCHEMA",
+    "SETTLEMENT_HEAVY_FRACTION",
     "EpisodeRow",
     "build_report",
     "day_cluster_bootstrap",
@@ -78,23 +89,32 @@ __all__ = [
     "group_statistics",
     "load_records",
     "paired_differences",
+    "policies_in_order",
+    "settlement_label",
     "write_report",
 ]
 
-REPORT_SCHEMA: Final[str] = "tapeforge.execution.report/1"
+REPORT_SCHEMA: Final[str] = "tapeforge.execution.report/2"
 MIN_DAYS_FOR_UNCERTAINTY: Final[int] = 5   # Distinct days needed before an interval is shown.
+# A policy whose episodes reach, on average, at least this fraction of the
+# target through the terminal settlement is labelled settlement-heavy. A
+# reporting convention so the reliance is named, not a research threshold.
+SETTLEMENT_HEAVY_FRACTION: Final[float] = 0.10
 BOOTSTRAP_RESAMPLES: Final[int] = 2_000
 BOOTSTRAP_SEED: Final[int] = 0
 REPORT_SUBDIR: Final[str] = "report"
 
-OUTCOMES: Final[tuple[str, ...]] = ("completed", "incomplete", "truncated")
+OUTCOMES: Final[tuple[str, ...]] = ("completed", "settled", "incomplete", "truncated")
 
 # Columns of episodes.csv, in order.
 EPISODE_COLUMNS: Final[tuple[str, ...]] = (
     "policy", "role", "held_out", "episode_id", "seed", "index", "date", "side", "rho_bps",
-    "target_qty_ticks", "arrival_price_ticks", "outcome", "n_steps", "filled_qty_ticks",
-    "residual_qty_ticks", "fees_ticks", "shortfall_ticks", "shortfall_bps",
-    "fill_shortfall_ticks", "terminal_component_ticks", "terminal_price_ticks",
+    "target_qty_ticks", "arrival_price_ticks", "terminal_rule", "terminal_surcharge_bps",
+    "outcome", "completed_by_fills", "completed", "n_steps", "filled_qty_ticks",
+    "settled_qty_ticks", "residual_qty_ticks", "filled_fraction", "settlement_fraction",
+    "fill_fees_ticks", "settlement_fees_ticks", "fees_ticks", "shortfall_ticks",
+    "shortfall_bps", "fill_shortfall_ticks", "terminal_component_ticks",
+    "terminal_price_ticks", "settlement_price_ticks", "settlement_exceeds_cap",
     "n_capped_steps", "risk_sum_ticks", "reward_sum_ticks",
 )
 
@@ -115,16 +135,29 @@ class EpisodeRow:
         rho_bps: Target fraction drawn.
         target_qty_ticks: Target in quantity ticks.
         arrival_price_ticks: Arrival price.
+        terminal_rule: Terminal rule the episode ran under.
+        terminal_surcharge_bps: Settlement surcharge of the spec.
         outcome: One of ``OUTCOMES``.
+        completed_by_fills: The ordinary fills reached the target.
+        completed: The target was reached by the end (fills or settlement).
         n_steps: Decisions taken.
-        filled_qty_ticks: Filled quantity.
-        residual_qty_ticks: Unfilled quantity.
-        fees_ticks: Fees paid, cash ticks.
+        filled_qty_ticks: Quantity of ordinary fills.
+        settled_qty_ticks: Quantity settled at the horizon.
+        residual_qty_ticks: Quantity neither filled nor settled.
+        filled_fraction: ``filled / target``.
+        settlement_fraction: ``settled / target``.
+        fill_fees_ticks: Fees of ordinary fills, cash ticks.
+        settlement_fees_ticks: Fee of the settlement, cash ticks.
+        fees_ticks: Total fees, cash ticks.
         shortfall_ticks: Shortfall as the record defines it for the outcome.
         shortfall_bps: The same in basis points of the arrival notional.
-        fill_shortfall_ticks: Shortfall of the fills alone (no residual term).
-        terminal_component_ticks: Residual term charged, cash ticks.
+        fill_shortfall_ticks: Shortfall of the fills alone (no terminal term).
+        terminal_component_ticks: Terminal term charged (settlement cost or
+            legacy residual term), cash ticks.
         terminal_price_ticks: Terminal mark used, 0 when none.
+        settlement_price_ticks: Settlement price, 0 when nothing settled.
+        settlement_exceeds_cap: The settlement exceeded the terminal bucket's
+            participation cap.
         n_capped_steps: Fills cut by the participation cap.
         risk_sum_ticks: Sum of the risk component.
         reward_sum_ticks: Sum of the per-step rewards.
@@ -141,23 +174,34 @@ class EpisodeRow:
     rho_bps: int
     target_qty_ticks: int
     arrival_price_ticks: int
+    terminal_rule: str
+    terminal_surcharge_bps: int
     outcome: str
+    completed_by_fills: bool
+    completed: bool
     n_steps: int
     filled_qty_ticks: int
+    settled_qty_ticks: int
     residual_qty_ticks: int
+    filled_fraction: float
+    settlement_fraction: float
+    fill_fees_ticks: int
+    settlement_fees_ticks: int
     fees_ticks: int
     shortfall_ticks: int
     shortfall_bps: float
     fill_shortfall_ticks: int
     terminal_component_ticks: int
     terminal_price_ticks: int
+    settlement_price_ticks: int
+    settlement_exceeds_cap: bool
     n_capped_steps: int
     risk_sum_ticks: int
     reward_sum_ticks: int
 
     @property
     def terminated(self) -> bool:
-        """Return whether the episode ended by completion or at the horizon."""
+        """Return whether the episode ended by completion, settlement or at the horizon."""
         return self.outcome != "truncated"
 
 
@@ -186,10 +230,26 @@ def load_records(run_dir: str | Path, include_test: bool = False) -> list[dict[s
 
 
 def _outcome(summary: Mapping[str, Any]) -> str:
-    """Classify a record's episode summary."""
+    """Classify a record's episode summary into one of ``OUTCOMES``."""
     if summary["truncated"]:
         return "truncated"
-    return "completed" if summary["completed"] else "incomplete"
+    if summary["completed_by_fills"]:
+        return "completed"
+    return "settled" if summary["settled_qty_ticks"] else "incomplete"
+
+
+def policies_in_order(manifest: Mapping[str, Any]) -> list[str]:
+    """Return the distinct policy names of a manifest's run entries, in first-appearance order.
+
+    The configured baselines come first (the experiment writes them in
+    configuration order); records added later by ``evaluation`` follow, so
+    an externally evaluated policy pairs against the same reference.
+    """
+    seen: list[str] = []
+    for entry in manifest["runs"]:
+        if entry["policy"] not in seen:
+            seen.append(entry["policy"])
+    return seen
 
 
 def episode_rows(records: Iterable[Mapping[str, Any]]) -> list[EpisodeRow]:
@@ -215,17 +275,27 @@ def episode_rows(records: Iterable[Mapping[str, Any]]) -> list[EpisodeRow]:
                     rho_bps=int(draw["rho_bps"]),
                     target_qty_ticks=int(summary["target_qty_ticks"]),
                     arrival_price_ticks=int(summary["arrival_price_ticks"]),
+                    terminal_rule=str(summary["terminal_rule"]),
+                    terminal_surcharge_bps=int(summary["terminal_surcharge_bps"]),
                     outcome=_outcome(summary),
+                    completed_by_fills=bool(summary["completed_by_fills"]),
+                    completed=bool(summary["completed"]),
                     n_steps=int(summary["n_steps"]),
                     filled_qty_ticks=int(summary["filled_qty_ticks"]),
+                    settled_qty_ticks=int(summary["settled_qty_ticks"]),
                     residual_qty_ticks=int(summary["residual_qty_ticks"]),
+                    filled_fraction=float(summary["filled_fraction"]),
+                    settlement_fraction=float(summary["settlement_fraction"]),
+                    fill_fees_ticks=int(summary["fill_fees_ticks"]),
+                    settlement_fees_ticks=int(summary["settlement_fees_ticks"]),
                     fees_ticks=int(summary["fees_ticks"]),
                     shortfall_ticks=int(summary["shortfall_ticks"]),
                     shortfall_bps=float(summary["shortfall_bps"]),
-                    fill_shortfall_ticks=int(summary["shortfall_ticks"])
-                    - int(summary["terminal_component_ticks"]),
+                    fill_shortfall_ticks=int(summary["fill_shortfall_ticks"]),
                     terminal_component_ticks=int(summary["terminal_component_ticks"]),
                     terminal_price_ticks=int(summary["terminal_price_ticks"]),
+                    settlement_price_ticks=int(summary["settlement_price_ticks"]),
+                    settlement_exceeds_cap=bool(summary["settlement_exceeds_cap"]),
                     n_capped_steps=int(summary["n_capped_steps"]),
                     risk_sum_ticks=int(summary["risk_sum_ticks"]),
                     reward_sum_ticks=int(summary["reward_sum_ticks"]),
@@ -287,6 +357,18 @@ def day_cluster_bootstrap(
     }
 
 
+def settlement_label(mean_settlement_fraction: float | None, n_settled: int) -> str:
+    """Return ``"none"``, ``"light"`` or ``"heavy"`` for a group's reliance on the settlement.
+
+    ``"none"`` when no episode settled anything, ``"heavy"`` when the mean
+    settled fraction of the target is at least ``SETTLEMENT_HEAVY_FRACTION``,
+    ``"light"`` otherwise.
+    """
+    if not n_settled or mean_settlement_fraction is None:
+        return "none"
+    return "heavy" if mean_settlement_fraction >= SETTLEMENT_HEAVY_FRACTION else "light"
+
+
 def group_statistics(
     rows: Sequence[EpisodeRow], min_days: int = MIN_DAYS_FOR_UNCERTAINTY
 ) -> dict[str, Any]:
@@ -298,24 +380,43 @@ def group_statistics(
     """
     terminated = [r for r in rows if r.terminated]
     completed = [r for r in rows if r.outcome == "completed"]
+    settled = [r for r in rows if r.outcome == "settled"]
     truncated = [r for r in rows if r.outcome == "truncated"]
     bps = [r.shortfall_bps for r in terminated]
+    n_settled_any = sum(1 for r in rows if r.settled_qty_ticks)
+    mean_settlement_fraction = _mean([r.settlement_fraction for r in rows])
     out: dict[str, Any] = {
         "n_episodes": len(rows),
         "n_completed": len(completed),
+        "n_settled": len(settled),
         "n_incomplete": sum(1 for r in rows if r.outcome == "incomplete"),
         "n_truncated": len(truncated),
-        "completion_rate": len(completed) / len(rows) if rows else None,
+        # Completion by ordinary fills and final completion (fills or settlement) are
+        # different claims; both are shown, never one for the other.
+        "completion_by_fills_rate": len(completed) / len(rows) if rows else None,
+        "final_completion_rate": (
+            sum(1 for r in rows if r.completed) / len(rows) if rows else None
+        ),
         "truncation_rate": len(truncated) / len(rows) if rows else None,
         "n_days": len({r.date for r in rows}),
         "mean_steps": _mean([r.n_steps for r in rows]),
         "mean_capped_steps": _mean([r.n_capped_steps for r in rows]),
+        "mean_filled_fraction": _mean([r.filled_fraction for r in rows]),
+        "mean_settlement_fraction": mean_settlement_fraction,
         "mean_residual_fraction": _mean(
             [r.residual_qty_ticks / r.target_qty_ticks for r in rows]
         ),
+        "settlement_label": settlement_label(mean_settlement_fraction, n_settled_any),
+        "n_settlements_exceeding_cap": sum(1 for r in rows if r.settlement_exceeds_cap),
+        "total_fill_fees_ticks": sum(r.fill_fees_ticks for r in rows),
+        "total_settlement_fees_ticks": sum(r.settlement_fees_ticks for r in rows),
         "total_fees_ticks": sum(r.fees_ticks for r in rows),
+        "mean_fill_fees_bps": _mean([_bps(r.fill_fees_ticks, r) for r in rows]),
+        "mean_settlement_fees_bps": _mean([_bps(r.settlement_fees_ticks, r) for r in rows]),
         "mean_fees_bps": _mean([_bps(r.fees_ticks, r) for r in rows]),
-        # Terminated episodes: one shortfall definition (residual term included).
+        "total_risk_ticks": sum(r.risk_sum_ticks for r in rows),
+        "mean_risk_bps": _mean([_bps(r.risk_sum_ticks, r) for r in rows]),
+        # Terminated episodes: one shortfall definition (terminal term included).
         "terminated": {
             "n": len(terminated),
             "total_shortfall_ticks": sum(r.shortfall_ticks for r in terminated),
@@ -325,9 +426,13 @@ def group_statistics(
             "p95_shortfall_bps": nearest_rank_percentile(bps, 95) if bps else None,
             "p99_shortfall_bps": nearest_rank_percentile(bps, 99) if bps else None,
             "max_shortfall_bps": max(bps) if bps else None,
+            "mean_fill_shortfall_bps": _mean(
+                [_bps(r.fill_shortfall_ticks, r) for r in terminated]
+            ),
             "mean_terminal_component_bps": _mean(
                 [_bps(r.terminal_component_ticks, r) for r in terminated]
             ),
+            "total_terminal_component_ticks": sum(r.terminal_component_ticks for r in terminated),
             "mean_reward_bps": _mean([_bps(r.reward_sum_ticks, r) for r in terminated]),
             "mean_shortfall_bps_uncertainty": day_cluster_bootstrap(
                 _by_day(terminated, lambda r: r.shortfall_bps), min_days=min_days
@@ -339,6 +444,15 @@ def group_statistics(
             "median_shortfall_bps": (
                 nearest_rank_percentile([r.shortfall_bps for r in completed], 50)
                 if completed else None
+            ),
+        },
+        # Settled episodes: the target was reached through the boundary condition.
+        "settled": {
+            "n": len(settled),
+            "mean_shortfall_bps": _mean([r.shortfall_bps for r in settled]),
+            "mean_settlement_fraction": _mean([r.settlement_fraction for r in settled]),
+            "mean_settlement_cost_bps": _mean(
+                [_bps(r.terminal_component_ticks, r) for r in settled]
             ),
         },
         # Truncated episodes: fills-only shortfall, a different quantity.
@@ -425,8 +539,13 @@ def paired_differences(
                         sum(1 for d in diffs_ticks if d == 0) / len(diffs_ticks)
                         if diffs_ticks else None
                     ),
-                    "n_both_completed": sum(
+                    "n_both_completed_by_fills": sum(
                         1 for o, b in pairs if o.outcome == "completed" and b.outcome == "completed"
+                    ),
+                    # Pairs where at least one side reached the target only through the
+                    # settlement; their difference includes a boundary-condition cost.
+                    "n_either_settled": sum(
+                        1 for o, b in pairs if o.settled_qty_ticks or b.settled_qty_ticks
                     ),
                     "mean_diff_bps_uncertainty": day_cluster_bootstrap(by_day, min_days=min_days),
                 }
@@ -459,12 +578,13 @@ def build_report(
     manifest = load_manifest(run_dir)
     records = load_records(run_dir, include_test)
     rows = episode_rows(records)
-    policies = list(manifest["config"]["policies"])
+    policies = policies_in_order(manifest)
     reference = policies[0] if reference is None else reference
     roles = [r for r in manifest["roles_evaluated"] if include_test or r != "test"]
 
     per_policy = [
         {"policy": p, "role": role, "held_out": role == "test",
+         "diagnostic": p in DIAGNOSTIC_POLICIES,
          **group_statistics([r for r in rows if r.policy == p and r.role == role], min_days)}
         for role in roles for p in policies
     ]
@@ -496,6 +616,8 @@ def build_report(
             ],
             "seeds": manifest["config"]["seeds"],
             "episodes_per_day": manifest["config"]["episodes_per_day"],
+            "terminal_rule": template["terminal_rule"],
+            "terminal_surcharge_bps": template["terminal_surcharge_bps"],
             "residual_mu": template["residual_mu"],
             "risk_lambda": template["risk_lambda"],
             "fee_bps": template["fee_bps"],
@@ -509,15 +631,29 @@ def build_report(
         "definitions": {
             "shortfall_terminated": (
                 "implementation shortfall in cash ticks: side * (exec notional - arrival "
-                "price * filled) + fees + residual term; the residual term is side * "
-                "(terminal mark - arrival) * residual + residual_mu * residual, charged only "
-                "when the horizon ended with residual inventory"
+                "price * filled) + fill fees + terminal term. Under terminal_settlement the "
+                "terminal term is the settlement cost side * (settlement notional - arrival "
+                "price * settled) + settlement fee, with the settlement price the terminal mark "
+                "moved against the side by terminal_surcharge_bps; under residual_perold it is "
+                "side * (terminal mark - arrival) * residual + residual_mu * residual. Charged "
+                "only when the horizon ended with quantity left"
             ),
             "shortfall_truncated": (
-                "fills-only shortfall (no residual term, no terminal mark); a different "
-                "quantity, reported separately and excluded from pairing"
+                "fills-only shortfall (nothing settled, no terminal term, no terminal mark); a "
+                "different quantity, reported separately and excluded from pairing"
             ),
             "shortfall_bps": "shortfall / (arrival price * target) * 10_000",
+            "completion": (
+                "completed = the ordinary fills reached the target; settled = the target was "
+                "reached only through the synthetic terminal settlement; final completion = "
+                "either. The settlement is a boundary condition of the task, not executable "
+                "liquidity, so settlement fraction and settlement cost are reported next to it"
+            ),
+            "settlement_label": (
+                f"heavy when the mean settled fraction of the target is >= "
+                f"{SETTLEMENT_HEAVY_FRACTION}, light when any episode settled, none otherwise; "
+                "a reporting convention"
+            ),
             "paired_difference": "policy shortfall minus reference shortfall on the same episode",
             "uncertainty": (
                 "95 % day-cluster bootstrap percentile interval of the pooled mean; absent "
@@ -604,9 +740,10 @@ def render_rst(report: Mapping[str, Any]) -> str:
     rev = exp["code_revision"]
     lines += [
         f"Created {exp['created_utc']}; commit {rev.get('commit')} (dirty: {rev.get('dirty')}); "
-        f"simulator {exp['simulator_version']}; fee {exp['fee_bps']} bps, participation cap "
-        f"{exp['participation_cap_bps']} bps, horizon {exp['horizon_buckets']} buckets, "
-        f"residual_mu {exp['residual_mu']}, risk_lambda {exp['risk_lambda']}; seeds "
+        f"simulator {exp['simulator_version']}; terminal rule ``{exp['terminal_rule']}``, "
+        f"surcharge {exp['terminal_surcharge_bps']} bps, residual_mu {exp['residual_mu']}; fee "
+        f"{exp['fee_bps']} bps, participation cap {exp['participation_cap_bps']} bps, horizon "
+        f"{exp['horizon_buckets']} buckets, risk_lambda {exp['risk_lambda']}; seeds "
         f"{exp['seeds']}, {exp['episodes_per_day']} episodes per day per seed.",
         "",
         "Held-out test records included: " + ("yes" if report["include_test"] else "no") + ".",
@@ -625,29 +762,59 @@ def render_rst(report: Mapping[str, Any]) -> str:
     ]
     for key, text in report["definitions"].items():
         lines.append(f"* ``{key}``: {text}")
-    if exp["residual_mu"] == 0:
+    if exp["terminal_rule"] == "terminal_settlement":
         lines += [
             "",
-            "``residual_mu`` is 0: an episode that ends with residual inventory pays only the "
-            "Perold opportunity cost, which averages near zero, and no completion penalty. "
-            "Mean shortfalls of policies with different completion rates are therefore not "
-            "comparable on their own; read them next to the completion rate, the residual "
-            "fraction and the completed-only mean. This is the documented inaction incentive "
-            "of the residual rule, not a defect of the report.",
+            "``terminal_settlement``: quantity left at the horizon is settled in one synthetic "
+            f"fill at the terminal mark moved {exp['terminal_surcharge_bps']} bps against the "
+            "side, with the ordinary fee. The surcharge is an experimental setting, not a "
+            "calibrated impact estimate, and the settlement ignores the participation cap, so "
+            "final completion is 100 % by construction unless the tape ran out. Read the mean "
+            "shortfall next to completion by fills, the settlement fraction and the settlement "
+            "cost; a settlement-heavy policy reached the target through the boundary "
+            "condition, not through execution.",
         ]
+    if exp["terminal_rule"] == "residual_perold" and exp["residual_mu"] == 0:
+        lines += [
+            "",
+            "``residual_perold`` with ``residual_mu`` 0: an episode that ends with residual "
+            "inventory pays only the Perold opportunity cost, which averages near zero, and no "
+            "completion penalty or fee on the residual. Mean shortfalls of policies with "
+            "different completion rates are therefore not comparable on their own; read them "
+            "next to the completion rate, the residual fraction and the completed-only mean. "
+            "This is the documented inaction incentive of the legacy residual rule, not a "
+            "defect of the report.",
+        ]
+    heavy = [f"``{g['policy']}`` ({g['role']})" for g in report["per_policy"]
+             if g["settlement_label"] == "heavy"]
+    diagnostic = sorted({g["policy"] for g in report["per_policy"] if g["diagnostic"]})
+    if heavy:
+        lines += ["", "Settlement-heavy (mean settled fraction >= "
+                  f"{SETTLEMENT_HEAVY_FRACTION}): " + ", ".join(heavy) + "."]
+    if diagnostic:
+        lines += ["", "Diagnostic policies (not strategies; they expose a reward-rule property): "
+                  + ", ".join(f"``{p}``" for p in diagnostic) + "."]
     lines += ["", "Per policy", "----------", ""]
     lines.append(
         rst_table(
-            ("policy", "role", "n", "completed", "incomplete", "truncated", "mean IS bps",
-             "median", "p95", "p99", "max", "completed-only mean", "truncated fills-only mean",
-             "mean steps", "mean capped", "residual frac", "95 % CI of mean"),
+            ("policy", "role", "n", "completed by fills", "settled", "incomplete", "truncated",
+             "final completion", "mean IS bps", "median", "p95", "p99", "max",
+             "fills-only IS bps", "terminal term bps", "settlement frac", "settlement label",
+             "fill fees bps", "settlement fees bps", "risk bps", "completed-only mean",
+             "truncated fills-only mean", "mean steps", "mean capped", "95 % CI of mean"),
             [
-                (g["policy"], g["role"], g["n_episodes"], g["n_completed"], g["n_incomplete"],
-                 g["n_truncated"], g["terminated"]["mean_shortfall_bps"],
+                (g["policy"] + (" (diagnostic)" if g["diagnostic"] else ""), g["role"],
+                 g["n_episodes"], g["n_completed"], g["n_settled"], g["n_incomplete"],
+                 g["n_truncated"], g["final_completion_rate"],
+                 g["terminated"]["mean_shortfall_bps"],
                  g["terminated"]["median_shortfall_bps"], g["terminated"]["p95_shortfall_bps"],
                  g["terminated"]["p99_shortfall_bps"], g["terminated"]["max_shortfall_bps"],
-                 g["completed"]["mean_shortfall_bps"], g["truncated"]["mean_fill_shortfall_bps"],
-                 g["mean_steps"], g["mean_capped_steps"], g["mean_residual_fraction"],
+                 g["terminated"]["mean_fill_shortfall_bps"],
+                 g["terminated"]["mean_terminal_component_bps"], g["mean_settlement_fraction"],
+                 g["settlement_label"], g["mean_fill_fees_bps"], g["mean_settlement_fees_bps"],
+                 g["mean_risk_bps"], g["completed"]["mean_shortfall_bps"],
+                 g["truncated"]["mean_fill_shortfall_bps"], g["mean_steps"],
+                 g["mean_capped_steps"],
                  _uncertainty_text(g["terminated"]["mean_shortfall_bps_uncertainty"]))
                 for g in report["per_policy"]
             ],
@@ -656,13 +823,15 @@ def render_rst(report: Mapping[str, Any]) -> str:
     lines += ["", "Per day", "-------", ""]
     lines.append(
         rst_table(
-            ("policy", "role", "date", "n", "completed", "truncated", "mean IS bps", "median",
-             "total IS ticks", "total fees ticks"),
+            ("policy", "role", "date", "n", "completed by fills", "settled", "truncated",
+             "mean IS bps", "median", "settlement frac", "total IS ticks", "total fees ticks",
+             "total settlement cost ticks", "total risk ticks"),
             [
                 (g["policy"], g["role"], g["date"], g["n_episodes"], g["n_completed"],
-                 g["n_truncated"], g["terminated"]["mean_shortfall_bps"],
-                 g["terminated"]["median_shortfall_bps"],
-                 g["terminated"]["total_shortfall_ticks"], g["total_fees_ticks"])
+                 g["n_settled"], g["n_truncated"], g["terminated"]["mean_shortfall_bps"],
+                 g["terminated"]["median_shortfall_bps"], g["mean_settlement_fraction"],
+                 g["terminated"]["total_shortfall_ticks"], g["total_fees_ticks"],
+                 g["terminated"]["total_terminal_component_ticks"], g["total_risk_ticks"])
                 for g in report["per_day"]
             ],
         )
@@ -672,12 +841,13 @@ def render_rst(report: Mapping[str, Any]) -> str:
     if report["paired"]:
         lines.append(
             rst_table(
-                ("policy", "role", "pairs", "excluded (truncated)", "mean diff bps",
-                 "median diff", "total diff ticks", "policy cheaper", "equal", "95 % CI of mean"),
+                ("policy", "role", "pairs", "excluded (truncated)", "either settled",
+                 "mean diff bps", "median diff", "total diff ticks", "policy cheaper", "equal",
+                 "95 % CI of mean"),
                 [
                     (p["policy"], p["role"], p["n_pairs"], p["n_excluded_truncated"],
-                     p["mean_diff_bps"], p["median_diff_bps"], p["total_diff_ticks"],
-                     p["fraction_policy_cheaper"], p["fraction_equal"],
+                     p["n_either_settled"], p["mean_diff_bps"], p["median_diff_bps"],
+                     p["total_diff_ticks"], p["fraction_policy_cheaper"], p["fraction_equal"],
                      _uncertainty_text(p["mean_diff_bps_uncertainty"]))
                     for p in report["paired"]
                 ],

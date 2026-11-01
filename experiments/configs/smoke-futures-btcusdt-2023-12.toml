@@ -3,10 +3,10 @@
 # validation day; no test dates. The label marks a demonstration: one validation
 # day gives no day-level uncertainty and supports no claim about any policy.
 # Research evaluation needs its own configuration with explicit research dates.
-schema = "tapeforge.execution.experiment-config/1"
+schema = "tapeforge.execution.experiment-config/2"
 name = "smoke-futures-btcusdt-2023-12"
 label = "smoke"
-description = "USD-M futures BTCUSDT 2023-12-01..03 (2 train, 1 validation); smoke only"
+description = "USD-M futures BTCUSDT 2023-12-01..03 (2 train, 1 validation); terminal settlement at 25 bps; smoke only"
 
 [data]
 source = "archive"
@@ -29,9 +29,12 @@ rho_choices_bps = [200, 500, 1000]
 evaluate_roles = ["train", "validation"]
 
 [policies]
-names = ["twap", "immediate", "cap_aware_twap"]
+names = ["twap", "immediate", "cap_aware_twap", "zero_action"]  # zero_action is a diagnostic
 
-# The accepted first configuration; the two swept coefficients stay at zero (off).
+# The accepted first configuration under the primary terminal rule. The surcharge
+# is one of the smoke sensitivity settings {0, 10, 25, 50} bps; none of them is a
+# calibrated impact estimate or a chosen research coefficient. risk_lambda stays at
+# zero (off); residual_mu is a legacy-rule parameter and must be 0 here.
 [template]
 horizon_buckets = 300
 participation_cap_bps = 1000
@@ -43,3 +46,5 @@ risk_lambda = 0
 residual_mu = 0
 arrival_lookback = 60
 fill_rule = "bucket_vwap_capped"
+terminal_rule = "terminal_settlement"
+terminal_surcharge_bps = 25
