@@ -76,8 +76,8 @@ def test_every_stage_section_produces_a_gated_row(
 @pytest.mark.skipif(torch.cuda.is_available(), reason="checks the no-CUDA skip path")
 def test_an_unavailable_device_yields_skipped_rows_not_numbers(tmp_path: Path) -> None:
     out = tmp_path / "results.json"
-    config = _config(tmp_path, device="cuda", sections='["env_step", "batched_core"]')
-    assert training.main(["--config", str(config), "--out", str(out)]) == 0
+    config = _config(tmp_path, sections='["env_step", "batched_core"]')
+    assert training.main(["--config", str(config), "--out", str(out), "--device", "cuda"]) == 0
     entries = {e["name"]: e["metrics"] for e in json.loads(out.read_text())}
     assert entries["env_step/serial"]["status"] == "ok"
     for name in ("env_step/batched", "batched_core"):

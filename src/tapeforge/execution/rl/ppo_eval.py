@@ -142,13 +142,15 @@ def evaluate_checkpoint(
     """Replay a checkpoint on a baseline run's episodes and register its records there.
 
     The checkpoint must have been trained on the world the run evaluated:
-    the split record and the data digests must match, and with
+    the data digests and the split record must match, and with
     ``strict_settings`` so must the simulator template and, when the
     checkpoint names one, the evaluation-set digest. ``strict_settings=False``
     permits a run whose template differs (a sensitivity run that evaluates a
-    policy under settings it was not trained on); the differing keys are
-    recorded with the evaluation. Observations are standardised with the
-    checkpoint's own frozen statistics.
+    policy under settings it was not trained on), including a geometry
+    change that re-derives the split record from the same days and roles;
+    the differing keys are recorded with the evaluation. A run over other
+    days or another role assignment is always refused. Observations are
+    standardised with the checkpoint's own frozen statistics.
 
     Returns:
         The record paths written by ``evaluation.evaluate_policy``.
@@ -161,7 +163,11 @@ def evaluate_checkpoint(
     checkpoint_dir = selected_checkpoint(checkpoint)
     model, provenance, statistics = load_checkpoint(checkpoint_dir)
     manifest = load_manifest(run_dir)
-    if canonical_sha256(manifest["split"]) != provenance["split_sha256"]:
+    # A template change to the episode geometry (latency, data delay, ...) recomputes the
+    # admissible starts, so the split record differs although the days and roles do not.
+    same_split = canonical_sha256(manifest["split"]) == provenance["split_sha256"]
+    same_days = manifest["config"]["split"] == provenance["config"]["split"]
+    if not same_split and (strict_settings or not same_days):
         raise ValueError("the run's split record differs from the one the checkpoint trained on")
     digests = [d.get("sha256") or f"seed={d.get('seed')}" for d in manifest["data"]]
     if digests != provenance["data_digests"]:
@@ -190,5 +196,6 @@ def evaluate_checkpoint(
             "evaluated_checkpoint": str(checkpoint_dir),
             "evaluated_set_digest": digest,
             "template_keys_differing_from_training": mismatch,
+            "split_record_differs_from_training": not same_split,
         },
     )

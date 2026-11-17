@@ -474,6 +474,19 @@ def test_a_selected_checkpoint_is_paired_with_the_baselines_in_the_report(
     with pytest.raises(ValueError, match="include_test"):
         evaluate_checkpoint(run, baseline_run, "ppo-test", roles=["test"])
 
+    # The replay tool rebuilds a learned policy's episode from its checkpoint and checks it
+    # against the stored record.
+    from tapeforge.execution.research import replay
+
+    episode = "validation/s1/i2"
+    assert replay.main([str(baseline_run), "--episode", episode, "--policy", "ppo-s0",
+                        "--checkpoint", str(run), "--verify"]) == 0
+    assert replay.main([str(baseline_run), "--episode", episode, "--policy", "ppo-s0"]) == 1
+    model, _, statistics = load_checkpoint(selected_checkpoint(run))
+    replayed = replay.replay_episode(baseline_run, episode, "ppo-s0",
+                                     policy_fn=checkpoint_policy(model, statistics))
+    assert replay.verify_against_record(replayed, baseline_run) == []
+
 
 def test_a_checkpoint_is_not_evaluated_on_a_run_with_other_settings(
     trained: tuple[Path, Path], tmp_path: Path
@@ -489,7 +502,27 @@ def test_a_checkpoint_is_not_evaluated_on_a_run_with_other_settings(
     manifest = json.loads((sensitivity_run / "manifest.json").read_text())
     provenance = manifest["evaluations"][0]["provenance"]
     assert provenance["template_keys_differing_from_training"] == ["terminal_surcharge_bps"]
+    assert provenance["split_record_differs_from_training"] is False
     assert len(written) == 2
+
+    # A latency change re-derives the admissible starts from the same days: allowed only
+    # without strict settings. Other days are refused either way.
+    delayed = tmp_path / "latency.toml"
+    delayed.write_text(text.replace('arrival_lookback = 4', 'arrival_lookback = 4\n'
+                                    'latency_buckets = 1'))
+    latency_run = run_experiment(load_config(delayed), output_dir=tmp_path / "runs")
+    with pytest.raises(ValueError, match="split record differs"):
+        evaluate_checkpoint(run, latency_run, "ppo-s0")
+    evaluate_checkpoint(run, latency_run, "ppo-s0", strict_settings=False)
+    manifest = json.loads((latency_run / "manifest.json").read_text())
+    assert manifest["evaluations"][0]["provenance"]["split_record_differs_from_training"] is True
+    other_days = tmp_path / "days.toml"
+    other_days.write_text(text.replace('train = ["2024-01-01", "2024-01-02"]',
+                                       'train = ["2024-01-01"]')
+                          .replace('validation = ["2024-01-03"]', 'validation = ["2024-01-02"]'))
+    period_run = run_experiment(load_config(other_days), output_dir=tmp_path / "runs")
+    with pytest.raises(ValueError, match="data digests|split record"):
+        evaluate_checkpoint(run, period_run, "ppo-s0", strict_settings=False)
 
 
 def test_the_command_line_trains_several_seeds_and_evaluates_their_selections(

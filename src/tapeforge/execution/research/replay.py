@@ -45,7 +45,7 @@ from tapeforge.execution.research.experiment import (
     parse_episode_identifier,
     rebuild_splits,
 )
-from tapeforge.execution.runner import Trajectory, run_episode, summarize_episode
+from tapeforge.execution.runner import Policy, Trajectory, run_episode, summarize_episode
 from tapeforge.execution.simulator import newest_visible_bucket, remaining_qty_ticks
 from tapeforge.execution.spec import EpisodeSpec
 from tapeforge.execution.state import MarketSlice
@@ -132,23 +132,35 @@ def step_rows(trajectory: Trajectory, market: MarketSlice) -> list[dict[str, Any
 
 
 def replay_episode(
-    run_dir: str | Path, episode_id: str, policy: str, splits: Splits | None = None
+    run_dir: str | Path,
+    episode_id: str,
+    policy: str,
+    splits: Splits | None = None,
+    policy_fn: Policy | None = None,
 ) -> Replay:
     """Rebuild the episode ``episode_id`` of a run directory and replay ``policy`` on it.
 
     Args:
         run_dir: Directory written by ``experiment.run_experiment``.
         episode_id: ``<role>/s<seed>/i<index>``.
-        policy: A ``BASELINES`` name.
+        policy: A ``BASELINES`` name, or with ``policy_fn`` the name the
+            policy's records carry in the run (used by ``--verify``).
         splits: Already rebuilt splits (saves the data load when replaying
             several episodes).
+        policy_fn: The policy to replay when it is not a baseline, for
+            example a loaded checkpoint (``rl.ppo_eval.checkpoint_policy``).
 
     Raises:
         ValueError: Unknown policy, a malformed identifier, an identifier
             outside the run's episode sets, or data that cannot be loaded.
     """
-    if policy not in BASELINES:
-        raise ValueError(f"unknown policy {policy!r}; available: {sorted(BASELINES)}")
+    if policy_fn is None:
+        if policy not in BASELINES:
+            raise ValueError(
+                f"unknown policy {policy!r}; available: {sorted(BASELINES)}, or pass a "
+                "policy callable (--checkpoint on the command line)"
+            )
+        policy_fn = BASELINES[policy]
     manifest = load_manifest(run_dir)
     role, seed, index = parse_episode_identifier(episode_id)
     listed = manifest["episodes"].get(role, {}).get(str(seed))
@@ -168,7 +180,7 @@ def replay_episode(
     if draw.to_json() != expected:
         raise ValueError(f"the re-derived draw of {episode_id!r} differs from the manifest's")
     spec, market = materialize(splits, draw, config.template)
-    trajectory = run_episode(spec, market, BASELINES[policy])
+    trajectory = run_episode(spec, market, policy_fn)
     return Replay(episode_id, policy, draw, spec, market, trajectory)
 
 
@@ -281,7 +293,11 @@ def _cell(value: Any) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """``<run_dir> --episode <id> --policy <name> [--json] [--verify]``.
+    """``<run_dir> --episode <id> --policy <name> [--checkpoint DIR] [--json] [--verify]``.
+
+    ``--checkpoint`` replays a trained policy (a checkpoint directory or a
+    training run, which means its selected checkpoint) under the record name
+    given by ``--policy``; it needs the ``train`` extra.
 
     Returns:
         0 on success (and, with ``--verify``, when the replay matches the
@@ -290,15 +306,33 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m tapeforge.execution.research.replay")
     parser.add_argument("run_dir")
     parser.add_argument("--episode", required=True, help="<role>/s<seed>/i<index>")
-    parser.add_argument("--policy", required=True, choices=sorted(BASELINES))
+    parser.add_argument(
+        "--policy", required=True,
+        help=f"one of {sorted(BASELINES)}, or the record name of the --checkpoint policy",
+    )
+    parser.add_argument(
+        "--checkpoint", default=None,
+        help="replay this PPO checkpoint (or the selection of this training run)",
+    )
     parser.add_argument("--json", action="store_true", help="print the step rows as JSON")
     parser.add_argument(
         "--verify", action="store_true", help="compare the replayed summary with the record"
     )
     args = parser.parse_args(argv)
     try:
-        replay = replay_episode(args.run_dir, args.episode, args.policy)
-    except (ValueError, FileNotFoundError) as exc:
+        policy_fn = None
+        if args.checkpoint is not None:
+            # Imported here: replaying baselines must not require the trainer.
+            from tapeforge.execution.rl.ppo_eval import (
+                checkpoint_policy,
+                load_checkpoint,
+                selected_checkpoint,
+            )
+
+            model, _, statistics = load_checkpoint(selected_checkpoint(args.checkpoint))
+            policy_fn = checkpoint_policy(model, statistics)
+        replay = replay_episode(args.run_dir, args.episode, args.policy, policy_fn=policy_fn)
+    except (ValueError, FileNotFoundError, ImportError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     if args.json:

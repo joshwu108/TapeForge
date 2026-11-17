@@ -53,6 +53,8 @@ Usage:
     python benchmarks/training.py --config benchmarks/configs/training_smoke.toml --no-record
     python benchmarks/training.py --config benchmarks/configs/training_pilot.toml \\
         --out runs/benchmarks/training-pilot.json
+    python benchmarks/training.py --config benchmarks/configs/training_smoke.toml \\
+        --device cuda --no-record
 
 Without ``--no-record`` or ``--out`` the entries are appended to
 ``benchmarks/results.json``. Needs the ``train`` extra.
@@ -438,11 +440,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", required=True)
     parser.add_argument("--no-record", action="store_true", help="print only")
     parser.add_argument("--out", default=None, help="record to this file instead of results.json")
+    parser.add_argument("--device", default=None,
+                        help="override the config's device for the batched backend (e.g. cuda)")
     parser.add_argument("--child", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--child-out", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     benchmark = tomllib.loads(Path(args.config).read_text())
     base = load_ppo_config(benchmark["ppo_config"])
+    if args.device is not None:
+        benchmark["device"] = args.device
     device = str(benchmark["device"])
     run_root = Path(benchmark.get("output_dir", "runs/benchmarks")) / benchmark["name"]
 
@@ -483,8 +489,8 @@ def main(argv: list[str] | None = None) -> int:
             with tempfile.TemporaryDirectory() as tmp:
                 out = Path(tmp) / "metrics.json"
                 child = subprocess.run(
-                    [sys.executable, __file__, "--config", args.config, "--child", backend,
-                     "--child-out", str(out)], check=False,
+                    [sys.executable, __file__, "--config", args.config, "--device", device,
+                     "--child", backend, "--child-out", str(out)], check=False,
                 )
                 if child.returncode != 0 or not out.exists():
                     entries.append((f"end_to_end/{backend}",

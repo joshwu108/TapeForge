@@ -92,6 +92,18 @@ STEPS: tuple[Step, ...] = (
         "kernel_quick",
         (PY, "benchmarks/kernel.py", "--sizes", "100000", "--seeds", "1", "--no-record"),
     ),
+    Step(
+        "simulator_parity",
+        (PY, "-m", "tapeforge.execution.parity", "--device", "cuda", "--episodes", "5000",
+         "--out", "simulator-parity.json"),
+        needs_cuda=True,
+    ),
+    Step(
+        "training_benchmark_quick",
+        (PY, "benchmarks/training.py", "--config", "benchmarks/configs/training_smoke.toml",
+         "--device", "cuda", "--no-record"),
+        needs_cuda=True,
+    ),
     Step("kernel_sweep", (PY, "benchmarks/kernel.py"), needs_cuda=True, writes_results=True),
     Step("pipeline", (PY, "benchmarks/pipeline.py"), needs_cuda=True, writes_results=True),
 )
