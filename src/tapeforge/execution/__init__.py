@@ -1,15 +1,19 @@
-"""CPU execution simulation and research APIs.
+"""Execution simulation and research APIs.
 
 Core rules and transitions live in spec, state, and simulator. The runner
-replays policies from baselines. Subpackages group the supporting workflow:
+replays policies from baselines. ``batched`` applies the same transitions to
+many episodes as torch tensors and ``parity`` compares the two; neither is
+imported here. Subpackages group the supporting workflow:
 
 * data: archive acquisition, day tapes, episode windows, splits and sampling.
-* research: configured experiments, reports, replay and sensitivity analysis.
-* rl: observation statistics, evaluation/provenance and the optional
-  Gymnasium adapter. No learner is implemented.
+* research: configured experiments, reports, replay, sensitivity tables and
+  one-factor matrices.
+* rl: observation statistics, evaluation/provenance, the optional Gymnasium
+  adapter and the optional PPO trainer.
 
 The public function and class exports below remain available directly from
-``tapeforge.execution``. Gymnasium is not imported by this module.
+``tapeforge.execution``. Importing this module needs NumPy only: torch,
+Gymnasium and Stable-Baselines3 are imported by the modules that use them.
 """
 
 from __future__ import annotations

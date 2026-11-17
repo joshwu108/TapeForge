@@ -6,12 +6,14 @@ TapeForge is an offline research platform for optimal trade execution. It
 turns historical market events into features, replays execution policies in
 a deterministic CPU simulator, and records comparable experiments. A Triton
 backend accelerates feature aggregation; a Gymnasium adapter exposes the
-reference simulator to reinforcement-learning libraries.
+reference simulator to reinforcement-learning libraries; an optional PPO
+trainer and a batched tensor implementation of the simulator build on it.
 
-The research objective is to measure whether GPU feature computation and,
-eventually, batched GPU simulation reduce training time while preserving
-numerical and temporal semantics. No learned policy or GPU execution
-simulator is implemented yet.
+The research objective is to measure whether GPU feature computation and
+batched GPU simulation reduce training time while preserving numerical and
+temporal semantics. The batched simulator has been checked against the CPU
+reference on CPU tensors only; it has not been run on CUDA, and no training
+speedup has been measured on a GPU.
 
 Architecture
 ============
@@ -24,9 +26,10 @@ Architecture
        -> NumPy reference / Triton feature aggregation
        -> bucket tapes and chronological splits
        -> sampled execution episodes
-       -> baseline policy or Gymnasium adapter
+       -> baseline policy, or PPO through the Gymnasium adapter
        -> CPU simulator: fills, fees, inventory, rewards
-       -> trajectories, paired reports, reproducible run records
+          (or the batched tensor simulator, held to the same transitions)
+       -> trajectories, checkpoints, paired reports, reproducible run records
 
 The CPU references define numerical behavior. The GPU feature engine uses
 one-pass reductions for short buckets and two-pass integer partial sums for
@@ -69,14 +72,31 @@ Status
      - Optional Gymnasium CPU adapter tested against direct simulator calls
        and the baseline policies; environment checker command; fixed
        evaluation manifests; external-policy evaluation writing
-       baseline-comparable records; checkpoint provenance schema. No PPO or
-       SAC learner is included.
+       baseline-comparable records; checkpoint provenance schema.
+   * - PPO trainer
+     - Optional (``train`` extra): Stable-Baselines3 PPO with a small MLP,
+       strict configuration, train-only frozen normalisation, per-rollout
+       diagnostics, checkpoints with provenance, validation-based checkpoint
+       selection and evaluation into baseline run directories. Implemented
+       and CPU-tested, including bit-identical resume on the CPU backends.
+       No SAC or recurrent policy.
+   * - Batched simulator
+     - ``execution.batched`` applies the reference transitions to many
+       episodes as device tensors, with a per-transition parity driver and a
+       vector environment for the trainer. Implemented and tested on CPU
+       tensors. **Not CUDA-tested:** no CUDA device was available; the CUDA
+       parity test skips and must be run on hardware.
    * - Performance evaluation
-     - Kernel, stage, and pageable/pinned transfer benchmarks implemented.
-       Recorded tuning sweeps and pinned-stream overlap remain pending.
-   * - Planned research
-     - Learned execution policies, GPU-vectorized environments, quote-aware
-       fills, and robustness/fidelity experiments remain unimplemented.
+     - Kernel, stage, and pageable/pinned transfer benchmarks implemented;
+       a training-pipeline benchmark compares serial, subprocess and batched
+       environments stage by stage. Recorded tuning sweeps, pinned-stream
+       overlap and every GPU training measurement remain pending.
+   * - Robustness
+     - One-factor experiment matrices (fee, latency, data delay, terminal
+       surcharge, risk coefficient, period) implemented and run locally for
+       the baselines and for policies trained under the base settings.
+       Retraining per variant, quote-aware fills and fidelity experiments
+       remain unimplemented.
 
 CI checks CPU behavior; it has no CUDA runner. Hardware verification must be
 repeated after GPU-facing changes. The quick T4 benchmark checked correctness
@@ -85,6 +105,21 @@ published.** Local three-day futures smoke experiments demonstrated the CPU
 pipeline under the terminal-settlement and legacy rules; they do not
 establish policy superiority, out-of-sample skill, or a research value of
 the terminal surcharge.
+
+A pilot was executed locally on CPU (see "Pilot experiment"): three PPO
+model seeds of 960,000 steps each, checkpoints selected on validation. It is
+a **null result**. On the six validation days the mean implementation
+shortfall of the three seeds (11.34, 11.40 and 11.43 bps) is
+indistinguishable from the ``immediate`` baseline (11.37 bps; the paired
+day-cluster intervals include zero or are marginally unfavourable) and from
+``cap_aware_twap`` (11.26 bps). All of them are far below ``twap``
+(16.10 bps), which the participation cap keeps from completing. In this fill
+model a completing policy pays the fee plus zero-mean price drift, so little
+is left to learn; and a one-factor sensitivity run shows that the ranking of
+the baselines depends on the terminal surcharge setting (at 0 bps the
+policies that wait are cheapest). These figures come from one instrument and
+one month under labelled settings. They are not out-of-sample evidence, and
+the sealed test days have not been evaluated.
 
 Install
 =======
@@ -97,13 +132,16 @@ installation.
 
    $ python3.12 -m venv .venv
    $ source .venv/bin/activate
-   $ python -m pip install -e '.[dev,torch,rl]'   # CPU development and Gymnasium
-   $ python -m pip install -e '.[dev,gpu,rl]'     # Linux CUDA development
+   $ python -m pip install -e '.[dev,torch,rl]'      # CPU development and Gymnasium
+   $ python -m pip install -e '.[dev,torch,train]'   # plus the PPO trainer
+   $ python -m pip install -e '.[dev,gpu,train]'     # Linux CUDA development
 
 NumPy is the only required runtime dependency. CPU references, streaming,
 execution simulation, and baseline experiments do not require PyTorch.
-``ops.aggregate`` requires the ``torch`` extra; the environment adapter
-requires ``rl``. The ``rl`` extra installs Gymnasium, not an RL trainer.
+``ops.aggregate`` and ``execution.batched`` require the ``torch`` extra; the
+environment adapter requires ``rl``; the trainer requires ``train``
+(Gymnasium, Stable-Baselines3 2.9 and PyTorch). Each optional module names
+its extra when the dependency is missing.
 
 Run a baseline experiment
 =========================
@@ -160,6 +198,42 @@ Archives live under ``data/<market>/aggTrades/`` and are checked against the
 source's published SHA-256 checksum. Verified cached archives can be reused
 without network access. Spot and futures are separate markets; a run names
 one market and symbol. Check source licensing before redistributing data.
+
+Pilot experiment
+================
+
+``experiments/configs/pilot-futures-btcusdt-2023-12.toml`` fixes one
+protocol: Binance USD-M futures BTCUSDT, 23 consecutive UTC days, assigned
+chronologically to 11 training days (2023-12-01 to 11), 6 validation days
+(12 to 17) and 6 test days (18 to 23). The simulator settings are the
+accepted first configuration: 10 bps fee, no latency or data delay, risk
+term off, terminal settlement at 25 bps. The 25 bps surcharge is a labelled
+initial setting, not a calibrated market-impact estimate. The date selection
+is a proposal with plain limits: one instrument, one venue, one contiguous
+month.
+
+.. code-block:: console
+
+   $ python -m tapeforge.execution.data.datasets fetch --market futures-um \
+       --symbol BTCUSDT --max-archives 23 --max-bytes 1073741824 \
+       $(for d in $(seq -w 1 23); do printf -- '--date 2023-12-%s ' "$d"; done)
+   $ python -m tapeforge.execution.research.experiment run \
+       experiments/configs/pilot-futures-btcusdt-2023-12.toml
+   $ python -m tapeforge.execution.research.report runs/<pilot-run> --reference immediate
+   $ python -m tapeforge.execution.rl.evaluation manifest runs/<pilot-run>
+
+The 23 archives total about 335 MiB and are verified against the published
+SHA-256 checksums; the configuration itself never downloads. The run replays
+``twap``, ``immediate``, ``cap_aware_twap`` and the ``zero_action``
+diagnostic on identical episodes of the training and validation days. The
+manifest records the data checksums, seeds, split record, simulator version
+and settings; ``evaluation-manifest.json`` freezes the evaluation episode
+set and its digest. The label ``pilot`` marks output as a fixed small-sample
+protocol: its figures are not out-of-sample evidence.
+
+The test days are sealed. No tool reads them unless ``--include-test`` is
+passed, and passing it requires a frozen protocol and the maintainer's
+authorization. They have not been evaluated.
 
 Experiment contract
 ===================
@@ -386,14 +460,17 @@ To use the same episode with Gymnasium after installing ``.[rl]``:
    observation, info = env.reset(seed=7)
    observation, reward, terminated, truncated, info = env.step([0.1])
 
-The environment is ready for a trainer adapter. PPO/SAC training, policy
-checkpoint selection, and GPU-vectorized environments are not included.
+``snapshot`` and ``restore`` carry an environment's running episode, exact
+state and selection generator to another process, which is what lets the
+trainer resume collection exactly. The PPO trainer below builds on this
+environment; SAC and recurrent policies are not included.
 
 Evaluating a policy
 ===================
 
 ``tapeforge.execution.rl.evaluation`` holds what a trainer needs around the
-environment, and nothing of the trainer itself.
+environment, and nothing of the trainer itself (``rl.ppo`` is the optional
+trainer that uses it).
 
 * ``load_training_config`` reads a strict TOML description
   (``tapeforge.execution.training-config/1``): the experiment configuration,
@@ -435,6 +512,155 @@ environment, and nothing of the trainer itself.
    policy = vector_policy(lambda vector: np.float32(0.1))  # a stand-in for a learned policy
    written = evaluate_policy(run_dir, policy, "constant-0.1", splits=splits)
    assert len(written) == 2  # one record per evaluated role and seed
+
+Training a policy (PPO)
+=======================
+
+The trainer is optional (``pip install -e '.[train]'``) and thin:
+Stable-Baselines3's PPO with separate MLP actor and critic, connected to
+``ExecutionEnv``. Three strict TOML files describe a run, each rejecting
+unknown keys:
+
+* the experiment configuration (data, split, simulator settings);
+* a training configuration (``training-config/1``): training pools,
+  the frozen-statistics reference, the evaluation role and seeds;
+* a PPO configuration (``ppo-config/1``): network, optimiser, rollout,
+  update, schedule and model seeds. Every value is read from the file;
+  nothing falls back to a library default.
+
+.. code-block:: console
+
+   $ python -m tapeforge.execution.rl.ppo train experiments/configs/smoke-synthetic-ppo.toml
+   $ python -m tapeforge.execution.rl.ppo train \
+       experiments/configs/pilot-futures-btcusdt-2023-12-ppo.toml \
+       --evaluation-manifest runs/<pilot-run>/evaluation-manifest.json
+   $ python -m tapeforge.execution.rl.ppo train <ppo.toml> --seed 0 \
+       --resume runs/<training-run>/checkpoints/v00100 --total-steps 1920000
+   $ python -m tapeforge.execution.rl.ppo evaluate runs/<pilot-run> \
+       ppo-s0=runs/<training-run-seed0> ppo-s1=runs/<training-run-seed1>
+   $ python -m tapeforge.execution.research.report runs/<pilot-run> --reference immediate
+   $ python -m tapeforge.execution.research.replay runs/<pilot-run> \
+       --episode validation/s1/i0 --policy ppo-s0 \
+       --checkpoint runs/<training-run-seed0> --verify
+
+The first command trains every ``model_seeds`` entry on synthetic data in a
+few seconds and needs no download. ``evaluate`` takes a checkpoint directory
+or a training run (it then uses the checkpoint selected on validation) and
+writes records into the baseline run directory, so the report pairs each
+model seed with the baselines on identical episode identifiers. Replay with
+``--checkpoint`` steps a trained policy through one episode and, with
+``--verify``, checks the result against the record ``evaluate`` wrote under
+that policy name.
+
+Contracts:
+
+* **Objective.** ``gamma = 1.0``: the per-step rewards of a terminated
+  episode sum to minus the implementation shortfall in basis points of the
+  arrival notional (plus the risk term), a finite-horizon undiscounted cost.
+  A smaller ``gamma`` discounts the terminal settlement relative to earlier
+  fills and is a different objective; it must be written in the file to be
+  used.
+* **Actions.** The policy acts in ``[-1, 1]``; the environment receives
+  ``(clip(a, -1, 1) + 1) / 2`` computed in float64. The rollout buffer keeps
+  the unclipped Gaussian sample and its log-probability, so the update
+  evaluates the distribution the action was drawn from. Evaluation applies
+  the same map to the policy mean.
+* **Observations.** Statistics are fitted once on training draws replayed by
+  a named baseline, frozen, stored in every checkpoint and applied
+  identically in training and evaluation. There is no running normaliser.
+* **Episode ends.** ``terminated`` (target reached or horizon, settlement
+  included) ends the return. ``truncated`` (the tape ran out) is passed to
+  the learner as a time-limit truncation and bootstrapped; episodes cut by
+  the split builder never truncate.
+* **Seeds.** Model seeds (initialisation, action noise, minibatch order,
+  per-environment episode selection) are separate from the sampling seeds of
+  the training pools and of the fixed evaluation episodes.
+* **Checkpoint selection.** Lowest validation mean shortfall over the
+  checkpoints saved on the declared schedule; the earliest wins a tie. The
+  test role is never consulted.
+
+A training run directory holds ``config.json``, ``statistics.json``,
+``rollouts.jsonl`` (per rollout: environment steps, wall time, the policy
+version that collected it, episode reward, shortfall, settled fraction, and
+the entropy, approximate KL, clip fraction, value loss and explained
+variance of the update), ``evaluations.jsonl``, ``selection.json``,
+``summary.json`` and ``checkpoints/v<k>/`` with ``model.zip`` (weights and
+optimiser state), ``provenance.json`` (configuration, split and data hashes,
+statistics, simulator version) and ``collection.pt`` (the collection
+position and generator states).
+
+Resuming: ``--resume`` continues a run from a checkpoint bit-identically to
+the uninterrupted run on the ``serial`` and ``subprocess`` backends, on CPU,
+with the same library versions, thread count and configuration (tested for
+both backends). Loading ``model.zip`` alone restores a policy for evaluation;
+it is not a continuation of training. The ``batched`` backend stores no
+collection position and cannot be resumed. ``collection.pt`` is a pickle:
+load only checkpoints you wrote.
+
+Batched simulator
+=================
+
+``tapeforge.execution.batched`` implements the reference transitions for
+many independent episodes as int64 tensors on one device. Episode constants
+(arrival price, terminal mark, settlement price, the int64 bound check) are
+computed once by the reference functions when an ``EpisodeBatch`` is built;
+``step`` and ``observe`` are tensor code that never reads a value back to
+the host, except for the optional action-range check
+(``step(..., validate=True)``).
+
+.. code-block:: console
+
+   $ python -m tapeforge.execution.parity --device cpu --episodes 5000 --out parity-cpu.json
+   $ python -m tapeforge.execution.parity --device cuda --episodes 5000 --out parity-cuda.json
+
+The parity driver feeds identical action sequences to both implementations
+and compares the observation, every step-record field and every state field
+after each transition, over seeded scenarios covering both sides, mixed
+targets and horizons, latency and data delay, empty buckets, binding caps,
+fees, both terminal rules, missing fill buckets and terminal marks, and
+prices near the int64 accounting bound. It exits 2 when the device is
+unavailable.
+
+Limits: prices, bucket quantities and targets below 2**53 (so the float64
+action conversion and observations equal the reference's); actions must be
+float64 tensors; a settling episode whose settlement price would not be
+positive is rejected at construction; stepping an ended environment is a
+masked no-op; memory is 41 bytes per episode bucket.
+``rollout.backend = "batched"`` trains through it. Because the trainer's
+rollout buffer is host memory, that backend still copies actions,
+observations, rewards and done flags between host and device every step.
+
+**Verification status.** On CPU tensors the batched simulator matches the
+reference on every compared transition. It has not been executed on CUDA.
+The CUDA parity test and ``--device cuda`` run must pass on hardware before
+any GPU result is used; CPU-tensor agreement is not a substitute. Parity is
+agreement between two implementations of the same synthetic rules: replaying
+recorded market data does not model the market's response to the agent.
+
+Robustness matrices
+===================
+
+.. code-block:: console
+
+   $ python -m tapeforge.execution.research.matrix run \
+       experiments/matrices/smoke-synthetic-one-factor.toml
+   $ python -m tapeforge.execution.research.matrix run experiments/matrices/pilot-one-factor.toml
+   $ python -m tapeforge.execution.rl.ppo evaluate runs/<matrix-dir>/<variant-run> \
+       ppo-s0=runs/<training-run> --allow-setting-mismatch
+   $ python -m tapeforge.execution.research.matrix summarize runs/<matrix-dir>
+
+A matrix file names a base configuration and variants that each change
+exactly one template field (fee, latency, data delay, terminal surcharge,
+risk coefficient) or the split dates (a period). The pilot matrix keeps the
+0 / 10 / 25 / 50 bps surcharge settings. The summary states per variant
+whether it replays the base's episodes: a change of latency, data delay,
+horizon or lookback alters the admissible starts, so its rows are unpaired.
+A variant cannot use a date the base seals as test. A policy trained under
+the base settings and evaluated under a variant
+(``--allow-setting-mismatch``, recorded with the evaluation) was not
+optimised for that variant; retraining per variant is a larger sweep that
+has not been run. Changes to the observation features are a different kind
+of experiment and are not expressed in a matrix.
 
 Feature engine
 ==============
@@ -515,11 +741,15 @@ Transfer the archive, then run on that machine:
 
    $ tar xzf tapeforge-snapshot.tgz
    $ cd TapeForge
-   $ python -m pip install -e '.[dev,rl]'   # use the runtime's CUDA torch and Triton
+   $ python -m pip install -e '.[dev,train]'   # use the runtime's CUDA torch and Triton
    $ python tools/verify_snapshot.py run --artifacts verification --record --zip
+   $ python tools/verify_snapshot.py run --artifacts verification \
+       --steps gpu_suite simulator_parity training_benchmark_quick --zip
 
 The snapshot includes tracked and eligible untracked files, excluding ignored
-files, and records a content digest. The runner saves step logs, environment,
+files, and records a content digest. The second ``run`` line is the bounded
+subset for the batched simulator: the GPU test suite, the CUDA parity
+comparison and a quick training benchmark. The runner saves step logs, environment,
 JUnit XML, status manifest, and a results copy. Download ``verification.zip``
 and recorded benchmark results before disposing of the remote environment.
 
@@ -532,13 +762,36 @@ Benchmarks
    $ python benchmarks/kernel.py --timing cuda_events --no-record
    $ python benchmarks/kernel.py
    $ python benchmarks/pipeline.py
+   $ python benchmarks/training.py --config benchmarks/configs/training_smoke.toml --no-record
+   $ python benchmarks/training.py --config benchmarks/configs/training_pilot.toml \
+       --out runs/benchmarks/training-pilot.json
+   $ python benchmarks/training.py --config benchmarks/configs/training_smoke.toml \
+       --device cuda --no-record
 
 ``kernel.py`` compares the checked API, prepared execution, individual passes,
 forced two-pass execution, eager/compiled PyTorch, and the CPU reference.
 Stage rows separate validation, metadata, allocation, and preparation; these
 overlap with end-to-end rows and must not be added to them.
 ``pipeline.py`` measures host/device transfers and compute using pageable or
-pinned memory. Pinned-stream overlap and end-to-end training benchmarks remain unimplemented.
+pinned memory. Pinned-stream overlap remains unimplemented.
+
+``training.py`` (needs the ``train`` extra) compares serial, subprocess and
+batched environments under one PPO configuration: same simulator settings,
+episode pools, policy, rollout size, sample budget and evaluation protocol.
+Its sections are recorded separately and must not be summed: per-episode
+feature preparation from precomputed tapes against on-demand aggregation;
+environment stepping alone; the batched simulator alone across batch sizes;
+policy inference and the PPO update; and complete training runs in fresh
+processes with data loading, setup, collection, optimisation, evaluation and
+checkpointing timed apart, memory, CPU time over wall time, environment
+steps per second (one PPO sample per step) and the training time at which a
+predeclared validation threshold was first met, or that it never was. The
+batched rows are timed only after the parity comparison passes on the
+benchmark device, and an unavailable device yields ``skipped`` rows. Known
+differences between backends are stored with every record: the batched
+backend draws the same episode distribution in a different sequence and
+pays per-step host/device copies. Only CPU measurements exist so far; they
+are local artifacts under ``runs/`` and are not published here.
 
 Correctness is checked before timing. Warm-up excludes compilation. Results
 record wall-clock or CUDA-event timing, workload distribution, setup included
@@ -561,6 +814,7 @@ Repository layout
      execution/
        spec.py, state.py             execution rules and data structures
        simulator.py                  fills, accounting and state transitions
+       batched.py, parity.py         the same transitions as device tensors; parity driver
        baselines.py, runner.py        reference policies and episode replay
        data/
          datasets.py                 archive acquisition and checksums
@@ -570,19 +824,26 @@ Repository layout
          experiment.py               configured runs and artifact manifests
          report.py, replay.py        result summaries and episode inspection
          sensitivity.py              terminal-rule comparisons
+         matrix.py                   one-factor robustness matrices
        rl/
          normalization.py            training statistics and versioned files
          evaluation.py               fixed evaluation sets and provenance
          gym_env.py, env_check.py     optional Gymnasium interface and checker
-   experiments/configs/              synthetic and futures smoke configs per terminal setting
-   benchmarks/                       compute/transfer timings and result records
+         ppo_config.py               strict trainer configuration
+         ppo_env.py, ppo.py          action map, training environments, PPO training
+         ppo_eval.py                 checkpoint loading and evaluation
+         batched_env.py              vector environment over the batched simulator
+   experiments/configs/              smoke and pilot experiment, training and PPO configs
+   experiments/matrices/             one-factor robustness matrices
+   benchmarks/                       kernel, transfer and training-pipeline timings
    tests/                            CPU/GPU parity, accounting, leakage, tooling
    tools/                            parity summary and snapshot verification
    data/, runs/                      local datasets and outputs; Git-ignored
 
 Execution modules are grouped by the workflow they support: ``data`` prepares
 inputs, ``research`` runs and inspects experiments, and ``rl`` connects trainers
-to the CPU simulator. The core simulation files stay in ``execution/``.
+to the simulator. The core simulation files stay in ``execution/``.
+``CONTRIBUTING.rst`` lists each component's responsibilities.
 Public imports such as ``from tapeforge.execution import EpisodeSpec, run_policy``
 are unchanged. Module-specific imports and CLI commands use the subpackages,
 for example ``python -m tapeforge.execution.research.experiment``. Update local
@@ -608,7 +869,8 @@ against an independent reference before benchmarking.
 Documentation policy
 ====================
 
-``README.rst`` is the public documentation. Markdown, private design notes,
+``README.rst`` is the public documentation and ``CONTRIBUTING.rst`` the
+contributor guide. Markdown, private design notes,
 and learning plans remain local and ignored. Shared results use JSON, CSV,
 or reStructuredText. Downloaded market data and run artifacts are not committed.
 

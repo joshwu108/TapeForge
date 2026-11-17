@@ -1,8 +1,9 @@
 """Tests for the public documentation: RST validity, feature coverage, examples and claims.
 
-README.rst is parsed with docutils, every feature in ``contract.FEATURE_NAMES`` must
-be documented, every Python code block must execute on the CPU, and no speedup
-claim may appear before ``benchmarks/results.json`` records a GPU measurement.
+README.rst and CONTRIBUTING.rst are parsed with docutils, every feature in
+``contract.FEATURE_NAMES`` must be documented, every Python code block must execute
+on the CPU, no speedup claim may appear before ``benchmarks/results.json`` records
+a GPU measurement, and the README keeps its statement of what is not verified.
 """
 
 from __future__ import annotations
@@ -42,6 +43,23 @@ def test_readme_is_valid_restructuredtext() -> None:
     """README.rst parses without docutils warnings, so it renders on every host."""
     problems = _parse_problems(README.read_text())
     assert not problems, "README.rst has RST errors:\n" + "".join(problems)
+
+
+def test_contributor_guide_is_valid_restructuredtext() -> None:
+    """CONTRIBUTING.rst parses without docutils warnings."""
+    guide = README.parent / "CONTRIBUTING.rst"
+    problems = _parse_problems(guide.read_text())
+    assert not problems, "CONTRIBUTING.rst has RST errors:\n" + "".join(problems)
+
+
+def test_readme_states_the_verification_status_of_the_batched_simulator() -> None:
+    """The README must not present the batched simulator as GPU-verified.
+
+    The statement is removed only together with a recorded CUDA parity run.
+    """
+    text = " ".join(README.read_text().split())
+    assert "It has not been executed on CUDA" in text
+    assert "the sealed test days have not been evaluated" in text
 
 
 def test_readme_documents_every_public_feature() -> None:
