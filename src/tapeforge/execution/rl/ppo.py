@@ -329,7 +329,7 @@ class _TrainingLog(BaseCallback):
         # The collection position is written last so that it includes this evaluation.
         torch.save(
             {
-                "environments": self.training_env.env_method("snapshot"),
+                "environments": self._environment_snapshots(),
                 "last_obs": model._last_obs,
                 "last_episode_starts": model._last_episode_starts,
                 "torch_rng": generators[0],
@@ -342,6 +342,13 @@ class _TrainingLog(BaseCallback):
             checkpoint_dir / "collection.pt",
         )
         _set_generator_states(generators)
+
+    def _environment_snapshots(self) -> list[Any] | None:
+        """Return every environment's collection position, or ``None`` on the batched backend."""
+        try:
+            return list(self.training_env.env_method("snapshot"))
+        except NotImplementedError:
+            return None
 
     def selection(self) -> dict[str, Any]:
         """Return the checkpoint-selection record: the rule, every evaluation and the choice.
@@ -560,6 +567,11 @@ def train(
         write_json_atomic(run_dir / "config.json", resolved)
         resume_state = torch.load(checkpoint_dir / "collection.pt", weights_only=False)
         assert resume_state is not None
+        if resume_state["environments"] is None:
+            raise ConfigError(
+                f"{checkpoint_dir} was written by the batched backend, which stores no "
+                "collection position; it can be evaluated but not resumed"
+            )
         _drop_rows_from(run_dir / "rollouts.jsonl", "rollout", int(resume_state["version"]))
         _drop_rows_from(
             run_dir / "evaluations.jsonl", "policy_version", int(resume_state["version"]) + 1

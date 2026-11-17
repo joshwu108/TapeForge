@@ -62,5 +62,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu torch
           pip install -e '.[dev,train]'
-      - name: test the trainer
-        run: pytest -q tests/test_execution/test_ppo.py
+      - name: test the trainer and the batched simulator on CPU tensors
+        run: >
+          pytest -q tests/test_execution/test_ppo.py tests/test_execution/test_batched.py
+          tests/test_execution/test_batched_env.py

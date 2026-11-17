@@ -42,7 +42,7 @@ except ImportError as exc:  # pragma: no cover - exercised in a subprocess test
     ) from exc
 
 from tapeforge.execution.data.splits import Splits
-from tapeforge.execution.research.experiment import ConfigError, ExperimentConfig
+from tapeforge.execution.research.experiment import ExperimentConfig
 from tapeforge.execution.rl.evaluation import TrainingConfig
 from tapeforge.execution.rl.gym_env import ExecutionEnv, SplitPool
 from tapeforge.execution.rl.normalization import ObservationStatistics
@@ -196,10 +196,14 @@ def make_vec_env(
     len]`` (``config.pool_episodes`` draws of the training role) with its own
     selection stream.
 
-    Raises:
-        ConfigError: The ``batched`` backend, which ``batched_vec_env``
-            builds instead.
+    The ``batched`` backend instead builds one tensor environment over the
+    union of the pools (``batched_env.make_batched_vec_env``).
     """
+    if config.backend == "batched":
+        # Imported here: the CPU backends must not require the tensor simulator.
+        from tapeforge.execution.rl.batched_env import make_batched_vec_env
+
+        return make_batched_vec_env(config, experiment, training, splits, statistics, model_seed)
     factories = [
         _environment_factory(
             splits, experiment, training,
@@ -210,6 +214,4 @@ def make_vec_env(
     ]
     if config.backend == "serial":
         return DummyVecEnv(factories)  # type: ignore[arg-type]
-    if config.backend == "subprocess":
-        return SubprocVecEnv(factories)  # type: ignore[arg-type]
-    raise ConfigError(f"backend {config.backend!r} is not built by make_vec_env")
+    return SubprocVecEnv(factories)  # type: ignore[arg-type]
