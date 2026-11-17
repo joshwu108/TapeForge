@@ -271,7 +271,8 @@ def _verify_local(spec: ArchiveSpec, target: Path) -> ArchiveRecord | None:
     if not checksum_path.exists():
         raise DatasetError(
             f"{target} exists but {checksum_path.name} is missing beside it; the file cannot "
-            "be verified. Fetch the published checksum (python -m tapeforge.execution.datasets "
+            "be verified. Fetch the published checksum "
+            "(python -m tapeforge.execution.data.datasets "
             f"fetch --market {spec.market} --symbol {spec.symbol} --date {spec.date}) or "
             "remove the file"
         )
@@ -403,7 +404,7 @@ def ensure_archive(
     if not allow_download:
         raise DatasetError(
             f"{target} is not present and downloads are disabled for this run; fetch it with "
-            f"python -m tapeforge.execution.datasets fetch --market {spec.market} "
+            f"python -m tapeforge.execution.data.datasets fetch --market {spec.market} "
             f"--symbol {spec.symbol} --date {spec.date}"
         )
     budget = DownloadBudget() if budget is None else budget
@@ -516,7 +517,7 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         0 on success, 1 when a day could not be acquired or verified.
     """
-    parser = argparse.ArgumentParser(prog="python -m tapeforge.execution.datasets")
+    parser = argparse.ArgumentParser(prog="python -m tapeforge.execution.data.datasets")
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("fetch", "verify"):
         command = sub.add_parser(name)

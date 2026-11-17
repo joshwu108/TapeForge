@@ -1,10 +1,10 @@
-"""Tests for tapeforge.execution.splits: hand-built segment boundaries, embargo widths, the purge
+"""Tests for tapeforge.execution.data.splits: hand-built segment boundaries, embargo widths, the
+purge
 window, start enumeration, validation, JSON round-trips and the split invariants under random
 day structures.
 
 Days are flat single-price tapes from ``_day``; ``_four_days`` is the hand-built
-calendar whose segment ranges are asserted exactly.
-"""
+calendar whose segment ranges are asserted exactly."""
 
 from __future__ import annotations
 
@@ -15,10 +15,9 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from tapeforge.contract import DEFAULT_BUCKET_WIDTH_US as W
-from tapeforge.execution.days import DayTape
-from tapeforge.execution.episodes import required_window
-from tapeforge.execution.spec import EpisodeSpec
-from tapeforge.execution.splits import (
+from tapeforge.execution.data.days import DayTape
+from tapeforge.execution.data.episodes import required_window
+from tapeforge.execution.data.splits import (
     ROLES,
     Segment,
     SplitDates,
@@ -28,6 +27,7 @@ from tapeforge.execution.splits import (
     embargo_buckets,
     purge_window,
 )
+from tapeforge.execution.spec import EpisodeSpec
 from test_execution.tapes import DEEP, P0, slice_from_rows
 
 # Hand-built geometry: horizon 5, latency 1, lookback 3, delay 0 -> n_before 5, n_after 9,

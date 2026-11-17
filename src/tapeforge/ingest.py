@@ -313,7 +313,7 @@ def download(
 
     An existing file is not re-downloaded but is still verified. When the
     checksum cannot be fetched, a warning is printed and the local digest is
-    reported instead. ``tapeforge.execution.datasets`` wraps this behaviour
+    reported instead. ``tapeforge.execution.data.datasets`` wraps this behaviour
     with a size budget, a manifest and strict (never unverified) acquisition
     for experiments.
 

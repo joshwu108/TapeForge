@@ -1,32 +1,15 @@
-"""Reference execution simulator: CPU-only, torch-free, exact integer accounting.
+"""CPU execution simulation and research APIs.
 
-Submodules and their responsibilities:
+Core rules and transitions live in spec, state, and simulator. The runner
+replays policies from baselines. Subpackages group the supporting workflow:
 
-* ``spec``: episode parameters, units and the int64 bound check.
-* ``state``: immutable data carried through an episode (tape slice, state,
-  step record).
-* ``simulator``: ``reset`` / ``observe`` / ``step`` transition semantics, the
-  fill rule and the reward decomposition.
-* ``episodes``: the tape window an episode needs and target sizing from the
-  reference volume.
-* ``days``: whole-day tapes, synthetic or from an aggTrades archive.
-* ``splits``: chronological day splits with embargo and purge controls.
-* ``sampling``: seeded, index-addressable episode draws.
-* ``runner``: policy replay, summaries and JSON run records.
-* ``baselines``: signal-free reference policies and the zero-action
-  diagnostic.
-* ``normalization``: train-only observation statistics and their versioned
-  files.
-* ``datasets``: archive acquisition with checksums, a budget and a manifest.
-* ``experiment``: TOML-configured baseline experiments and run directories.
-* ``report``: per-policy, per-day and paired statistics over a run.
-* ``replay``: step-by-step replay of one recorded episode.
-* ``sensitivity``: cross-run comparison of terminal-rule settings on
-  identical episodes.
-* ``evaluation``: fixed evaluation sets, the external-policy interface,
-  strict training configuration and checkpoint provenance.
-* ``gym_env`` and ``env_check``: Gymnasium adapter and its checker command;
-  both need the optional ``rl`` extra and are not imported here.
+* data: archive acquisition, day tapes, episode windows, splits and sampling.
+* research: configured experiments, reports, replay and sensitivity analysis.
+* rl: observation statistics, evaluation/provenance and the optional
+  Gymnasium adapter. No learner is implemented.
+
+The public function and class exports below remain available directly from
+``tapeforge.execution``. Gymnasium is not imported by this module.
 """
 
 from __future__ import annotations
@@ -39,7 +22,7 @@ from tapeforge.execution.baselines import (
     twap,
     zero_action,
 )
-from tapeforge.execution.days import (
+from tapeforge.execution.data.days import (
     DayTape,
     concat_tapes,
     cut_slice,
@@ -48,14 +31,37 @@ from tapeforge.execution.days import (
     episode_at,
     synthetic_day,
 )
-from tapeforge.execution.episodes import (
+from tapeforge.execution.data.episodes import (
     build_market_slice,
     make_episode,
     reference_volume_ticks,
     required_window,
     target_from_reference_volume,
 )
-from tapeforge.execution.evaluation import (
+from tapeforge.execution.data.sampling import (
+    EpisodeDraw,
+    draw_episode,
+    materialize,
+    sample_episodes,
+)
+from tapeforge.execution.data.splits import (
+    ROLES,
+    SplitDates,
+    SplitRecord,
+    Splits,
+    build_splits,
+    embargo_buckets,
+    purge_window,
+)
+from tapeforge.execution.research.experiment import (
+    ExperimentConfig,
+    load_config,
+    run_experiment,
+)
+from tapeforge.execution.research.replay import replay_episode
+from tapeforge.execution.research.report import build_report, write_report
+from tapeforge.execution.research.sensitivity import build_sensitivity, write_sensitivity
+from tapeforge.execution.rl.evaluation import (
     TrainingConfig,
     checkpoint_provenance,
     evaluate_policy,
@@ -64,20 +70,13 @@ from tapeforge.execution.evaluation import (
     validate_checkpoint_provenance,
     vector_policy,
 )
-from tapeforge.execution.experiment import (
-    ExperimentConfig,
-    load_config,
-    run_experiment,
-)
-from tapeforge.execution.normalization import (
+from tapeforge.execution.rl.normalization import (
     ObservationStatistics,
     load_statistics,
     normalize,
     observation_statistics,
     save_statistics,
 )
-from tapeforge.execution.replay import replay_episode
-from tapeforge.execution.report import build_report, write_report
 from tapeforge.execution.runner import (
     EpisodeSummary,
     Observation,
@@ -90,8 +89,6 @@ from tapeforge.execution.runner import (
     summarize_set,
     write_run_record,
 )
-from tapeforge.execution.sampling import EpisodeDraw, draw_episode, materialize, sample_episodes
-from tapeforge.execution.sensitivity import build_sensitivity, write_sensitivity
 from tapeforge.execution.simulator import (
     OBSERVATION_FIELDS,
     SIMULATOR_VERSION,
@@ -119,15 +116,6 @@ from tapeforge.execution.spec import (
     fee_ticks,
     participation_cap_ticks,
     settlement_price_ticks,
-)
-from tapeforge.execution.splits import (
-    ROLES,
-    SplitDates,
-    SplitRecord,
-    Splits,
-    build_splits,
-    embargo_buckets,
-    purge_window,
 )
 from tapeforge.execution.state import MarketSlice, State, StepResult
 

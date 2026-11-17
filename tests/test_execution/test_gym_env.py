@@ -1,4 +1,4 @@
-"""Tests for tapeforge.execution.gym_env: the Gymnasium checker, step-by-step parity with the
+"""Tests for tapeforge.execution.rl.gym_env: the Gymnasium checker, step-by-step parity with the
 simulator, every baseline through the adapter, seeding and reset independence, termination and
 truncation, boundary and invalid actions, delayed observations, pool exhaustion, frozen
 normalisation and a random-action smoke run.
@@ -18,8 +18,10 @@ gym = pytest.importorskip("gymnasium")
 
 from tapeforge.contract import DEFAULT_BUCKET_WIDTH_US as W  # noqa: E402
 from tapeforge.execution.baselines import BASELINES  # noqa: E402
-from tapeforge.execution.days import synthetic_day  # noqa: E402
-from tapeforge.execution.gym_env import (  # noqa: E402
+from tapeforge.execution.data.days import synthetic_day  # noqa: E402
+from tapeforge.execution.data.sampling import sample_episodes  # noqa: E402
+from tapeforge.execution.data.splits import SplitDates, Splits, build_splits  # noqa: E402
+from tapeforge.execution.rl.gym_env import (  # noqa: E402
     ACTION_SHAPE,
     EpisodePoolExhausted,
     ExecutionEnv,
@@ -27,13 +29,12 @@ from tapeforge.execution.gym_env import (  # noqa: E402
     SplitPool,
     reward_from_ticks,
 )
-from tapeforge.execution.normalization import observation_statistics  # noqa: E402
+from tapeforge.execution.rl.normalization import observation_statistics  # noqa: E402
 from tapeforge.execution.runner import (  # noqa: E402
     observation_for,
     run_episode,
     summarize_episode,
 )
-from tapeforge.execution.sampling import sample_episodes  # noqa: E402
 from tapeforge.execution.simulator import (  # noqa: E402
     OBSERVATION_FIELDS,
     EpisodeOver,
@@ -42,7 +43,6 @@ from tapeforge.execution.simulator import (  # noqa: E402
     step,
 )
 from tapeforge.execution.spec import EpisodeSpec  # noqa: E402
-from tapeforge.execution.splits import SplitDates, Splits, build_splits  # noqa: E402
 from test_execution.tapes import (  # noqa: E402
     DEEP,
     P0,

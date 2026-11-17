@@ -25,13 +25,13 @@ from typing import Any
 
 import numpy as np
 
+from tapeforge.execution.data.splits import ROLES, SplitRecord, Splits
 from tapeforge.execution.spec import (
     ACCEPTED_TARGET_FRACTIONS_BPS,
     SIDE_BUY,
     SIDE_SELL,
     EpisodeSpec,
 )
-from tapeforge.execution.splits import ROLES, SplitRecord, Splits
 from tapeforge.execution.state import MarketSlice
 
 __all__ = [

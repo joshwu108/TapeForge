@@ -91,11 +91,12 @@ try:
     from gymnasium import spaces
 except ImportError as exc:  # pragma: no cover - exercised in a subprocess test
     raise ImportError(
-        "tapeforge.execution.gym_env needs gymnasium; install it with pip install -e '.[rl]'"
+        "tapeforge.execution.rl.gym_env needs gymnasium; install it with pip install -e '.[rl]'"
     ) from exc
 
-from tapeforge.execution.normalization import ObservationStatistics, normalize
-from tapeforge.execution.sampling import draw_episode, materialize
+from tapeforge.execution.data.sampling import draw_episode, materialize
+from tapeforge.execution.data.splits import Splits
+from tapeforge.execution.rl.normalization import ObservationStatistics, normalize
 from tapeforge.execution.simulator import (
     OBSERVATION_FIELDS,
     SIMULATOR_VERSION,
@@ -108,7 +109,6 @@ from tapeforge.execution.simulator import (
     step,
 )
 from tapeforge.execution.spec import EpisodeSpec
-from tapeforge.execution.splits import Splits
 from tapeforge.execution.state import MarketSlice, State, StepResult
 
 __all__ = [

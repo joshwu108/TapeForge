@@ -1,4 +1,4 @@
-"""Tests for tapeforge.execution.evaluation and the versioned statistics files: strict training
+"""Tests for tapeforge.execution.rl.evaluation and the versioned statistics files: strict training
 configuration, fixed evaluation manifests, the external-callable interface writing baseline-
 comparable records, and the model-agnostic checkpoint provenance.
 
@@ -14,7 +14,16 @@ import numpy as np
 import pytest
 
 from tapeforge.execution.baselines import BASELINES, twap
-from tapeforge.execution.evaluation import (
+from tapeforge.execution.data.sampling import sample_episodes
+from tapeforge.execution.research.experiment import (
+    ConfigError,
+    acquire_days,
+    load_manifest,
+    rebuild_splits,
+    run_experiment,
+)
+from tapeforge.execution.research.report import build_report, episode_rows, load_records
+from tapeforge.execution.rl.evaluation import (
     CHECKPOINT_PROVENANCE_SCHEMA,
     EVALUATION_MANIFEST_SCHEMA,
     TRAINING_CONFIG_SCHEMA,
@@ -30,23 +39,14 @@ from tapeforge.execution.evaluation import (
     vector_policy,
     write_evaluation_manifest,
 )
-from tapeforge.execution.experiment import (
-    ConfigError,
-    acquire_days,
-    load_manifest,
-    rebuild_splits,
-    run_experiment,
-)
-from tapeforge.execution.normalization import (
+from tapeforge.execution.rl.normalization import (
     STATISTICS_SCHEMA,
     load_statistics,
     observation_statistics,
     save_statistics,
     statistics_from_json,
 )
-from tapeforge.execution.report import build_report, episode_rows, load_records
 from tapeforge.execution.runner import observation_for, run_episode, summarize_episode
-from tapeforge.execution.sampling import sample_episodes
 from tapeforge.execution.simulator import OBSERVATION_FIELDS, SIMULATOR_VERSION
 from test_execution.configs import synthetic_config
 

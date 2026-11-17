@@ -72,6 +72,9 @@ def test_tree_files_follow_gitignore() -> None:
     files = {str(p.relative_to(REPO)) for p in vs.tree_files()}
     assert "README.rst" in files and "src/tapeforge/contract.py" in files
     assert "src/tapeforge/streaming.py" in files
+    assert "src/tapeforge/execution/data/datasets.py" in files
+    assert "src/tapeforge/execution/research/experiment.py" in files
+    assert "src/tapeforge/execution/rl/gym_env.py" in files
     assert not any(name.startswith(("planning/", ".venv/", "venv/", "data/")) for name in files)
     assert not any(name.endswith(".md") for name in files)
     assert not any("__pycache__" in name for name in files)

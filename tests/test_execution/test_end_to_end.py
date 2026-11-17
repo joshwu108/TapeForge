@@ -16,7 +16,21 @@ import numpy as np
 import pytest
 
 from tapeforge.execution.baselines import BASELINES
-from tapeforge.execution.evaluation import (
+from tapeforge.execution.research.experiment import (
+    acquire_days,
+    load_config,
+    load_manifest,
+    rebuild_splits,
+    run_experiment,
+)
+from tapeforge.execution.research.replay import replay_episode, verify_against_record
+from tapeforge.execution.research.report import (
+    build_report,
+    episode_rows,
+    load_records,
+    write_report,
+)
+from tapeforge.execution.rl.evaluation import (
     checkpoint_provenance,
     evaluate_policy,
     evaluation_manifest,
@@ -27,16 +41,7 @@ from tapeforge.execution.evaluation import (
     vector_policy,
     write_evaluation_manifest,
 )
-from tapeforge.execution.experiment import (
-    acquire_days,
-    load_config,
-    load_manifest,
-    rebuild_splits,
-    run_experiment,
-)
-from tapeforge.execution.normalization import load_statistics, save_statistics
-from tapeforge.execution.replay import replay_episode, verify_against_record
-from tapeforge.execution.report import build_report, episode_rows, load_records, write_report
+from tapeforge.execution.rl.normalization import load_statistics, save_statistics
 from tapeforge.execution.runner import observation_for, run_episode, summarize_episode
 from tapeforge.execution.simulator import OBSERVATION_FIELDS, SIMULATOR_VERSION
 from test_execution.configs import synthetic_mapping
@@ -86,8 +91,8 @@ terminal_surcharge_bps = 25
 
 def test_end_to_end_synthetic_pipeline(tmp_path: Path) -> None:
     pytest.importorskip("gymnasium")
-    from tapeforge.execution.env_check import check_environment
-    from tapeforge.execution.gym_env import ExecutionEnv, SplitPool
+    from tapeforge.execution.rl.env_check import check_environment
+    from tapeforge.execution.rl.gym_env import ExecutionEnv, SplitPool
 
     config_path = tmp_path / "e2e.toml"
     config_path.write_text(CONFIG_TOML)

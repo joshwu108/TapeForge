@@ -12,10 +12,10 @@ from pathlib import Path
 
 import pytest
 
-from tapeforge.execution import sensitivity as sensitivity_module
-from tapeforge.execution.experiment import run_experiment
-from tapeforge.execution.report import build_report
-from tapeforge.execution.sensitivity import (
+from tapeforge.execution.research import sensitivity as sensitivity_module
+from tapeforge.execution.research.experiment import run_experiment
+from tapeforge.execution.research.report import build_report
+from tapeforge.execution.research.sensitivity import (
     SENSITIVITY_SCHEMA,
     build_sensitivity,
     render_sensitivity_rst,
@@ -145,11 +145,11 @@ def test_sensitivity_cli_writes_json_csv_and_rst(
 
 def test_env_check_passes_on_the_synthetic_configuration(tmp_path: Path) -> None:
     pytest.importorskip("gymnasium")
-    from tapeforge.execution import env_check
-    from tapeforge.execution.evaluation import training_config_from_mapping as tc
-    from tapeforge.execution.evaluation import training_statistics
-    from tapeforge.execution.experiment import rebuild_splits
-    from tapeforge.execution.normalization import save_statistics
+    from tapeforge.execution.research.experiment import rebuild_splits
+    from tapeforge.execution.rl import env_check
+    from tapeforge.execution.rl.evaluation import training_config_from_mapping as tc
+    from tapeforge.execution.rl.evaluation import training_statistics
+    from tapeforge.execution.rl.normalization import save_statistics
 
     mapping = synthetic_mapping()
     path = tmp_path / "exp.toml"

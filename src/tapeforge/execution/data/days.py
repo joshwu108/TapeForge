@@ -43,7 +43,7 @@ import numpy as np
 
 from tapeforge import generate, ingest, reference, windows
 from tapeforge.contract import DEFAULT_BUCKET_WIDTH_US, TRADE_DTYPE, US_PER_SECOND
-from tapeforge.execution.episodes import (
+from tapeforge.execution.data.episodes import (
     reference_volume_ticks,
     required_window,
     target_from_reference_volume,

@@ -14,10 +14,10 @@ from pathlib import Path
 import pytest
 
 from tapeforge.execution.baselines import BASELINES
-from tapeforge.execution.days import BUCKETS_PER_DAY, DayTape, day_from_archive
+from tapeforge.execution.data.days import BUCKETS_PER_DAY, DayTape, day_from_archive
+from tapeforge.execution.data.splits import SplitDates, Splits, build_splits
 from tapeforge.execution.runner import run_policy, write_run_record
 from tapeforge.execution.spec import EpisodeSpec
-from tapeforge.execution.splits import SplitDates, Splits, build_splits
 
 REPO = Path(__file__).resolve().parent.parent.parent
 FUTURES_DAY = REPO / "data" / "futures-um" / "aggTrades" / "BTCUSDT-aggTrades-2023-12-01.zip"

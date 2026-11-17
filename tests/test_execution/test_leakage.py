@@ -12,13 +12,13 @@ import pytest
 
 from tapeforge.contract import DEFAULT_BUCKET_WIDTH_US as W
 from tapeforge.execution.baselines import twap
-from tapeforge.execution.days import DayTape, episode_at, synthetic_day
-from tapeforge.execution.episodes import required_window
+from tapeforge.execution.data.days import DayTape, episode_at, synthetic_day
+from tapeforge.execution.data.episodes import required_window
+from tapeforge.execution.data.sampling import materialize, sample_episodes
+from tapeforge.execution.data.splits import SplitDates, build_splits
 from tapeforge.execution.runner import run_episode
-from tapeforge.execution.sampling import materialize, sample_episodes
 from tapeforge.execution.simulator import observe, reset
 from tapeforge.execution.spec import EpisodeSpec
-from tapeforge.execution.splits import SplitDates, build_splits
 from tapeforge.execution.state import MarketSlice
 
 SPEC = EpisodeSpec(side=1, target_qty_ticks=1, horizon_buckets=5, arrival_lookback=3)

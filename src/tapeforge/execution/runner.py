@@ -38,7 +38,8 @@ from typing import Any, Final
 
 import numpy as np
 
-from tapeforge.execution.sampling import EpisodeDraw, materialize, sample_episodes
+from tapeforge.execution.data.sampling import EpisodeDraw, materialize, sample_episodes
+from tapeforge.execution.data.splits import Splits
 from tapeforge.execution.simulator import (
     SIMULATOR_VERSION,
     fill_shortfall,
@@ -53,7 +54,6 @@ from tapeforge.execution.simulator import (
     step,
 )
 from tapeforge.execution.spec import ACCEPTED_TARGET_FRACTIONS_BPS, EpisodeSpec
-from tapeforge.execution.splits import Splits
 from tapeforge.execution.state import MarketSlice, State, StepResult
 
 __all__ = [

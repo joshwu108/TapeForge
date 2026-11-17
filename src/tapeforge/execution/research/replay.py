@@ -36,7 +36,9 @@ from pathlib import Path
 from typing import Any
 
 from tapeforge.execution.baselines import BASELINES
-from tapeforge.execution.experiment import (
+from tapeforge.execution.data.sampling import EpisodeDraw, draw_episode, materialize
+from tapeforge.execution.data.splits import Splits
+from tapeforge.execution.research.experiment import (
     config_from_mapping,
     config_mapping_from_manifest,
     load_manifest,
@@ -44,10 +46,8 @@ from tapeforge.execution.experiment import (
     rebuild_splits,
 )
 from tapeforge.execution.runner import Trajectory, run_episode, summarize_episode
-from tapeforge.execution.sampling import EpisodeDraw, draw_episode, materialize
 from tapeforge.execution.simulator import newest_visible_bucket, remaining_qty_ticks
 from tapeforge.execution.spec import EpisodeSpec
-from tapeforge.execution.splits import Splits
 from tapeforge.execution.state import MarketSlice
 
 __all__ = [
@@ -287,7 +287,7 @@ def main(argv: list[str] | None = None) -> int:
         0 on success (and, with ``--verify``, when the replay matches the
         record), 1 otherwise.
     """
-    parser = argparse.ArgumentParser(prog="python -m tapeforge.execution.replay")
+    parser = argparse.ArgumentParser(prog="python -m tapeforge.execution.research.replay")
     parser.add_argument("run_dir")
     parser.add_argument("--episode", required=True, help="<role>/s<seed>/i<index>")
     parser.add_argument("--policy", required=True, choices=sorted(BASELINES))

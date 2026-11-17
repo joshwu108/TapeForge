@@ -48,7 +48,9 @@ from typing import Any, Final
 import numpy as np
 
 from tapeforge.execution.baselines import BASELINES
-from tapeforge.execution.experiment import (
+from tapeforge.execution.data.sampling import sample_episodes
+from tapeforge.execution.data.splits import ROLES, Splits
+from tapeforge.execution.research.experiment import (
     MANIFEST_NAME,
     RECORDS_SUBDIR,
     ConfigError,
@@ -59,7 +61,7 @@ from tapeforge.execution.experiment import (
     rebuild_splits,
     write_json_atomic,
 )
-from tapeforge.execution.normalization import (
+from tapeforge.execution.rl.normalization import (
     STATISTICS_SCHEMA,
     ObservationStatistics,
     normalize,
@@ -72,9 +74,7 @@ from tapeforge.execution.runner import (
     code_revision,
     run_policy,
 )
-from tapeforge.execution.sampling import sample_episodes
 from tapeforge.execution.simulator import OBSERVATION_FIELDS, SIMULATOR_VERSION
-from tapeforge.execution.splits import ROLES, Splits
 
 __all__ = [
     "CHECKPOINT_PROVENANCE_SCHEMA",

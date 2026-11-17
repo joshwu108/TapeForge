@@ -32,9 +32,9 @@ from typing import Any
 
 import numpy as np
 
-from tapeforge.execution.experiment import ConfigError, load_config, rebuild_splits
-from tapeforge.execution.gym_env import ExecutionEnv, SplitPool
-from tapeforge.execution.normalization import load_statistics
+from tapeforge.execution.research.experiment import ConfigError, load_config, rebuild_splits
+from tapeforge.execution.rl.gym_env import ExecutionEnv, SplitPool
+from tapeforge.execution.rl.normalization import load_statistics
 from tapeforge.execution.runner import run_episode, summarize_episode
 from tapeforge.execution.simulator import OBSERVATION_FIELDS, reset, step
 
@@ -252,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         0 when every check passed, 1 with the failed check on stderr.
     """
-    parser = argparse.ArgumentParser(prog="python -m tapeforge.execution.env_check")
+    parser = argparse.ArgumentParser(prog="python -m tapeforge.execution.rl.env_check")
     parser.add_argument("config", help="experiment configuration (schema 2)")
     parser.add_argument("--role", default="train", help="split role to draw from (never test)")
     parser.add_argument("--episodes", type=int, default=8,

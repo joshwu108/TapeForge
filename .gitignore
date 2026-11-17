@@ -53,7 +53,7 @@ htmlcov/
 coverage.xml
 
 # Datasets: downloaded market data archives are never committed (licence and size).
-data/
+/data/
 *.zip
 *.csv.gz
 *.parquet

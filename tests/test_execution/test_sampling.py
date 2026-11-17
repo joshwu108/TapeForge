@@ -1,24 +1,24 @@
-"""Tests for tapeforge.execution.sampling: a draw is a pure function of (seed, role, index), draws
+"""Tests for tapeforge.execution.data.sampling: a draw is a pure function of (seed, role, index),
+draws
 cover the whole side and target-fraction domain, and ``materialize`` cuts the episode a draw names.
 
 ``_splits`` builds three flat single-price days whose prices identify the day a
-materialised episode came from.
-"""
+materialised episode came from."""
 
 from __future__ import annotations
 
 import pytest
 
 from tapeforge.contract import DEFAULT_BUCKET_WIDTH_US as W
-from tapeforge.execution.days import DayTape
-from tapeforge.execution.sampling import (
+from tapeforge.execution.data.days import DayTape
+from tapeforge.execution.data.sampling import (
     EpisodeDraw,
     draw_episode,
     materialize,
     sample_episodes,
 )
+from tapeforge.execution.data.splits import SplitDates, Splits, build_splits
 from tapeforge.execution.spec import ACCEPTED_TARGET_FRACTIONS_BPS, EpisodeSpec
-from tapeforge.execution.splits import SplitDates, Splits, build_splits
 from test_execution.tapes import DEEP, P0, slice_from_rows
 
 SPEC = EpisodeSpec(side=1, target_qty_ticks=1, horizon_buckets=5, latency_buckets=1,

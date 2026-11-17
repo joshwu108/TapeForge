@@ -35,11 +35,11 @@ from typing import Any, Final
 
 import numpy as np
 
+from tapeforge.execution.data.sampling import EpisodeDraw, materialize
+from tapeforge.execution.data.splits import Splits
 from tapeforge.execution.runner import Policy, run_episode
-from tapeforge.execution.sampling import EpisodeDraw, materialize
 from tapeforge.execution.simulator import OBSERVATION_FIELDS, SIMULATOR_VERSION
 from tapeforge.execution.spec import EpisodeSpec
-from tapeforge.execution.splits import Splits
 
 __all__ = [
     "STATISTICS_SCHEMA",

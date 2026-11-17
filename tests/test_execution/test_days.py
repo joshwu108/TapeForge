@@ -1,4 +1,4 @@
-"""Tests for tapeforge.execution.days: UTC day geometry, the synthetic, trade-array and archive
+"""Tests for tapeforge.execution.data.days: UTC day geometry, the synthetic, trade-array and archive
 adapters, contiguity and concatenation, slice cutting, and episodes cut from a day tape.
 
 Synthetic days are checked bucket for bucket against the reference feature
@@ -14,7 +14,7 @@ import pytest
 
 from tapeforge import contract, generate, reference, windows
 from tapeforge.execution import EpisodeSpec, make_episode, reset
-from tapeforge.execution.days import (
+from tapeforge.execution.data.days import (
     BUCKETS_PER_DAY,
     DayTape,
     concat_tapes,

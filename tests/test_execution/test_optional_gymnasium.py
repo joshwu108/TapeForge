@@ -25,7 +25,8 @@ def _run(code: str) -> subprocess.CompletedProcess[str]:
 def test_the_execution_package_imports_and_runs_without_gymnasium() -> None:
     result = _run(
         "from tapeforge.execution import BASELINES, EpisodeSpec, run_episode; "
-        "from tapeforge.execution import experiment, report, replay, datasets; "
+        "from tapeforge.execution.research import experiment, report, replay; "
+        "from tapeforge.execution.data import datasets; "
         "from test_execution.tapes import worksheet_spec, worksheet_tape; "
         "t = run_episode(worksheet_spec(side=1), worksheet_tape(), BASELINES['twap']); "
         "print(t.final_state.cash_ticks)"
@@ -35,6 +36,6 @@ def test_the_execution_package_imports_and_runs_without_gymnasium() -> None:
 
 
 def test_the_adapter_names_the_optional_dependency() -> None:
-    result = _run("import tapeforge.execution.gym_env")
+    result = _run("import tapeforge.execution.rl.gym_env")
     assert result.returncode != 0
     assert "ImportError" in result.stderr and "pip install -e '.[rl]'" in result.stderr

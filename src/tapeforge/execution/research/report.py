@@ -71,7 +71,7 @@ from typing import Any, Final
 import numpy as np
 
 from tapeforge.execution.baselines import DIAGNOSTIC_POLICIES
-from tapeforge.execution.experiment import (
+from tapeforge.execution.research.experiment import (
     EXPERIMENT_MANIFEST_SCHEMA,
     load_manifest,
     write_json_atomic,
@@ -902,7 +902,7 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         0 on success, 1 on a bad run directory or reference.
     """
-    parser = argparse.ArgumentParser(prog="python -m tapeforge.execution.report")
+    parser = argparse.ArgumentParser(prog="python -m tapeforge.execution.research.report")
     parser.add_argument("run_dir")
     parser.add_argument("--reference", default=None, help="policy to pair against")
     parser.add_argument("--include-test", action="store_true", help="include held-out records")

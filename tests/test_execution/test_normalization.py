@@ -1,4 +1,4 @@
-"""Tests for tapeforge.execution.normalization: observation statistics are computed from training
+"""Tests for tapeforge.execution.rl.normalization: observation statistics are computed from training
 draws only, ``normalize`` centres and scales with a unit divisor for constant fields, and the
 statistics round-trip through JSON.
 
@@ -13,17 +13,17 @@ import pytest
 
 from tapeforge.contract import DEFAULT_BUCKET_WIDTH_US as W
 from tapeforge.execution.baselines import twap
-from tapeforge.execution.days import DayTape, synthetic_day
-from tapeforge.execution.normalization import (
+from tapeforge.execution.data.days import DayTape, synthetic_day
+from tapeforge.execution.data.sampling import materialize, sample_episodes
+from tapeforge.execution.data.splits import SplitDates, Splits, build_splits
+from tapeforge.execution.rl.normalization import (
     ObservationStatistics,
     normalize,
     observation_statistics,
 )
 from tapeforge.execution.runner import run_episode
-from tapeforge.execution.sampling import materialize, sample_episodes
 from tapeforge.execution.simulator import OBSERVATION_FIELDS
 from tapeforge.execution.spec import EpisodeSpec
-from tapeforge.execution.splits import SplitDates, Splits, build_splits
 from test_execution.tapes import DEEP, P0, slice_from_rows
 
 SPEC = EpisodeSpec(side=1, target_qty_ticks=1, horizon_buckets=5, arrival_lookback=3)

@@ -1,10 +1,10 @@
-"""Tests for tapeforge.execution.experiment: strict configuration loading, identical episodes for
+"""Tests for tapeforge.execution.research.experiment: strict configuration loading, identical
+episodes for
 every policy regardless of order, reproducible run directories, the held-out rule, atomic and
 collision-safe writes, and the comparison utility.
 
 Everything runs on the synthetic configuration of ``test_execution.configs``;
-the archive path is exercised with a fake network in ``test_datasets``.
-"""
+the archive path is exercised with a fake network in ``test_datasets``."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from tapeforge.execution import experiment
-from tapeforge.execution.experiment import (
+from tapeforge.execution.research import experiment
+from tapeforge.execution.research.experiment import (
     EXPERIMENT_MANIFEST_SCHEMA,
     ConfigError,
     compare_experiments,

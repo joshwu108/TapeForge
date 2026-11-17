@@ -31,8 +31,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
 
-from tapeforge.execution.experiment import load_manifest, write_json_atomic
-from tapeforge.execution.report import (
+from tapeforge.execution.research.experiment import load_manifest, write_json_atomic
+from tapeforge.execution.research.report import (
     EpisodeRow,
     episode_rows,
     group_statistics,
@@ -222,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         0 on success, 1 when the runs are not comparable or a manifest is bad.
     """
-    parser = argparse.ArgumentParser(prog="python -m tapeforge.execution.sensitivity")
+    parser = argparse.ArgumentParser(prog="python -m tapeforge.execution.research.sensitivity")
     parser.add_argument("run_dirs", nargs="+")
     parser.add_argument("--out", required=True, help="output directory")
     parser.add_argument("--include-test", action="store_true")

@@ -64,7 +64,7 @@ from typing import Any, Final
 import numpy as np
 
 from tapeforge.execution.baselines import BASELINES
-from tapeforge.execution.datasets import (
+from tapeforge.execution.data.datasets import (
     DEFAULT_MAX_DOWNLOAD_ARCHIVES,
     DEFAULT_MAX_DOWNLOAD_BYTES,
     ArchiveRecord,
@@ -73,9 +73,10 @@ from tapeforge.execution.datasets import (
     DownloadBudget,
     ensure_archives,
 )
-from tapeforge.execution.days import DayTape, day_from_archive, synthetic_day
+from tapeforge.execution.data.days import DayTape, day_from_archive, synthetic_day
+from tapeforge.execution.data.sampling import sample_episodes
+from tapeforge.execution.data.splits import ROLES, SplitDates, Splits, build_splits
 from tapeforge.execution.runner import code_revision, run_policy
-from tapeforge.execution.sampling import sample_episodes
 from tapeforge.execution.simulator import SIMULATOR_ASSUMPTIONS, SIMULATOR_VERSION
 from tapeforge.execution.spec import (
     ACCEPTED_TARGET_FRACTIONS_BPS,
@@ -83,7 +84,6 @@ from tapeforge.execution.spec import (
     TERMINAL_RULES,
     EpisodeSpec,
 )
-from tapeforge.execution.splits import ROLES, SplitDates, Splits, build_splits
 from tapeforge.ingest import MARKET_BASE_URLS
 
 __all__ = [
@@ -877,7 +877,7 @@ def main(argv: list[str] | None = None) -> int:
         0 on success; 1 on a configuration, data or comparison failure, with
         the reason on stderr.
     """
-    parser = argparse.ArgumentParser(prog="python -m tapeforge.execution.experiment")
+    parser = argparse.ArgumentParser(prog="python -m tapeforge.execution.research.experiment")
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="replay every configured policy and write a run directory")
     run.add_argument("config", help="TOML experiment configuration")

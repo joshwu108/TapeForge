@@ -1,9 +1,9 @@
-"""Tests for tapeforge.execution.datasets: archive paths per market, checksum-verified downloads
+"""Tests for tapeforge.execution.data.datasets: archive paths per market, checksum-verified
+downloads
 through a fake ``urlopen``, cache reuse, the download budget, failure reporting and the manifest.
 
 No test touches the network: ``_fake_network`` serves the committed five-record
-fixture archive and answers HEAD requests with its size.
-"""
+fixture archive and answers HEAD requests with its size."""
 
 from __future__ import annotations
 
@@ -16,8 +16,8 @@ from typing import Any
 
 import pytest
 
-from tapeforge.execution import datasets
-from tapeforge.execution.datasets import (
+from tapeforge.execution.data import datasets
+from tapeforge.execution.data.datasets import (
     DATASET_MANIFEST_SCHEMA,
     ArchiveSpec,
     DatasetError,

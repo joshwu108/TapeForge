@@ -16,7 +16,8 @@ import pytest
 
 from tapeforge.contract import DEFAULT_BUCKET_WIDTH_US as W
 from tapeforge.execution.baselines import immediate, twap
-from tapeforge.execution.days import DayTape, synthetic_day
+from tapeforge.execution.data.days import DayTape, synthetic_day
+from tapeforge.execution.data.splits import SplitDates, Splits, build_splits
 from tapeforge.execution.runner import (
     RUN_RECORD_SCHEMA,
     EpisodeSummary,
@@ -33,7 +34,6 @@ from tapeforge.execution.runner import (
 )
 from tapeforge.execution.simulator import OBSERVATION_FIELDS, SIMULATOR_VERSION, observe, reset
 from tapeforge.execution.spec import EpisodeSpec
-from tapeforge.execution.splits import SplitDates, Splits, build_splits
 from tapeforge.execution.state import MarketSlice
 from test_execution.policies import rollout, twap_policy
 from test_execution.tapes import (

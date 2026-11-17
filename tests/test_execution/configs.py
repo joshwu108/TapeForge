@@ -10,7 +10,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from tapeforge.execution.experiment import (
+from tapeforge.execution.research.experiment import (
     EXPERIMENT_CONFIG_SCHEMA,
     ExperimentConfig,
     config_from_mapping,

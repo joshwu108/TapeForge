@@ -1,9 +1,9 @@
-"""Tests for tapeforge.execution.episodes: the required window, the reference volume, the target
+"""Tests for tapeforge.execution.data.episodes: the required window, the reference volume, the
+target
 quantity derived from it, and episode construction from a trade array.
 
 Rounding cases are pinned with exact integers; ``_day`` generates a uniform
-synthetic day for the end-to-end checks.
-"""
+synthetic day for the end-to-end checks."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from tapeforge.execution import (
     reset,
     target_from_reference_volume,
 )
-from tapeforge.execution.episodes import round_half_up_bps
+from tapeforge.execution.data.episodes import round_half_up_bps
 from test_execution.policies import rollout, twap_policy
 from test_execution.tapes import DEEP, P0, slice_from_rows
 

@@ -77,7 +77,6 @@ Status
    * - Planned research
      - Learned execution policies, GPU-vectorized environments, quote-aware
        fills, and robustness/fidelity experiments remain unimplemented.
-       ``model.py`` and ``benchmarks/train.py`` are stubs.
 
 CI checks CPU behavior; it has no CUDA runner. Hardware verification must be
 repeated after GPU-facing changes. The quick T4 benchmark checked correctness
@@ -113,18 +112,18 @@ Start with synthetic data; no downloads or GPU are needed:
 
 .. code-block:: console
 
-   $ python -m tapeforge.execution.experiment run experiments/configs/smoke-synthetic.toml
+   $ python -m tapeforge.execution.research.experiment run experiments/configs/smoke-synthetic.toml
 
 The command creates ``runs/<name>-<utc>/``. Use the printed directory in
 subsequent commands:
 
 .. code-block:: console
 
-   $ python -m tapeforge.execution.report runs/<run-dir>
-   $ python -m tapeforge.execution.replay runs/<run-dir> \
+   $ python -m tapeforge.execution.research.report runs/<run-dir>
+   $ python -m tapeforge.execution.research.replay runs/<run-dir> \
        --episode validation/s1/i0 --policy twap --verify
-   $ python -m tapeforge.execution.experiment compare runs/<run-a> runs/<run-b>
-   $ python -m tapeforge.execution.env_check experiments/configs/smoke-synthetic.toml
+   $ python -m tapeforge.execution.research.experiment compare runs/<run-a> runs/<run-b>
+   $ python -m tapeforge.execution.rl.env_check experiments/configs/smoke-synthetic.toml
 
 The report writes JSON, CSV, and reStructuredText under ``<run-dir>/report/``.
 Replay prints the visible market bucket, action, submitted quantity, fill
@@ -143,13 +142,13 @@ identical across settings so the sensitivity tool can line them up:
 
 .. code-block:: console
 
-   $ python -m tapeforge.execution.datasets fetch --market futures-um \
+   $ python -m tapeforge.execution.data.datasets fetch --market futures-um \
        --symbol BTCUSDT --date 2023-12-01 --date 2023-12-02 --date 2023-12-03
-   $ for s in 0 10 25 50; do python -m tapeforge.execution.experiment run \
+   $ for s in 0 10 25 50; do python -m tapeforge.execution.research.experiment run \
        experiments/configs/smoke-futures-btcusdt-2023-12-settlement-${s}bps.toml; done
-   $ python -m tapeforge.execution.experiment run \
+   $ python -m tapeforge.execution.research.experiment run \
        experiments/configs/smoke-futures-btcusdt-2023-12-legacy-perold.toml
-   $ python -m tapeforge.execution.sensitivity runs/<run-0bps> runs/<run-10bps> \
+   $ python -m tapeforge.execution.research.sensitivity runs/<run-0bps> runs/<run-10bps> \
        runs/<run-25bps> runs/<run-50bps> runs/<run-legacy> --out runs/<sensitivity-dir>
 
 ``smoke-futures-btcusdt-2023-12.toml`` is the 25 bps settlement configuration
@@ -381,7 +380,7 @@ To use the same episode with Gymnasium after installing ``.[rl]``:
 
 .. code-block:: text
 
-   from tapeforge.execution.gym_env import ExecutionEnv, ListPool
+   from tapeforge.execution.rl.gym_env import ExecutionEnv, ListPool
 
    env = ExecutionEnv(ListPool([("example", spec, market)]))
    observation, info = env.reset(seed=7)
@@ -393,7 +392,7 @@ checkpoint selection, and GPU-vectorized environments are not included.
 Evaluating a policy
 ===================
 
-``tapeforge.execution.evaluation`` holds what a trainer needs around the
+``tapeforge.execution.rl.evaluation`` holds what a trainer needs around the
 environment, and nothing of the trainer itself.
 
 * ``load_training_config`` reads a strict TOML description
@@ -428,7 +427,7 @@ environment, and nothing of the trainer itself.
    import numpy as np
 
    from tapeforge.execution import evaluate_policy, run_experiment, vector_policy
-   from tapeforge.execution.experiment import load_config, rebuild_splits
+   from tapeforge.execution.research.experiment import load_config, rebuild_splits
 
    config = load_config("experiments/configs/smoke-synthetic.toml")
    run_dir = run_experiment(config, output_dir=tempfile.mkdtemp())
@@ -500,8 +499,7 @@ Checks and GPU verification
    $ python -m pytest -q tests/test_execution/test_gym_env.py tests/test_execution/test_end_to_end.py
    $ python -m mypy
 
-The strict type check currently reports two known errors in the ``model.py``
-stub. CUDA tests skip with a capability reason on CPU machines. Tests using
+CUDA tests skip with a capability reason on CPU machines. Tests using
 optional downloaded archives name missing files when skipped. The default
 suite includes slow tests. README Python examples execute in the docs tests.
 
@@ -540,7 +538,7 @@ forced two-pass execution, eager/compiled PyTorch, and the CPU reference.
 Stage rows separate validation, metadata, allocation, and preparation; these
 overlap with end-to-end rows and must not be added to them.
 ``pipeline.py`` measures host/device transfers and compute using pageable or
-pinned memory. Pinned-stream overlap and ``train.py`` remain unimplemented.
+pinned memory. Pinned-stream overlap and end-to-end training benchmarks remain unimplemented.
 
 Correctness is checked before timing. Warm-up excludes compilation. Results
 record wall-clock or CUDA-event timing, workload distribution, setup included
@@ -562,21 +560,33 @@ Repository layout
      kernels.py, prepared.py, ops.py  GPU kernels and public feature API
      execution/
        spec.py, state.py             execution rules and data structures
-       simulator.py, episodes.py     transitions and episode construction
-       days.py, splits.py            day tapes and chronological partitions
-       sampling.py, normalization.py seeded tasks and training statistics
-       baselines.py, runner.py       policies, replay loop, summaries
-       datasets.py, experiment.py    acquisition and configured experiments
-       report.py, replay.py          aggregate reports and episode inspection
-       sensitivity.py                cross-run terminal-rule comparison
-       evaluation.py                 evaluation sets, external policies, provenance
-       gym_env.py, env_check.py      optional Gymnasium interface and checker
-     model.py                        classifier stub
+       simulator.py                  fills, accounting and state transitions
+       baselines.py, runner.py        reference policies and episode replay
+       data/
+         datasets.py                 archive acquisition and checksums
+         days.py, episodes.py        bucket tapes and episode construction
+         splits.py, sampling.py      chronological partitions and seeded tasks
+       research/
+         experiment.py               configured runs and artifact manifests
+         report.py, replay.py        result summaries and episode inspection
+         sensitivity.py              terminal-rule comparisons
+       rl/
+         normalization.py            training statistics and versioned files
+         evaluation.py               fixed evaluation sets and provenance
+         gym_env.py, env_check.py     optional Gymnasium interface and checker
    experiments/configs/              synthetic and futures smoke configs per terminal setting
    benchmarks/                       compute/transfer timings and result records
    tests/                            CPU/GPU parity, accounting, leakage, tooling
    tools/                            parity summary and snapshot verification
    data/, runs/                      local datasets and outputs; Git-ignored
+
+Execution modules are grouped by the workflow they support: ``data`` prepares
+inputs, ``research`` runs and inspects experiments, and ``rl`` connects trainers
+to the CPU simulator. The core simulation files stay in ``execution/``.
+Public imports such as ``from tapeforge.execution import EpisodeSpec, run_policy``
+are unchanged. Module-specific imports and CLI commands use the subpackages,
+for example ``python -m tapeforge.execution.research.experiment``. Update local
+scripts using the former flat module paths; artifact schemas are unchanged.
 
 Development guidelines
 ======================

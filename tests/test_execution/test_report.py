@@ -1,4 +1,4 @@
-"""Tests for tapeforge.execution.report: outcome classes, hand-calculated group and paired
+"""Tests for tapeforge.execution.research.report: outcome classes, hand-calculated group and paired
 statistics, independent reconstruction from the records, the day-count gate on uncertainty, the
 held-out rule and the exported files.
 
@@ -16,9 +16,9 @@ from pathlib import Path
 
 import pytest
 
-from tapeforge.execution import report as report_module
-from tapeforge.execution.experiment import run_experiment
-from tapeforge.execution.report import (
+from tapeforge.execution.research import report as report_module
+from tapeforge.execution.research.experiment import run_experiment
+from tapeforge.execution.research.report import (
     REPORT_SCHEMA,
     EpisodeRow,
     build_report,

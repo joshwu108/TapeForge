@@ -1,7 +1,7 @@
-"""Tests for tapeforge.execution.replay: an episode identifier rebuilds the recorded episode
+"""Tests for tapeforge.execution.research.replay: an episode identifier rebuilds the recorded
+episode
 exactly, the step rows expose what the policy saw and what happened, and bad identifiers fail
-with a reason.
-"""
+with a reason."""
 
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from tapeforge.execution import replay as replay_module
-from tapeforge.execution.experiment import run_experiment
-from tapeforge.execution.replay import (
+from tapeforge.execution.research import replay as replay_module
+from tapeforge.execution.research.experiment import run_experiment
+from tapeforge.execution.research.replay import (
     STEP_COLUMNS,
     format_replay,
     replay_episode,
