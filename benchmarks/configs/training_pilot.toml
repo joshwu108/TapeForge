@@ -1,0 +1,24 @@
+# Training-pipeline benchmark on the pilot experiment (23 local futures days).
+# Needs the archives of experiments/configs/pilot-futures-btcusdt-2023-12.toml.
+name = "training-pilot"
+scope = "train"
+ppo_config = "experiments/configs/pilot-futures-btcusdt-2023-12-ppo.toml"
+backends = ["serial", "subprocess", "batched"]
+device = "cpu"                 # device of the batched simulator and its policy; "cuda" on a GPU
+sections = ["features", "env_step", "batched_core", "policy", "end_to_end"]
+model_seed = 0
+total_steps = 960000           # per backend, identical sample budget
+output_dir = "runs/benchmarks"
+
+feature_episodes = 200
+env_step_vector_steps = 2000
+core_batch_sizes = [8, 64, 512, 4096]
+core_vector_steps = 300
+
+# Predeclared timing target, not a success criterion: the validation mean
+# shortfall of the `immediate` baseline in the pilot baseline run, i.e. "at
+# least as cheap as submitting everything at every decision". Runs that never
+# reach it are reported as such.
+[threshold]
+metric = "validation_mean_shortfall_bps"
+max = 11.366

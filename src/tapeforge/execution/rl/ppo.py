@@ -495,8 +495,9 @@ def train(
     clip fraction, value loss and explained variance of the update after
     it), ``evaluations.jsonl`` and ``selection.json`` (validation scores of
     the scheduled checkpoints and the one selected), ``checkpoints/`` and
-    ``summary.json`` (step counts and the time spent collecting, updating,
-    evaluating and checkpointing).
+    ``summary.json`` (step counts and the time spent loading data, building
+    environments and the model, collecting, updating, evaluating and
+    checkpointing).
 
     Args:
         config: The PPO configuration.
@@ -579,6 +580,7 @@ def train(
 
     torch.set_num_threads(config.torch_threads)
     set_random_seed(model_seed)
+    setup_started = time.perf_counter()
     builder = make_vec_env if vec_env_builder is None else vec_env_builder
     vec_env = builder(config, experiment, training, splits, statistics, model_seed)
 
@@ -631,6 +633,7 @@ def train(
                     f"{config.total_steps}"
                 )
         started = time.perf_counter()
+        setup_seconds = started - setup_started
         model.learn(total_timesteps=remaining, callback=log,
                     reset_num_timesteps=resume_state is None)
         learn_seconds = time.perf_counter() - started
@@ -653,6 +656,7 @@ def train(
         "torch_threads": config.torch_threads,
         "seconds": {
             "data_load": data.data_seconds,
+            "setup": setup_seconds,
             "statistics": data.statistics_seconds,
             **log.seconds,
             "train": train_seconds,

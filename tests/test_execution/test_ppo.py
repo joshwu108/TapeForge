@@ -139,7 +139,7 @@ def test_the_action_map_is_bounded_monotone_and_rejects_non_finite_values() -> N
 def _reference_env(side: int = 1, **spec: int) -> tuple[PolicyActionEnv, EpisodeSpec]:
     episode_spec = worksheet_spec(side, terminal_surcharge_bps=25, **spec)
     pool = ListPool([("reference", episode_spec, worksheet_tape())])
-    return PolicyActionEnv(ExecutionEnv(pool)), episode_spec
+    return PolicyActionEnv(ExecutionEnv(pool), detailed_info=True), episode_spec
 
 
 @pytest.mark.parametrize("side", [1, -1])
@@ -248,6 +248,23 @@ def test_no_future_bucket_reaches_the_policy() -> None:
             streams.append(np.stack(observations))
         assert streams[0].tobytes() == streams[1].tobytes()
         assert len(streams[0]) == changed + 1
+
+
+def test_the_training_environment_reports_lean_info_unless_asked_for_detail() -> None:
+    spec, market = worksheet_spec(1), worksheet_tape()
+    lean = PolicyActionEnv(ExecutionEnv(ListPool([("e", spec, market)])))
+    detailed = PolicyActionEnv(ExecutionEnv(ListPool([("e", spec, market)])), detailed_info=True)
+    raw = np.array([-1.0], dtype=np.float32)
+    summaries = []
+    for env in (lean, detailed):
+        env.reset(seed=0)
+        infos = [env.step(raw)[4] for _ in range(3)]
+        summaries.append(infos[-1]["episode_summary"])
+        if env is lean:
+            assert infos[0] == {} and set(infos[-1]) == {"episode_summary"}
+        else:
+            assert {"step_result", "state", "reward_ticks"} <= set(infos[0])
+    assert summaries[0] == summaries[1]
 
 
 # --- learning on a constructed task --------------------------------------------------------------

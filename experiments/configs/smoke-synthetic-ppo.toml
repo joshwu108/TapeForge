@@ -1,0 +1,40 @@
+# PPO smoke settings on the synthetic experiment: a few seconds on a laptop CPU.
+# Untuned; the run shows that training, checkpointing and evaluation work.
+schema = "tapeforge.execution.ppo-config/1"
+name = "smoke-ppo-synthetic"
+training_config = "experiments/configs/smoke-synthetic-training.toml"
+model_seeds = [0]
+device = "cpu"
+torch_threads = 1
+output_dir = "runs"
+
+[network]
+hidden_sizes = [64, 64]
+activation = "tanh"
+log_std_init = -0.5
+
+[optimizer]
+learning_rate = 3e-4
+adam_eps = 1e-5
+
+[rollout]
+backend = "serial"             # serial | subprocess | batched
+n_envs = 8
+n_steps = 600
+pool_episodes = 500
+
+[update]
+batch_size = 480
+n_epochs = 10
+gamma = 1.0                    # undiscounted finite-horizon cost
+gae_lambda = 0.95
+clip_range = 0.2
+entropy_coef = 0.0
+value_coef = 0.5
+max_grad_norm = 0.5
+normalize_advantage = true
+
+[schedule]
+total_steps = 96000            # 20 rollouts
+eval_every_rollouts = 5
+selection_metric = "validation_mean_shortfall_bps"

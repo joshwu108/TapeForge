@@ -1,0 +1,20 @@
+# Training side of the synthetic smoke experiment; no downloads. Demonstrates
+# that the trainer runs end to end. Synthetic prices are a random walk, so the
+# result carries no market information.
+schema = "tapeforge.execution.training-config/1"
+experiment_config = "experiments/configs/smoke-synthetic.toml"
+policy_name = "ppo"
+
+[training]
+role = "train"
+seeds = [101, 102]             # training pools; distinct from the evaluation seed
+selection = "random"
+reward_unit = "bps"
+
+[normalization]
+reference_policy = "twap"
+seed = 7
+
+[evaluation]
+roles = ["validation"]
+seeds = [1]

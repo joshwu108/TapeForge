@@ -89,11 +89,21 @@ class PolicyActionEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.ndarray
     settlement, and how it ended. The shortfall is the sum of the step cost
     components plus the terminal component (fills only when truncated),
     which is the simulator's own decomposition.
+
+    Args:
+        env: The environment to wrap.
+        detailed_info: Pass ``ExecutionEnv``'s full step info through
+            (exact step record and state on every step). Off by default:
+            the vector environment deep-copies every info dict on every
+            step, and with the full records that copy cost several times
+            the simulator step itself in profiles. The summary is always
+            present on the last step.
     """
 
-    def __init__(self, env: ExecutionEnv) -> None:
+    def __init__(self, env: ExecutionEnv, *, detailed_info: bool = False) -> None:
         super().__init__(env)
         self.action_space = spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32)
+        self.detailed_info = detailed_info
         self._target_qty_ticks = 0
         self._reward_sum = 0.0
         self._cost_ticks = 0
@@ -116,11 +126,12 @@ class PolicyActionEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.ndarray
         self._cost_ticks += components["cost"]
         self._risk_ticks += components["risk"]
         self._steps += 1
+        lean: dict[str, Any] = info if self.detailed_info else {}
         if terminated or truncated:
             state = info["state"]
             notional = state["arrival_price_ticks"] * self._target_qty_ticks
             terminal = components["terminal"]
-            info["episode_summary"] = {
+            lean["episode_summary"] = {
                 "episode_id": info["episode_id"],
                 "n_steps": self._steps,
                 "terminated": terminated,
@@ -132,7 +143,7 @@ class PolicyActionEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.ndarray
                 "filled_fraction": state["filled_qty_ticks"] / self._target_qty_ticks,
                 "settlement_fraction": state["settled_qty_ticks"] / self._target_qty_ticks,
             }
-        return observation, float(reward), terminated, truncated, info
+        return observation, float(reward), terminated, truncated, lean
 
     def snapshot(self) -> dict[str, Any]:
         """Return the collection position of this environment (see ``ExecutionEnv.snapshot``)."""

@@ -508,8 +508,10 @@ class ExecutionEnv(gym.Env[np.ndarray, np.ndarray]):
         spec = self._entry.spec
         return {
             "episode_id": self._entry.episode_id,
-            "step_result": asdict(result),
-            "state": asdict(state),
+            # Flat dataclasses of ints and bools: a shallow copy equals ``asdict`` without
+            # its recursive deep copy, which profiling showed dominating the step.
+            "step_result": dict(vars(result)),
+            "state": dict(vars(state)),
             "remaining_qty_ticks": remaining_qty_ticks(state, spec),
             "reward_ticks": result.reward_ticks,
             "reward_components_ticks": {

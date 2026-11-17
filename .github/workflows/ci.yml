@@ -65,4 +65,4 @@ jobs:
       - name: test the trainer and the batched simulator on CPU tensors
         run: >
           pytest -q tests/test_execution/test_ppo.py tests/test_execution/test_batched.py
-          tests/test_execution/test_batched_env.py
+          tests/test_execution/test_batched_env.py tests/test_training_benchmark.py
