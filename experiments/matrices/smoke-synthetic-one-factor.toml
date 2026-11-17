@@ -1,0 +1,26 @@
+# One-factor matrix on the synthetic smoke experiment: no downloads, a few
+# seconds. Shows the tool; synthetic prices carry no market information.
+schema = "tapeforge.execution.experiment-matrix/1"
+name = "smoke-synthetic-one-factor"
+description = "fee, latency, terminal surcharge and risk coefficient, one at a time; synthetic smoke"
+base_config = "experiments/configs/smoke-synthetic.toml"
+
+[[variants]]
+name = "surcharge-0bps"
+template = { terminal_surcharge_bps = 0 }
+
+[[variants]]
+name = "surcharge-50bps"
+template = { terminal_surcharge_bps = 50 }
+
+[[variants]]
+name = "fee-5bps"
+template = { fee_bps = 5 }
+
+[[variants]]
+name = "latency-1"
+template = { latency_buckets = 1 }
+
+[[variants]]
+name = "risk-lambda-3"
+template = { risk_lambda = 3 }

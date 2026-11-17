@@ -1,0 +1,65 @@
+# One-factor robustness matrix of the pilot. Every value is a labelled
+# experiment setting, not a calibrated estimate; the base is the accepted
+# first configuration (fee 10 bps, no latency or data delay, surcharge 25 bps,
+# risk term off). The period variants re-partition the base's train and
+# validation days; the six sealed test days are never used.
+schema = "tapeforge.execution.experiment-matrix/1"
+name = "pilot-one-factor"
+description = "pilot: terminal surcharge, fee, latency, data delay, risk coefficient and period, one at a time"
+base_config = "experiments/configs/pilot-futures-btcusdt-2023-12.toml"
+
+# Terminal surcharge: the retained 0 / 10 / 25 / 50 bps settings (25 is the base).
+[[variants]]
+name = "surcharge-0bps"
+template = { terminal_surcharge_bps = 0 }
+
+[[variants]]
+name = "surcharge-10bps"
+template = { terminal_surcharge_bps = 10 }
+
+[[variants]]
+name = "surcharge-50bps"
+template = { terminal_surcharge_bps = 50 }
+
+# Fees: half and double the assumed 10 bps taker tier.
+[[variants]]
+name = "fee-5bps"
+template = { fee_bps = 5 }
+
+[[variants]]
+name = "fee-20bps"
+template = { fee_bps = 20 }
+
+# Latency and data delay of one bucket (one second). These change the episode
+# geometry, so the same seed draws other episodes: unpaired with the base.
+[[variants]]
+name = "latency-1"
+template = { latency_buckets = 1 }
+
+[[variants]]
+name = "data-delay-1"
+template = { data_delay_buckets = 1 }
+
+# Inventory-risk coefficient, in cash ticks per quantity tick left after each
+# decision. At about 4.2e6 price ticks and 300 decisions, 3 charges an even
+# schedule roughly 1 bp and 30 roughly 10 bps.
+[[variants]]
+name = "risk-lambda-3"
+template = { risk_lambda = 3 }
+
+[[variants]]
+name = "risk-lambda-30"
+template = { risk_lambda = 30 }
+
+# Historical periods inside the non-test days.
+[[variants]]
+name = "period-early"
+[variants.split]
+train = ["2023-12-01", "2023-12-02", "2023-12-03", "2023-12-04", "2023-12-05"]
+validation = ["2023-12-06", "2023-12-07", "2023-12-08", "2023-12-09", "2023-12-10"]
+
+[[variants]]
+name = "period-late"
+[variants.split]
+train = ["2023-12-08", "2023-12-09", "2023-12-10", "2023-12-11", "2023-12-12"]
+validation = ["2023-12-13", "2023-12-14", "2023-12-15", "2023-12-16", "2023-12-17"]

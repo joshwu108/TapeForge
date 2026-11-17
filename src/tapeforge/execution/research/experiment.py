@@ -704,6 +704,7 @@ def run_experiment(
     include_test: bool = False,
     output_dir: str | Path | None = None,
     command: Sequence[str] | None = None,
+    preloaded: Mapping[str, tuple[DayTape, Mapping[str, Any]]] | None = None,
 ) -> Path:
     """Run every policy over every evaluated role and seed and write the run directory.
 
@@ -713,6 +714,10 @@ def run_experiment(
             records are tagged ``held_out``.
         output_dir: Overrides ``config.output_dir``.
         command: The command line to record, if any.
+        preloaded: Day tapes with their provenance, keyed by date, loaded
+            earlier by ``acquire_days`` for the same data source. Several
+            runs over the same days (``matrix``) share one load this way.
+            Every date of the split must be present.
 
     Returns:
         The run directory, holding ``manifest.json`` and ``records/``.
@@ -731,7 +736,15 @@ def run_experiment(
 
     load_started = time.perf_counter()
     budget = DownloadBudget(config.data.max_download_archives, config.data.max_download_bytes)
-    tapes, provenance = acquire_days(config, budget)
+    if preloaded is None:
+        tapes, provenance = acquire_days(config, budget)
+    else:
+        dates = _all_dates(config.split)
+        missing = [d for d in dates if d not in preloaded]
+        if missing:
+            raise ConfigError(f"preloaded days lack the split dates {missing}")
+        tapes = tuple(preloaded[d][0] for d in dates)
+        provenance = tuple(dict(preloaded[d][1]) for d in dates)
     splits = build_splits(tapes, config.split, config.template)
     load_seconds = time.perf_counter() - load_started
 
