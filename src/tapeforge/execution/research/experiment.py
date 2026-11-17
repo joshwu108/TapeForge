@@ -22,7 +22,9 @@ Held-out period:
     ``include_test=True`` and the configuration lists test dates; its
     records are written beside the others but tagged ``held_out`` in the
     manifest. No configuration carries default dates; a ``"smoke"`` label
-    marks a demonstration whose results support no economic claim.
+    marks a demonstration whose results support no economic claim and a
+    ``"pilot"`` label a fixed small-sample protocol whose results are not
+    out-of-sample evidence.
 
 Episode identifiers:
     ``episode_identifier(role, seed, index)`` returns ``"<role>/s<seed>/i<index>"``.
@@ -124,10 +126,13 @@ LEGACY_HINT: Final[str] = (
     "terminal_surcharge_bps is the primary configuration"
 )
 
-# A smoke run demonstrates that the pipeline works end to end; a research run
-# is the configuration whose numbers may be interpreted. Both need explicit
+# A smoke run demonstrates that the pipeline works end to end. A pilot run
+# fixes a protocol (dates, seeds, settings) on a small sample to exercise the
+# whole method before a research run; its settings are labelled, not
+# calibrated, and its numbers are not out-of-sample evidence. A research run
+# is the configuration whose numbers may be interpreted. All need explicit
 # split dates; the label only changes how the output is described.
-LABELS: Final[tuple[str, ...]] = ("smoke", "research")
+LABELS: Final[tuple[str, ...]] = ("smoke", "pilot", "research")
 SOURCES: Final[tuple[str, ...]] = ("archive", "synthetic")
 RECORDS_SUBDIR: Final[str] = "records"
 MANIFEST_NAME: Final[str] = "manifest.json"
@@ -228,7 +233,7 @@ class ExperimentConfig:
 
     Attributes:
         name: Run name; the run directory is ``<output_dir>/<name>-<utc>``.
-        label: ``"smoke"`` or ``"research"``.
+        label: One of ``LABELS``.
         description: Free text copied into the manifest.
         data: ``DataConfig``.
         split: Explicit role assignment of every day.

@@ -380,3 +380,32 @@ def test_cli_runs_compares_and_reports_failures(
     assert experiment.main(["run", str(path)]) == 1
     assert "label must be one of" in capsys.readouterr().err
     assert experiment.main(["run", str(path), "--include-test"]) == 1
+
+
+def test_the_pilot_label_is_accepted_and_tracked_configurations_parse() -> None:
+    from tapeforge.execution.research.experiment import LABELS
+
+    assert synthetic_config(label="pilot").label == "pilot"
+    with pytest.raises(ConfigError, match="label"):
+        synthetic_config(label="final")
+    configs = sorted(Path("experiments/configs").glob("*.toml"))
+    experiment_configs = [
+        p for p in configs
+        if tomllib.loads(p.read_text()).get("schema") == "tapeforge.execution.experiment-config/2"
+    ]
+    assert experiment_configs
+    for path in experiment_configs:
+        config = load_config(path)
+        assert config.label in LABELS
+        # The held-out role is never evaluated by default, whatever the label.
+        assert "test" not in config.evaluate_roles
+
+
+def test_the_pilot_configuration_is_chronological_with_a_sealed_test_period() -> None:
+    config = load_config("experiments/configs/pilot-futures-btcusdt-2023-12.toml")
+    split = config.split
+    assert config.label == "pilot" and not config.data.allow_download
+    assert max(split.train) < min(split.validation) <= max(split.validation) < min(split.test)
+    assert len(split.validation) >= 5 and len(split.test) >= 5   # day-cluster intervals need 5
+    assert config.template.terminal_rule == "terminal_settlement"
+    assert config.template.terminal_surcharge_bps == 25

@@ -25,18 +25,25 @@ What a trainer needs before its first update, and nothing of the trainer itself:
   split and data hashes, normalisation, seed, action and reward conventions,
   simulator version); the weights themselves are the trainer's business.
 
+Command line:
+    ``python -m tapeforge.execution.rl.evaluation manifest <run_dir>`` writes
+    ``<run_dir>/evaluation-manifest.json``, the fixed evaluation set of a
+    baseline run.
+
 Not covered:
-    No neural policy, optimiser, rollout buffer, PPO loop or checkpoint
-    selection. Nothing here fits statistics on anything but the training
-    role.
+    No neural policy, optimiser, rollout buffer or PPO loop (``rl.ppo`` holds
+    the optional trainer). Nothing here fits statistics on anything but the
+    training role.
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
 import re
+import sys
 import time
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
@@ -78,6 +85,7 @@ from tapeforge.execution.simulator import OBSERVATION_FIELDS, SIMULATOR_VERSION
 
 __all__ = [
     "CHECKPOINT_PROVENANCE_SCHEMA",
+    "EVALUATION_MANIFEST_NAME",
     "EVALUATION_MANIFEST_SCHEMA",
     "TRAINING_CONFIG_SCHEMA",
     "TrainingConfig",
@@ -673,3 +681,43 @@ def validate_checkpoint_provenance(provenance: Mapping[str, Any]) -> None:
     config_from_mapping(config_mapping_from_manifest(provenance["config"]))
     if not isinstance(provenance["seed"], int) or isinstance(provenance["seed"], bool):
         raise ValueError("seed must be an integer")
+
+
+# --- command line ------------------------------------------------------------------------------
+
+EVALUATION_MANIFEST_NAME: Final[str] = "evaluation-manifest.json"
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``manifest <run_dir> [--out PATH] [--include-test]``: freeze a run's evaluation set.
+
+    Returns:
+        0 on success; 1 when the run directory cannot be read, with the
+        reason on stderr.
+    """
+    parser = argparse.ArgumentParser(prog="python -m tapeforge.execution.rl.evaluation")
+    sub = parser.add_subparsers(dest="command", required=True)
+    manifest = sub.add_parser("manifest", help="write the fixed evaluation set of a run directory")
+    manifest.add_argument("run_dir")
+    manifest.add_argument("--out", default=None,
+                          help=f"output path (default <run_dir>/{EVALUATION_MANIFEST_NAME})")
+    manifest.add_argument("--include-test", action="store_true",
+                          help="also list the held-out test episodes (never done by default)")
+    args = parser.parse_args(argv)
+    try:
+        payload = evaluation_manifest(args.run_dir, include_test=args.include_test)
+        path = write_evaluation_manifest(
+            payload, args.out or Path(args.run_dir) / EVALUATION_MANIFEST_NAME
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    roles = {role: sum(len(ids) for ids in by_seed.values())
+             for role, by_seed in payload["episodes"].items()}
+    print(f"evaluation manifest: {path}")
+    print(f"  digest {payload['digest']}; episodes per role {roles}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

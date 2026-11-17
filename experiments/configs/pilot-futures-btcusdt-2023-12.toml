@@ -1,0 +1,74 @@
+# Pilot protocol: Binance USD-M futures BTCUSDT aggregate trades, one venue, 23
+# consecutive UTC days. The dates are a proposed selection, not a calibrated
+# research design: one instrument, one contiguous month, no regime variety.
+#
+#   train       2023-12-01 .. 2023-12-11   (11 days)
+#   validation  2023-12-12 .. 2023-12-17   (6 days; checkpoint selection and reports)
+#   test        2023-12-18 .. 2023-12-23   (6 days; sealed)
+#
+# The test days are evaluated only with --include-test. They are not read for
+# statistics, training, checkpoint selection or debugging, and running them
+# requires a frozen protocol and the maintainer's authorization.
+#
+# Leakage controls come from the split builder (execution/data/splits.py): an
+# episode's whole slice (300 buckets of history for the reference volume and
+# arrival price, 300 decision buckets, 60 buckets of terminal-mark search) must
+# lie inside its role's segment, and the first 300 buckets of a segment that
+# follows another role are embargoed. With zero latency and data delay the
+# embargo equals the horizon, so the nearest episodes on either side of a role
+# boundary share no bucket and are at least 300 buckets apart.
+schema = "tapeforge.execution.experiment-config/2"
+name = "pilot-futures-btcusdt-2023-12"
+label = "pilot"
+description = "USD-M futures BTCUSDT 2023-12-01..23: 11 train, 6 validation, 6 sealed test days; terminal settlement at 25 bps (labelled initial setting)"
+
+[data]
+source = "archive"
+market = "futures-um"          # never mixed with spot history
+symbol = "BTCUSDT"
+data_dir = "data"              # ignored by Git
+allow_download = false         # fetch explicitly; see README "Pilot experiment"
+max_download_archives = 0
+max_download_bytes = 0
+
+[split]
+train = [
+  "2023-12-01", "2023-12-02", "2023-12-03", "2023-12-04", "2023-12-05", "2023-12-06",
+  "2023-12-07", "2023-12-08", "2023-12-09", "2023-12-10", "2023-12-11",
+]
+validation = [
+  "2023-12-12", "2023-12-13", "2023-12-14", "2023-12-15", "2023-12-16", "2023-12-17",
+]
+test = [
+  "2023-12-18", "2023-12-19", "2023-12-20", "2023-12-21", "2023-12-22", "2023-12-23",
+]
+
+# Episode-sampling seeds. Draws are a pure function of (seed, role, index), so
+# every policy, baseline or learned, replays the same episodes. Model-training
+# seeds are separate and live in the PPO configuration.
+[episodes]
+seeds = [1]
+episodes_per_day = 50          # 550 train and 300 validation episodes per seed
+rho_choices_bps = [200, 500, 1000]
+evaluate_roles = ["train", "validation"]
+
+[policies]
+names = ["twap", "immediate", "cap_aware_twap", "zero_action"]  # zero_action is a diagnostic
+
+# The accepted first configuration. terminal_surcharge_bps = 25 is a labelled
+# initial setting, not a calibrated market-impact estimate; the 0/10/25/50 bps
+# sensitivity settings are in experiments/matrices/. fee_bps = 10 is an assumed
+# taker tier. risk_lambda = 0 switches the inventory-risk term off.
+[template]
+horizon_buckets = 300
+participation_cap_bps = 1000
+slippage_ticks = 0
+fee_bps = 10
+latency_buckets = 0
+data_delay_buckets = 0
+risk_lambda = 0
+residual_mu = 0
+arrival_lookback = 60
+fill_rule = "bucket_vwap_capped"
+terminal_rule = "terminal_settlement"
+terminal_surcharge_bps = 25

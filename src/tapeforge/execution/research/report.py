@@ -737,6 +737,14 @@ def render_rst(report: Mapping[str, Any]) -> str:
             "**Smoke run.** This configuration demonstrates that the pipeline runs end to "
             "end. Its figures support no claim about any policy's economic merit.", "",
         ]
+    elif exp["label"] == "pilot":
+        lines += [
+            "**Pilot run.** A fixed small-sample protocol on one instrument and one "
+            "contiguous period. The terminal surcharge, fee and risk settings are labelled "
+            "experiment settings, not calibrated estimates, and the fill model has no market "
+            "impact. Its figures are not out-of-sample evidence and support no claim of "
+            "generalisation.", "",
+        ]
     rev = exp["code_revision"]
     lines += [
         f"Created {exp['created_utc']}; commit {rev.get('commit')} (dirty: {rev.get('dirty')}); "

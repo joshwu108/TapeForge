@@ -370,3 +370,16 @@ def test_checkpoint_provenance_is_complete_consistent_and_validated(run_dir: Pat
             validate_checkpoint_provenance(broken)
     with pytest.raises(ValueError, match="reward_unit"):
         checkpoint_provenance(config, splits, data, 0, None, reward_unit="usd")
+
+
+def test_manifest_command_freezes_the_evaluation_set_of_a_run(
+    run_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from tapeforge.execution.rl.evaluation import EVALUATION_MANIFEST_NAME, main
+
+    assert main(["manifest", str(run_dir)]) == 0
+    written = load_evaluation_manifest(run_dir / EVALUATION_MANIFEST_NAME)
+    assert written["digest"] == evaluation_manifest(run_dir)["digest"]
+    assert "test" not in written["episodes"]
+    assert written["digest"] in capsys.readouterr().out
+    assert main(["manifest", str(run_dir / "missing")]) == 1
