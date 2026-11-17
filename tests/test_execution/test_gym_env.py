@@ -471,3 +471,36 @@ def test_random_action_smoke_run_is_not_a_policy_but_keeps_every_invariant() -> 
             done = terminated or truncated
         episodes += 1
     assert episodes == 8
+
+
+def test_snapshot_and_restore_carry_the_collection_position_to_another_environment() -> None:
+    spec = worksheet_spec(side=1)
+    entries = [(f"e{i}", spec, worksheet_tape()) for i in range(4)]
+    first = ExecutionEnv(ListPool(entries), selection="random", cycle=True)
+    with pytest.raises(RuntimeError, match="reset"):
+        first.snapshot()
+    first.reset(seed=11)
+    first.step([0.25])
+    snapshot = first.snapshot()
+
+    second = ExecutionEnv(ListPool(entries), selection="random", cycle=True)
+    second.reset(seed=99)                     # another episode stream until restored
+    second.restore(snapshot)
+    assert second.state == first.state
+    assert second.current_episode_id == first.current_episode_id
+    for _ in range(6):                        # runs through episode ends and random selections
+        outcomes = []
+        for env in (first, second):
+            if env.snapshot()["done"]:
+                observation, info = env.reset()
+                outcomes.append((observation.tobytes(), info["episode_id"]))
+            else:
+                observation, reward, terminated, truncated, info = env.step([0.25])
+                outcomes.append((observation.tobytes(), reward, terminated, truncated,
+                                 info["state"]))
+        assert outcomes[0] == outcomes[1]
+
+    other_pool = ExecutionEnv(ListPool([("different", spec, worksheet_tape())]))
+    other_pool.reset(seed=0)
+    with pytest.raises(ValueError, match="pool"):
+        other_pool.restore({**snapshot, "pool_index": 0})

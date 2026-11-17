@@ -1,0 +1,43 @@
+# PPO settings of the pilot. A first working configuration, not a tuned one:
+# the values are common defaults for a small MLP and were not searched.
+schema = "tapeforge.execution.ppo-config/1"
+name = "pilot-ppo-futures-btcusdt-2023-12"
+training_config = "experiments/configs/pilot-futures-btcusdt-2023-12-training.toml"
+model_seeds = [0, 1, 2]        # model-training seeds; episode seeds are in the training config
+device = "cpu"
+torch_threads = 1
+output_dir = "runs"
+
+[network]
+hidden_sizes = [64, 64]        # separate actor and critic MLPs
+activation = "tanh"
+log_std_init = -0.5            # policy-action units; the policy acts in [-1, 1]
+
+[optimizer]
+learning_rate = 3e-4           # constant
+adam_eps = 1e-5
+
+[rollout]
+backend = "serial"
+n_envs = 8
+n_steps = 600                  # two full 300-decision horizons per environment
+pool_episodes = 4000           # draws per training seed
+
+[update]
+batch_size = 480
+n_epochs = 10
+# Undiscounted finite-horizon cost: the episode return is minus the
+# implementation shortfall. A smaller gamma would discount the terminal
+# settlement relative to earlier fills, which is a different objective.
+gamma = 1.0
+gae_lambda = 0.95
+clip_range = 0.2               # constant
+entropy_coef = 0.0
+value_coef = 0.5
+max_grad_norm = 0.5
+normalize_advantage = true
+
+[schedule]
+total_steps = 960000           # 200 rollouts
+eval_every_rollouts = 20       # 11 validation evaluations including versions 0 and 200
+selection_metric = "validation_mean_shortfall_bps"

@@ -1,0 +1,28 @@
+# Data side of the pilot's training: which episodes train, which statistics
+# standardise observations, which episodes evaluate. Optimiser settings are in
+# pilot-futures-btcusdt-2023-12-ppo.toml.
+schema = "tapeforge.execution.training-config/1"
+experiment_config = "experiments/configs/pilot-futures-btcusdt-2023-12.toml"
+policy_name = "ppo"
+
+# Training pools: draws of these seeds in the train role. They differ from the
+# evaluation seed below, so no training-pool draw index coincides with an
+# evaluated episode identifier (both still come from the same train days).
+[training]
+role = "train"
+seeds = [101, 102]
+selection = "random"
+reward_unit = "bps"            # basis points of the arrival notional
+
+# Frozen observation statistics: fitted once on train-role draws of this seed
+# replayed by TWAP, then stored with every checkpoint.
+[normalization]
+reference_policy = "twap"
+seed = 7
+
+# The fixed evaluation episodes are those of the experiment's seed 1, which the
+# baselines replay. Checkpoints are selected on validation; test stays sealed.
+[evaluation]
+roles = ["validation"]
+seeds = [1]
+include_test = false

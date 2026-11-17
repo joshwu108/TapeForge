@@ -64,6 +64,9 @@ Episode pools and seeding:
     generator in ``"random"`` mode. ``reset(options={"episode": i})`` or
     ``{"episode": "<id>"}`` selects an entry explicitly. Stepping before the
     first reset or after the episode ended raises.
+    ``snapshot`` / ``restore`` carry the running episode, its exact state
+    and the selection generator across processes, which is what lets a
+    trainer resume collection exactly where a checkpoint left it.
 
 Causality:
     The observation is ``simulator.observe``, which cuts the tape at bucket
@@ -80,7 +83,7 @@ Dependencies:
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any, Final, Literal
 
@@ -327,6 +330,7 @@ class ExecutionEnv(gym.Env[np.ndarray, np.ndarray]):
             )
         self.action_space = spaces.Box(0.0, 1.0, shape=ACTION_SHAPE, dtype=np.float32)
         self._cursor = 0
+        self._index: int | None = None
         self._entry: PoolEntry | None = None
         self._state: State | None = None
         self._last_observation: np.ndarray | None = None
@@ -442,7 +446,7 @@ class ExecutionEnv(gym.Env[np.ndarray, np.ndarray]):
         index = self._select(options)
         entry = self.pool[index]
         state = reset(entry.spec, entry.market)
-        self._entry, self._state, self._done = entry, state, False
+        self._index, self._entry, self._state, self._done = index, entry, state, False
         observation = self._observation(state)
         self._last_observation = observation
         info = {
@@ -520,7 +524,56 @@ class ExecutionEnv(gym.Env[np.ndarray, np.ndarray]):
             "is_done": is_done(state, spec),
         }
 
+    def snapshot(self) -> dict[str, Any]:
+        """Return the collection position: everything ``restore`` needs to continue exactly.
+
+        The snapshot holds the pool index and exact simulator state of the
+        running episode, the sequential cursor, the last observation and the
+        state of the episode-selection generator. It holds no market data;
+        ``restore`` re-reads the episode from the pool, so it is only valid
+        for an environment built over the same pool and settings.
+
+        Raises:
+            RuntimeError: Before the first reset.
+        """
+        if self._index is None or self._state is None or self._last_observation is None:
+            raise RuntimeError("no episode is running; call reset() first")
+        return {
+            "pool_index": self._index,
+            "episode_id": self.current_episode_id,
+            "state": asdict(self._state),
+            "cursor": self._cursor,
+            "done": self._done,
+            "last_observation": self._last_observation.tolist(),
+            "np_random_state": self.np_random.bit_generator.state,
+        }
+
+    def restore(self, snapshot: Mapping[str, Any]) -> None:
+        """Continue from a ``snapshot`` taken on an environment over the same pool.
+
+        Raises:
+            ValueError: The pool entry at the snapshot's index has another
+                episode identifier, or the selection generator is of another
+                kind (the snapshot belongs to a different pool or setup).
+        """
+        index = int(snapshot["pool_index"])
+        entry = self.pool[index]
+        if entry.episode_id != snapshot["episode_id"]:
+            raise ValueError(
+                f"snapshot is of episode {snapshot['episode_id']!r} but pool entry {index} is "
+                f"{entry.episode_id!r}; restore needs the pool the snapshot was taken on"
+            )
+        generator_state = snapshot["np_random_state"]
+        if generator_state["bit_generator"] != type(self.np_random.bit_generator).__name__:
+            raise ValueError("snapshot was taken with another kind of random generator")
+        self.np_random.bit_generator.state = generator_state
+        self._index, self._entry = index, entry
+        self._state = State(**snapshot["state"])
+        self._cursor = int(snapshot["cursor"])
+        self._done = bool(snapshot["done"])
+        self._last_observation = np.asarray(snapshot["last_observation"], dtype=np.float32)
+
     def close(self) -> None:
         """Release the running episode; the pool is untouched."""
-        self._entry, self._state, self._last_observation = None, None, None
+        self._index, self._entry, self._state, self._last_observation = None, None, None, None
         self._done = False
