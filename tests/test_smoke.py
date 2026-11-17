@@ -24,7 +24,6 @@ def test_every_module_imports() -> None:
         "generate",
         "ingest",
         "kernels",
-        "model",
         "ops",
         "reference",
         "windows",

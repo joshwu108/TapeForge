@@ -547,10 +547,13 @@ def run_policy(
     if n_episodes < 1:
         raise ValueError(f"n_episodes must be positive, got {n_episodes}")
     draws = sample_episodes(splits.record, role, n_episodes, seed, rho_choices_bps)
-    trajectories: list[Trajectory] = []
-    episodes: list[dict[str, Any]] = []
+    trajectories: list[Trajectory] = [] # detailed histories
+    episodes: list[dict[str, Any]] = [] # compact JSON episode summaries
     for draw in draws:
+        # receive execution rules and historical market slice
         spec, market = materialize(splits, draw, template)
+        # run the episode: the policy repeatedly receives an observation and chooses an
+        # action, and the simulator calculates the outcome
         trajectory = run_episode(spec, market, policy)
         trajectories.append(trajectory)
         episodes.append(_episode_json(draw, spec, summarize_episode(trajectory)))

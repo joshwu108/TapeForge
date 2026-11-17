@@ -82,7 +82,10 @@ def build_offsets(
             f"({int(timestamps[first])}). Sort at ingest, not here."
         )
 
+    # determine the edges
     edges = bucket_edges(start_us, n_buckets, width_us)
+
+    # find indexes of edges in timestamps using binary search
     return np.searchsorted(timestamps, edges, side="left").astype(np.int64)
 
 
