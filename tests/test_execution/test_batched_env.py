@@ -209,3 +209,37 @@ def test_a_batched_checkpoint_without_a_collection_snapshot_is_not_resumed(
     torch.save({**stored, "batched_environments": None}, checkpoint / "collection.pt")
     with pytest.raises(ConfigError, match="not resumed"):
         train(config, model_seed=0, resume_from=checkpoint)
+
+def test_a_snapshot_from_another_device_is_refused_before_anything_changes() -> None:
+    episodes = parity.random_episodes(12, 2)
+    batch = batched.EpisodeBatch.from_episodes(episodes)
+    ids = [f"e{k}" for k in range(len(episodes))]
+    vec = BatchedExecutionVecEnv(batch, 4, seed=1, episode_ids=ids)
+    vec.reset()
+    snapshot = vec.collection_snapshot()
+    assert snapshot["device"] == "cpu"
+    vec.step(np.zeros((4, 1), dtype=np.float32))
+    before = vec.collection_snapshot()
+    # A CUDA generator state is 16 bytes; snapshots written before the device
+    # entry existed are recognised by that size alone.
+    for foreign in ({**snapshot, "device": "cuda"},
+                    {k: v for k, v in snapshot.items() if k != "device"}
+                    | {"generator": torch.zeros(16, dtype=torch.uint8)}):
+        with pytest.raises(ValueError, match="device"):
+            vec.restore_collection(foreign)
+        after = vec.collection_snapshot()
+        for name, tensor in before["state"].items():
+            assert torch.equal(tensor, after["state"][name]), name
+        assert torch.equal(before["generator"], after["generator"])
+
+
+def test_cuda_generator_states_for_other_devices_are_refused(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tapeforge.execution.rl import ppo
+
+    states = ppo._generator_states()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    with pytest.raises(ConfigError, match="2 devices but 1"):
+        ppo._set_generator_states((*states[:3], [torch.zeros(16, dtype=torch.uint8)] * 2))

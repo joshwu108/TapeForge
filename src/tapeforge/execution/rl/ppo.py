@@ -174,12 +174,20 @@ def _set_generator_states(states: Sequence[Any]) -> None:
 
     A missing or ``None`` CUDA entry (a CPU run, or a checkpoint written
     before CUDA states were stored) leaves the CUDA generators unchanged.
+
+    Raises:
+        ConfigError: CUDA states for a different number of visible devices.
     """
     torch.set_rng_state(states[0])
     np.random.set_state(states[1])  # noqa: NPY002
     random.setstate(states[2])
     cuda = states[3] if len(states) > 3 else None
     if cuda is not None and torch.cuda.is_available():
+        if len(cuda) != torch.cuda.device_count():
+            raise ConfigError(
+                f"the checkpoint holds CUDA generator states for {len(cuda)} devices but "
+                f"{torch.cuda.device_count()} are visible; resume with the same devices"
+            )
         torch.cuda.set_rng_state_all(cuda)
 
 

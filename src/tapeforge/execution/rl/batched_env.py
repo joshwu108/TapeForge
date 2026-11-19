@@ -170,6 +170,8 @@ class BatchedExecutionVecEnv(VecEnv):
         A restored collection position indexes bank rows, so it is only valid
         for a bank with the same rows in the same order; the identifiers stand
         in for the market data, which ``SplitPool`` rebuilds deterministically.
+        Without identifiers only the bank size is checked; the trainer always
+        passes them (``make_batched_vec_env``).
         """
         digest = hashlib.sha256(str(self.batch.n_episodes).encode())
         for identifier in self._ids or ():
@@ -188,6 +190,7 @@ class BatchedExecutionVecEnv(VecEnv):
         state = self.state
         return {
             "schema": "tapeforge.execution.batched-collection/1",
+            "device": self.batch.device.type,
             "n_envs": self.num_envs,
             "reward_unit": self.reward_unit,
             "bank": self._bank_fingerprint(),
@@ -205,25 +208,36 @@ class BatchedExecutionVecEnv(VecEnv):
 
         Returns the restored last observations, as ``reset`` would.
 
+        Everything is checked before any state changes, so a refused
+        snapshot leaves the environment as it was.
+
         Raises:
-            ValueError: A snapshot of another bank, environment count or
-                reward unit.
+            ValueError: A snapshot of another bank, environment count, reward
+                unit or device type. The selection generator's state is
+                device-specific, so a CPU snapshot cannot continue on CUDA or
+                the reverse. Snapshots without a ``device`` entry are checked
+                through the size of the generator state instead.
         """
+        device = self.batch.device
         expected = {"n_envs": self.num_envs, "reward_unit": self.reward_unit,
                     "bank": self._bank_fingerprint()}
         differing = sorted(k for k, v in expected.items() if snapshot.get(k) != v)
+        generator = snapshot["generator"]
+        if snapshot.get("device", device.type) != device.type or (
+            generator.numel() != self._generator.get_state().numel()
+        ):
+            differing.append("device")
         if differing:
             raise ValueError(f"the collection snapshot differs in {differing}")
-        device = self.batch.device
         self._state = batched.BatchedState(
-            **{name: tensor.to(device) for name, tensor in snapshot["state"].items()}
+            **{name: tensor.to(device).clone() for name, tensor in snapshot["state"].items()}
         )
         self._reward_sum = snapshot["reward_sum"].to(device).clone()
         self._cost_ticks = snapshot["cost_ticks"].to(device).clone()
         self._risk_ticks = snapshot["risk_ticks"].to(device).clone()
         self._steps = snapshot["steps"].to(device).clone()
         self._last_observation = snapshot["last_observation"].to(device).clone()
-        self._generator.set_state(snapshot["generator"])
+        self._generator.set_state(generator)
         self._actions = None
         return self._last_observation.cpu().numpy()
 
