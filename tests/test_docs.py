@@ -52,14 +52,30 @@ def test_contributor_guide_is_valid_restructuredtext() -> None:
     assert not problems, "CONTRIBUTING.rst has RST errors:\n" + "".join(problems)
 
 
-def test_readme_states_the_verification_status_of_the_batched_simulator() -> None:
-    """The README must not present the batched simulator as GPU-verified.
+CUDA_EVIDENCE = README.parent / "benchmarks" / "evidence" / "cuda-t4-2026-11-19.json"
 
-    The statement is removed only together with a recorded CUDA parity run.
+
+def test_readme_cuda_claims_for_the_batched_simulator_rest_on_recorded_evidence() -> None:
+    """The README may call the batched simulator CUDA-tested only with a recorded run.
+
+    The cited record must hold, for every verification it lists, a CUDA
+    parity run with at least 5,000 episodes and no mismatch, and a gpu-marked
+    suite with passes and no skips. The README must keep naming the record,
+    must not claim a training speedup, and must keep the test days sealed.
     """
     text = " ".join(README.read_text().split())
-    assert "It has not been executed on CUDA" in text
+    assert "benchmarks/evidence/cuda-t4-2026-11-19.json" in text
+    assert "CUDA-tested on one Tesla T4" in text
+    assert "no end-to-end training speedup was measured" in text
     assert "the sealed test days have not been evaluated" in text
+    evidence = json.loads(CUDA_EVIDENCE.read_text())
+    assert evidence["verifications"]
+    for run in evidence["verifications"]:
+        assert run["device"]["gpu_name"] == "Tesla T4"
+        parity = run["simulator_parity"]
+        assert parity["ok"] and parity["n_mismatches"] == 0 and parity["n_episodes"] >= 5000
+        assert run["gpu_tests"]["passed"] > 0 and run["gpu_tests"]["skipped"] == 0
+        assert not run["steps_failed"] and not run["steps_skipped"]
 
 
 def test_readme_documents_every_public_feature() -> None:

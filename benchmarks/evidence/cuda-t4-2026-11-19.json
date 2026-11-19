@@ -1,0 +1,196 @@
+{
+  "schema": "tapeforge.evidence.cuda-verification/1",
+  "summary": "Batched simulator parity with the CPU reference and the gpu-marked test suite on one Modal Tesla T4, plus one synthetic training-pipeline measurement. Parity is agreement between two implementations of the same rules; the training measurement shows no GPU speedup at eight environments.",
+  "verifications": [
+    {
+      "attempt": "20261119T063701Z-verify",
+      "git_commit": "976931837fb70605b048180487ca98bc9258abd7",
+      "tree_sha256": "7f36749d59a2fb0947481bc5a29916790bbf8ffe2b01daaab64e6e965def1588",
+      "git_dirty_note": "dirty reflected unrelated untracked directories excluded from the snapshot",
+      "started_utc": "2026-11-19T06:36:05Z",
+      "device": {
+        "gpu_name": "Tesla T4",
+        "gpu_capability": "7.5",
+        "cuda": "13.0",
+        "torch": "2.14.1+cu130",
+        "triton": "3.8.0",
+        "python": "3.12.10",
+        "numpy": "2.5.5",
+        "platform": "Linux-4.19.0-gvisor-x86_64-with-glibc2.36"
+      },
+      "steps_executed": [
+        "lint",
+        "gpu_suite",
+        "kernel_quick",
+        "simulator_parity"
+      ],
+      "steps_skipped": {},
+      "steps_failed": [],
+      "gpu_tests": {
+        "passed": 83,
+        "skipped": 0,
+        "selection": "pytest -m gpu"
+      },
+      "simulator_parity": {
+        "n_episodes": 5000,
+        "n_transitions": 26696,
+        "n_observations": 26696,
+        "n_mismatches": 0,
+        "ok": true,
+        "seed": 0,
+        "simulator_version": "tapeforge.execution.simulator/2"
+      }
+    },
+    {
+      "attempt": "20261119T075921Z-pilot",
+      "git_commit": "846999426db8d1172ba64740c5841bfddcb65221",
+      "tree_sha256": "7f586ecb7109a7416237931dc99bc01bbd7b4f0623f94861b02de3a6005f4b9e",
+      "git_dirty_note": "dirty reflected unrelated untracked directories excluded from the snapshot",
+      "started_utc": "2026-11-19T07:59:40Z",
+      "device": {
+        "gpu_name": "Tesla T4",
+        "gpu_capability": "7.5",
+        "cuda": "13.0",
+        "torch": "2.14.1+cu130",
+        "triton": "3.8.0",
+        "python": "3.12.10",
+        "numpy": "2.5.5",
+        "platform": "Linux-4.19.0-gvisor-x86_64-with-glibc2.36"
+      },
+      "steps_executed": [
+        "lint",
+        "gpu_suite",
+        "kernel_quick",
+        "simulator_parity"
+      ],
+      "steps_skipped": {},
+      "steps_failed": [],
+      "gpu_tests": {
+        "passed": 83,
+        "skipped": 0,
+        "selection": "pytest -m gpu"
+      },
+      "simulator_parity": {
+        "n_episodes": 5000,
+        "n_transitions": 26696,
+        "n_observations": 26696,
+        "n_mismatches": 0,
+        "ok": true,
+        "seed": 0,
+        "simulator_version": "tapeforge.execution.simulator/2"
+      }
+    }
+  ],
+  "training_pipeline_benchmark": {
+    "config": "benchmarks/configs/training_smoke.toml (device = cuda for the batched row)",
+    "git_commit": "976931837fb70605b048180487ca98bc9258abd7",
+    "tree_sha256": "7f36749d59a2fb0947481bc5a29916790bbf8ffe2b01daaab64e6e965def1588",
+    "host": "one Modal allocation: Tesla T4, 8 CPU cores, 16 GiB; every row on the same host",
+    "repeats": 1,
+    "rows": [
+      {
+        "backend": "serial",
+        "device": "cpu",
+        "n_envs": 8,
+        "env_steps": 96000,
+        "process_wall_seconds": 56.18,
+        "seconds": {
+          "data_load": 0.11,
+          "statistics": 0.94,
+          "setup": 1.73,
+          "collect": 15.78,
+          "update": 7.17,
+          "evaluate": 30.33,
+          "checkpoint": 0.09,
+          "train": 22.94
+        }
+      },
+      {
+        "backend": "subprocess",
+        "device": "cpu",
+        "n_envs": 8,
+        "env_steps": 96000,
+        "process_wall_seconds": 72.44,
+        "seconds": {
+          "data_load": 0.1,
+          "statistics": 0.95,
+          "setup": 19.84,
+          "collect": 15.5,
+          "update": 6.37,
+          "evaluate": 29.51,
+          "checkpoint": 0.09,
+          "train": 21.87
+        }
+      },
+      {
+        "backend": "batched",
+        "device": "cuda",
+        "n_envs": 8,
+        "env_steps": 96000,
+        "process_wall_seconds": 129.36,
+        "seconds": {
+          "data_load": 0.11,
+          "statistics": 0.94,
+          "setup": 2.22,
+          "collect": 66.75,
+          "update": 8.38,
+          "evaluate": 50.78,
+          "checkpoint": 0.08,
+          "train": 75.12
+        }
+      }
+    ],
+    "stepping_rows": [
+      {
+        "name": "env_step/serial",
+        "n_envs": 8,
+        "microseconds_per_vector_step": 534.5,
+        "env_steps_per_second": 14967.8,
+        "includes": "full VecEnv step; only the batched row copies between host and device"
+      },
+      {
+        "name": "env_step/subprocess",
+        "n_envs": 8,
+        "microseconds_per_vector_step": 633.7,
+        "env_steps_per_second": 12623.7,
+        "includes": "full VecEnv step; only the batched row copies between host and device"
+      },
+      {
+        "name": "env_step/batched",
+        "n_envs": 8,
+        "microseconds_per_vector_step": 4479.3,
+        "env_steps_per_second": 1786.0,
+        "includes": "full VecEnv step; only the batched row copies between host and device"
+      },
+      {
+        "name": "batched_core/b8",
+        "n_envs": 8,
+        "microseconds_per_vector_step": 3980.4,
+        "env_steps_per_second": 2009.9,
+        "includes": "observe + step + masked reset per vector step; no host transfer"
+      },
+      {
+        "name": "batched_core/b64",
+        "n_envs": 64,
+        "microseconds_per_vector_step": 3869.4,
+        "env_steps_per_second": 16540.0,
+        "includes": "observe + step + masked reset per vector step; no host transfer"
+      },
+      {
+        "name": "batched_core/b512",
+        "n_envs": 512,
+        "microseconds_per_vector_step": 3231.5,
+        "env_steps_per_second": 158442.6,
+        "includes": "observe + step + masked reset per vector step; no host transfer"
+      },
+      {
+        "name": "batched_core/b4096",
+        "n_envs": 4096,
+        "microseconds_per_vector_step": 3123.4,
+        "env_steps_per_second": 1311377.6,
+        "includes": "observe + step + masked reset per vector step; no host transfer"
+      }
+    ],
+    "reading": "Synthetic data, one repeat. At eight environments the batched CUDA backend is slower end to end than serial CPU. The device-only batched core costs about 3-4 ms per vector step from batch 8 to batch 4096, so a near-constant per-step device cost, not the batch's work, dominates at small batches; the measurement does not separate launch latency from synchronisation. No speedup is claimed."
+  }
+}

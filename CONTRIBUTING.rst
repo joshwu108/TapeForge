@@ -79,7 +79,10 @@ Rules for a change
 * **Say what was verified.** Keep "implemented", "CPU-tested",
   "CUDA-tested", "experiment executed" and "conclusion supported" apart in
   code comments, commit messages and documentation. Performance statements
-  cite a recorded measurement with its hardware and revision.
+  cite a recorded measurement with its hardware and revision. A "CUDA-tested"
+  statement cites a record in ``benchmarks/evidence/`` with the source
+  revision and content hash it was run on; a change to the batched simulator
+  or the GPU kernels needs a new hardware run before the statement covers it.
 * **Tests come with the change.** Accounting changes need exact-integer
   assertions; learning code is tested on constructed tasks, never on
   historical profitability.

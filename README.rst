@@ -11,9 +11,10 @@ trainer and a batched tensor implementation of the simulator build on it.
 
 The research objective is to measure whether GPU feature computation and
 batched GPU simulation reduce training time while preserving numerical and
-temporal semantics. The batched simulator has been checked against the CPU
-reference on CPU tensors only; it has not been run on CUDA, and no training
-speedup has been measured on a GPU.
+temporal semantics. The batched simulator matches the CPU reference on every
+compared transition on CPU tensors and on one CUDA device (a Tesla T4). On
+that device no end-to-end training speedup was measured: at eight
+environments the batched CUDA backend was the slowest of the three backends.
 
 Architecture
 ============
@@ -78,19 +79,27 @@ Status
        strict configuration, train-only frozen normalisation, per-rollout
        diagnostics, checkpoints with provenance, validation-based checkpoint
        selection and evaluation into baseline run directories. Implemented
-       and CPU-tested, including bit-identical resume on the CPU backends.
+       and CPU-tested, including bit-identical resume on the serial and
+       subprocess backends and on the batched backend over CPU tensors.
+       Trained on CUDA (batched backend, one T4) in the validation pilot.
        No SAC or recurrent policy.
    * - Batched simulator
      - ``execution.batched`` applies the reference transitions to many
        episodes as device tensors, with a per-transition parity driver and a
        vector environment for the trainer. Implemented and tested on CPU
-       tensors. **Not CUDA-tested:** no CUDA device was available; the CUDA
-       parity test skips and must be run on hardware.
+       tensors. **CUDA-tested on one Tesla T4** in two runs at different
+       revisions: all gpu-marked tests passed with none skipped, and 5,000
+       parity episodes (26,696 transitions) matched with no mismatch
+       (``benchmarks/evidence/cuda-t4-2026-11-19.json``). Other GPUs,
+       drivers and PyTorch versions are not covered.
    * - Performance evaluation
      - Kernel, stage, and pageable/pinned transfer benchmarks implemented;
        a training-pipeline benchmark compares serial, subprocess and batched
-       environments stage by stage. Recorded tuning sweeps, pinned-stream
-       overlap and every GPU training measurement remain pending.
+       environments stage by stage. One synthetic run on one T4 host is
+       summarised in ``benchmarks/evidence/``; it shows no GPU training
+       speedup. A T4 kernel sweep was run but is not adopted into
+       ``benchmarks/results.json``. Tuning decisions and pinned-stream overlap
+       remain pending.
    * - Robustness
      - One-factor experiment matrices (fee, latency, data delay, terminal
        surcharge, risk coefficient, period) implemented and run locally for
@@ -99,8 +108,9 @@ Status
        remain unimplemented.
 
 CI checks CPU behavior; it has no CUDA runner. Hardware verification must be
-repeated after GPU-facing changes. The quick T4 benchmark checked correctness
-but was not recorded in ``benchmarks/results.json``. **No speedup figures are
+repeated after GPU-facing changes. T4 verification is summarised in
+``benchmarks/evidence/cuda-t4-2026-11-19.json``; no kernel row from it is
+recorded in ``benchmarks/results.json``. **No speedup figures are
 published.** Local three-day futures smoke experiments demonstrated the CPU
 pipeline under the terminal-settlement and legacy rules; they do not
 establish policy superiority, out-of-sample skill, or a research value of
@@ -590,12 +600,18 @@ statistics, simulator version) and ``collection.pt`` (the collection
 position and generator states).
 
 Resuming: ``--resume`` continues a run from a checkpoint bit-identically to
-the uninterrupted run on the ``serial`` and ``subprocess`` backends, on CPU,
-with the same library versions, thread count and configuration (tested for
-both backends). Loading ``model.zip`` alone restores a policy for evaluation;
-it is not a continuation of training. The ``batched`` backend stores no
-collection position and cannot be resumed. ``collection.pt`` is a pickle:
-load only checkpoints you wrote.
+the uninterrupted run on the ``serial`` and ``subprocess`` backends and on
+the ``batched`` backend over CPU tensors, with the same library versions,
+thread count and configuration (tested for all three). The batched backend
+stores one snapshot of the whole vector (simulator state, accumulators,
+pending observations, selection generator); CUDA generator states are stored
+when CUDA is in use. On CUDA a resumed run continues the same schedule from
+the same simulator and generator state, but the update's floating-point
+reductions are not guaranteed deterministic, so it is not claimed to be
+bit-identical there. Batched checkpoints written before the snapshot existed
+can be evaluated but not resumed. Loading ``model.zip`` alone restores a
+policy for evaluation; it is not a continuation of training.
+``collection.pt`` is a pickle: load only checkpoints you wrote.
 
 Batched simulator
 =================
@@ -631,11 +647,16 @@ rollout buffer is host memory, that backend still copies actions,
 observations, rewards and done flags between host and device every step.
 
 **Verification status.** On CPU tensors the batched simulator matches the
-reference on every compared transition. It has not been executed on CUDA.
-The CUDA parity test and ``--device cuda`` run must pass on hardware before
-any GPU result is used; CPU-tensor agreement is not a substitute. Parity is
-agreement between two implementations of the same synthetic rules: replaying
-recorded market data does not model the market's response to the agent.
+reference on every compared transition. On CUDA it was executed on one Tesla
+T4 (PyTorch 2.14.1, CUDA 13.0) in two runs at different source revisions:
+the gpu-marked suite passed with nothing skipped, and ``--device cuda
+--episodes 5000`` compared 26,696 transitions with no mismatch. The record,
+with revisions and content hashes, is
+``benchmarks/evidence/cuda-t4-2026-11-19.json``. Repeat both checks on any
+other device or software stack and after any change to the batched
+simulator; CPU-tensor agreement is not a substitute. Parity is agreement
+between two implementations of the same synthetic rules: replaying recorded
+market data does not model the market's response to the agent.
 
 Robustness matrices
 ===================
@@ -790,8 +811,14 @@ batched rows are timed only after the parity comparison passes on the
 benchmark device, and an unavailable device yields ``skipped`` rows. Known
 differences between backends are stored with every record: the batched
 backend draws the same episode distribution in a different sequence and
-pays per-step host/device copies. Only CPU measurements exist so far; they
-are local artifacts under ``runs/`` and are not published here.
+pays per-step host/device copies. One synthetic run on a T4 host (96,000
+samples, eight environments, one repeat) is summarised in
+``benchmarks/evidence/cuda-t4-2026-11-19.json``: 56.2 s end to end for
+serial CPU, 72.4 s for subprocess CPU and 129.4 s for batched CUDA, whose
+collection took 66.8 s against 15.8 s serial. The device-only batched core
+costs about 3 to 4 ms per vector step at every batch size from 8 to 4,096,
+so at eight environments a near-constant per-step device cost dominates.
+That is not a speedup, and larger batches were not trained.
 
 Correctness is checked before timing. Warm-up excludes compilation. Results
 record wall-clock or CUDA-event timing, workload distribution, setup included
