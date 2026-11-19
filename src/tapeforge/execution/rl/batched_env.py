@@ -26,8 +26,15 @@ Differences from the CPU environments:
       it equals the CPU value whenever ``reward_ticks * 10_000`` and
       ``arrival_price * target`` are below 2**53 and can differ in the last
       bit beyond that. ``reward_ticks`` itself is exact.
-    * No collection snapshot: a training run on this backend cannot be
-      resumed exactly.
+    * The collection position is one snapshot of the whole vector
+      (``collection_snapshot`` / ``restore_collection``), not one per
+      environment: the simulator state, the episode accumulators, the
+      pending observations and the selection generator, all copied to host
+      memory. Restoring it on CPU tensors continues bit-identically (a test
+      checks this). On CUDA the simulator integers and the generator are
+      restored exactly, but the trainer's floating-point update is not
+      guaranteed deterministic there, so a resumed CUDA run is a valid
+      continuation of the same schedule, not a bit-identical replay.
 
 Dependencies:
     ``stable-baselines3`` and ``torch`` (``pip install -e '.[train]'``).
@@ -35,7 +42,9 @@ Dependencies:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import hashlib
+from collections.abc import Mapping, Sequence
+from dataclasses import fields
 from typing import Any
 
 import numpy as np
@@ -153,6 +162,69 @@ class BatchedExecutionVecEnv(VecEnv):
         for accumulator in (self._reward_sum, self._cost_ticks, self._risk_ticks, self._steps):
             accumulator.zero_()
         self._last_observation, _ = self._observation(self._state)
+        return self._last_observation.cpu().numpy()
+
+    def _bank_fingerprint(self) -> str:
+        """Return a digest of the bank's size and episode identifiers.
+
+        A restored collection position indexes bank rows, so it is only valid
+        for a bank with the same rows in the same order; the identifiers stand
+        in for the market data, which ``SplitPool`` rebuilds deterministically.
+        """
+        digest = hashlib.sha256(str(self.batch.n_episodes).encode())
+        for identifier in self._ids or ():
+            digest.update(b"\0" + identifier.encode())
+        return digest.hexdigest()
+
+    def collection_snapshot(self) -> dict[str, Any]:
+        """Return the collection position of every environment, in host memory.
+
+        It holds the simulator state, the per-episode accumulators, the last
+        observations and the selection generator state; no market data.
+
+        Raises:
+            RuntimeError: Before the first reset.
+        """
+        state = self.state
+        return {
+            "schema": "tapeforge.execution.batched-collection/1",
+            "n_envs": self.num_envs,
+            "reward_unit": self.reward_unit,
+            "bank": self._bank_fingerprint(),
+            "state": {f.name: getattr(state, f.name).cpu().clone() for f in fields(state)},
+            "reward_sum": self._reward_sum.cpu().clone(),
+            "cost_ticks": self._cost_ticks.cpu().clone(),
+            "risk_ticks": self._risk_ticks.cpu().clone(),
+            "steps": self._steps.cpu().clone(),
+            "last_observation": self._last_observation.cpu().clone(),
+            "generator": self._generator.get_state().clone(),
+        }
+
+    def restore_collection(self, snapshot: Mapping[str, Any]) -> np.ndarray:
+        """Continue from ``collection_snapshot()`` of an environment over the same bank.
+
+        Returns the restored last observations, as ``reset`` would.
+
+        Raises:
+            ValueError: A snapshot of another bank, environment count or
+                reward unit.
+        """
+        expected = {"n_envs": self.num_envs, "reward_unit": self.reward_unit,
+                    "bank": self._bank_fingerprint()}
+        differing = sorted(k for k, v in expected.items() if snapshot.get(k) != v)
+        if differing:
+            raise ValueError(f"the collection snapshot differs in {differing}")
+        device = self.batch.device
+        self._state = batched.BatchedState(
+            **{name: tensor.to(device) for name, tensor in snapshot["state"].items()}
+        )
+        self._reward_sum = snapshot["reward_sum"].to(device).clone()
+        self._cost_ticks = snapshot["cost_ticks"].to(device).clone()
+        self._risk_ticks = snapshot["risk_ticks"].to(device).clone()
+        self._steps = snapshot["steps"].to(device).clone()
+        self._last_observation = snapshot["last_observation"].to(device).clone()
+        self._generator.set_state(snapshot["generator"])
+        self._actions = None
         return self._last_observation.cpu().numpy()
 
     @property
@@ -300,10 +372,11 @@ class BatchedExecutionVecEnv(VecEnv):
     def env_method(
         self, method_name: str, *method_args: Any, indices: Any = None, **method_kwargs: Any
     ) -> list[Any]:
-        """Not supported; in particular there is no ``snapshot`` (``NotImplementedError``)."""
+        """Not supported (``NotImplementedError``): the collection position is one
+        snapshot of the whole vector, ``collection_snapshot``."""
         raise NotImplementedError(
-            f"the batched backend has no per-environment method {method_name!r}; collection "
-            "snapshots and exact resume are not supported on it"
+            f"the batched backend has no per-environment method {method_name!r}; use "
+            "collection_snapshot() / restore_collection() for the whole vector"
         )
 
     def env_is_wrapped(self, wrapper_class: Any, indices: Any = None) -> list[bool]:

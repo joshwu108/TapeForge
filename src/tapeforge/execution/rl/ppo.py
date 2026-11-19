@@ -45,17 +45,23 @@ Checkpoints and resuming:
     hashes, frozen statistics, simulator version) and ``collection.pt`` (the
     collection position: every environment's running episode and selection
     generator, the pending observations, the global torch / NumPy / Python
-    generator states and the log counters).
+    generator states, the CUDA generator states when CUDA is in use, and the
+    log counters). The ``batched`` backend stores one snapshot of the whole
+    vector under ``batched_environments`` instead of per-environment ones.
 
     Loading ``model.zip`` alone restores the policy for evaluation; it does
     not continue training exactly. ``train(resume_from=...)`` restores the
     collection position as well and then continues bit-identically to the
     uninterrupted run. That guarantee holds for the ``serial`` and
     ``subprocess`` backends on CPU with the same software versions, thread
-    count and configuration (a test checks the serial case); it is not
-    claimed across library versions, devices or thread counts, and not for
-    the ``batched`` backend. ``collection.pt`` is a pickle: load only
-    checkpoints you wrote.
+    count and configuration (tests check the serial, subprocess and
+    CPU-tensor batched cases); it is not claimed across library versions,
+    devices or thread counts. On CUDA a resumed run restores the same
+    simulator state and generators but the update's floating-point
+    reductions may differ, so it is a continuation of the same schedule, not
+    a bit-identical replay. Checkpoints the ``batched`` backend wrote before
+    it stored a collection snapshot can be evaluated but not resumed.
+    ``collection.pt`` is a pickle: load only checkpoints you wrote.
 
 Dependencies:
     ``stable-baselines3`` (``pip install -e '.[train]'``). Importing this
@@ -141,21 +147,54 @@ _ACTIVATIONS: Final[dict[str, type[torch.nn.Module]]] = {
 # --- rollout diagnostics, checkpoints and selection ---------------------------------------------
 
 
-def _generator_states() -> tuple[Any, Any, Any]:
-    """Return the global torch, NumPy and Python generator states.
+def _cuda_generator_states() -> list[Any] | None:
+    """Return every CUDA device's generator state, or ``None`` when CUDA is not in use.
 
-    The library draws action noise from torch's global generator and
-    minibatch order from NumPy's legacy global one, so these are the states
-    that decide how training continues.
+    Only read once CUDA has been initialised (a policy on ``cuda`` does that),
+    so a CPU run never initialises a device here.
     """
-    return torch.get_rng_state(), np.random.get_state(), random.getstate()  # noqa: NPY002
+    if torch.cuda.is_available() and torch.cuda.is_initialized():  # type: ignore[no-untyped-call]
+        return list(torch.cuda.get_rng_state_all())
+    return None
 
 
-def _set_generator_states(states: tuple[Any, Any, Any]) -> None:
-    """Restore the states returned by ``_generator_states``."""
+def _generator_states() -> tuple[Any, Any, Any, Any]:
+    """Return the global torch, NumPy, Python and CUDA generator states.
+
+    The library draws action noise from torch's global generator of the
+    policy device (CPU or CUDA) and minibatch order from NumPy's legacy
+    global one, so these are the states that decide how training continues.
+    """
+    return (torch.get_rng_state(), np.random.get_state(), random.getstate(),  # noqa: NPY002
+            _cuda_generator_states())
+
+
+def _set_generator_states(states: Sequence[Any]) -> None:
+    """Restore the states returned by ``_generator_states``.
+
+    A missing or ``None`` CUDA entry (a CPU run, or a checkpoint written
+    before CUDA states were stored) leaves the CUDA generators unchanged.
+    """
     torch.set_rng_state(states[0])
     np.random.set_state(states[1])  # noqa: NPY002
     random.setstate(states[2])
+    cuda = states[3] if len(states) > 3 else None
+    if cuda is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda)
+
+
+def _batched_env(env: VecEnv) -> Any:
+    """Return the batched vector environment under any ``VecEnvWrapper`` layers.
+
+    Raises:
+        ConfigError: ``env`` does not wrap a batched environment.
+    """
+    while not hasattr(env, "collection_snapshot"):
+        inner = getattr(env, "venv", None)
+        if inner is None:
+            raise ConfigError("the training environment stores no collection position")
+        env = inner
+    return env
 
 
 def _mean(values: Sequence[float]) -> float | None:
@@ -212,8 +251,11 @@ class _TrainingLog(BaseCallback):
         state = self.resume_state
         if state is None:
             return
-        for index, snapshot in enumerate(state["environments"]):
-            self.training_env.env_method("restore", snapshot, indices=[index])
+        if state["environments"] is None:
+            _batched_env(self.training_env).restore_collection(state["batched_environments"])
+        else:
+            for index, snapshot in enumerate(state["environments"]):
+                self.training_env.env_method("restore", snapshot, indices=[index])
         model: PPO = self.model  # type: ignore[assignment]
         model._last_obs = state["last_obs"]
         model._last_episode_starts = state["last_episode_starts"]
@@ -222,7 +264,8 @@ class _TrainingLog(BaseCallback):
         self.evaluations = list(state["evaluations"])
         self._skip_boundary = self.version
         # Last: everything above may have consumed random numbers.
-        _set_generator_states((state["torch_rng"], state["numpy_rng"], state["python_rng"]))
+        _set_generator_states((state["torch_rng"], state["numpy_rng"], state["python_rng"],
+                               state.get("cuda_rng")))
 
     def _on_rollout_start(self) -> None:
         self._finish_pending()
@@ -327,14 +370,20 @@ class _TrainingLog(BaseCallback):
         _append_jsonl(self.run_dir / "evaluations.jsonl", self.evaluations[-1])
         write_json_atomic(self.run_dir / "selection.json", self.selection())
         # The collection position is written last so that it includes this evaluation.
+        environments = self._environment_snapshots()
         torch.save(
             {
-                "environments": self._environment_snapshots(),
+                "environments": environments,
+                "batched_environments": (
+                    None if environments is not None
+                    else _batched_env(self.training_env).collection_snapshot()
+                ),
                 "last_obs": model._last_obs,
                 "last_episode_starts": model._last_episode_starts,
                 "torch_rng": generators[0],
                 "numpy_rng": generators[1],
                 "python_rng": generators[2],
+                "cuda_rng": generators[3],
                 "version": self.version,
                 "seconds": dict(self.seconds),
                 "evaluations": list(self.evaluations),
@@ -344,7 +393,10 @@ class _TrainingLog(BaseCallback):
         _set_generator_states(generators)
 
     def _environment_snapshots(self) -> list[Any] | None:
-        """Return every environment's collection position, or ``None`` on the batched backend."""
+        """Return every environment's collection position, or ``None`` on the batched backend.
+
+        The batched backend's position is ``_batched_env(...).collection_snapshot()``.
+        """
         try:
             return list(self.training_env.env_method("snapshot"))
         except NotImplementedError:
@@ -568,9 +620,11 @@ def train(
         write_json_atomic(run_dir / "config.json", resolved)
         resume_state = torch.load(checkpoint_dir / "collection.pt", weights_only=False)
         assert resume_state is not None
-        if resume_state["environments"] is None:
+        if resume_state["environments"] is None and (
+            resume_state.get("batched_environments") is None
+        ):
             raise ConfigError(
-                f"{checkpoint_dir} was written by the batched backend, which stores no "
+                f"{checkpoint_dir} was written by a batched backend that stored no "
                 "collection position; it can be evaluated but not resumed"
             )
         _drop_rows_from(run_dir / "rollouts.jsonl", "rollout", int(resume_state["version"]))

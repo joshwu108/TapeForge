@@ -1,7 +1,8 @@
 """Tests of the batched vector environment against the CPU training environment.
 
 The CPU side is ``PolicyActionEnv`` over ``ExecutionEnv``; the batched side
-runs on CPU tensors here. A CUDA run needs hardware and is not covered.
+runs on CPU tensors here. These tests do not run on CUDA; simulator parity
+on CUDA is covered by the gpu-marked tests in test_batched.py.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from test_execution.tapes import worksheet_spec, worksheet_tape
 pytest.importorskip("stable_baselines3")
 
 import torch  # noqa: E402
+from stable_baselines3 import PPO  # noqa: E402
 
 from tapeforge.execution import batched, parity  # noqa: E402
 from tapeforge.execution.rl.batched_env import BatchedExecutionVecEnv  # noqa: E402
@@ -130,21 +132,80 @@ def test_invalid_use_of_the_batched_environment_raises() -> None:
         vec.step(np.zeros((3, 1), dtype=np.float32))
     with pytest.raises(ValueError, match="bank row"):
         vec.reset_to([0, 1])
-    with pytest.raises(NotImplementedError, match="exact resume"):
+    with pytest.raises(NotImplementedError, match="collection_snapshot"):
         vec.env_method("snapshot")
     with pytest.raises(ValueError, match="reward_unit"):
         BatchedExecutionVecEnv(batch, 2, seed=0, reward_unit="dollars")
     assert vec.get_attr("render_mode") == [None, None]
 
 
-def test_the_trainer_runs_on_the_batched_backend_and_refuses_to_resume_it(tmp_path: Path) -> None:
+def test_a_restored_collection_snapshot_continues_the_same_trajectory() -> None:
+    episodes = parity.random_episodes(24, 9)
+    batch = batched.EpisodeBatch.from_episodes(episodes)
+    ids = [f"e{k}" for k in range(len(episodes))]
+    rng = np.random.default_rng(1)
+    actions = rng.uniform(-1.0, 1.0, size=(60, 8, 1)).astype(np.float32)
+    reference = BatchedExecutionVecEnv(batch, 8, seed=3, episode_ids=ids)
+    reference.reset()
+    for step in actions[:25]:
+        reference.step(step)
+    snapshot = reference.collection_snapshot()
+    expected = [reference.step(step) for step in actions[25:]]
+
+    # A fresh environment, other seed: only the snapshot decides how it continues.
+    restored = BatchedExecutionVecEnv(batch, 8, seed=99, episode_ids=ids)
+    restored.restore_collection(snapshot)
+    for step, (observation, reward, done, info) in zip(actions[25:], expected, strict=True):
+        got = restored.step(step)
+        assert got[0].tobytes() == observation.tobytes()
+        assert got[1].tobytes() == reward.tobytes()
+        assert np.array_equal(got[2], done)
+        assert [i.get("episode_summary") for i in got[3]] == [
+            i.get("episode_summary") for i in info
+        ]
+
+    with pytest.raises(ValueError, match="n_envs"):
+        BatchedExecutionVecEnv(batch, 4, seed=3, episode_ids=ids).restore_collection(snapshot)
+    with pytest.raises(ValueError, match="bank"):
+        BatchedExecutionVecEnv(batch, 8, seed=3).restore_collection(snapshot)
+
+
+def test_the_batched_backend_resumes_bit_identically_on_cpu_tensors(tmp_path: Path) -> None:
     config = load_ppo_config(write_configs(tmp_path, backend="batched"))
-    run = train(config, model_seed=0)
-    rows = [json.loads(line) for line in (run / "rollouts.jsonl").read_text().splitlines()]
+    uninterrupted = train(config, model_seed=0, output_dir=tmp_path / "a")
+    lines = (uninterrupted / "rollouts.jsonl").read_text().splitlines()
+    rows = [json.loads(line) for line in lines]
     assert [r["env_steps"] for r in rows] == [96, 192, 288, 384]
     assert all(np.isfinite(r["approx_kl"]) and r["episodes_finished"] > 0 for r in rows)
-    assert json.loads((run / "summary.json").read_text())["backend"] == "batched"
-    checkpoint = selected_checkpoint(run)
-    assert torch.load(checkpoint / "collection.pt", weights_only=False)["environments"] is None
+    assert json.loads((uninterrupted / "summary.json").read_text())["backend"] == "batched"
+
+    partial = train(config, model_seed=0, total_steps=192, output_dir=tmp_path / "b")
+    checkpoint = partial / "checkpoints" / "v00002"
+    stored = torch.load(checkpoint / "collection.pt", weights_only=False)
+    assert stored["environments"] is None and stored["batched_environments"] is not None
+    resumed = train(config, model_seed=0, resume_from=checkpoint)
+    assert resumed == partial
+    final = [PPO.load(run / "checkpoints" / "v00004" / "model.zip", device="cpu")
+             for run in (uninterrupted, resumed)]
+    for name, tensor in final[0].policy.state_dict().items():
+        assert torch.equal(tensor, final[1].policy.state_dict()[name]), name
+
+    def comparable(run: Path) -> list[dict[str, object]]:
+        lines = (run / "rollouts.jsonl").read_text().splitlines()
+        return [{k: v for k, v in json.loads(line).items() if not k.endswith("_seconds")}
+                for line in lines]
+
+    assert comparable(resumed) == comparable(uninterrupted)
+    assert selected_checkpoint(resumed).name == selected_checkpoint(uninterrupted).name
+
+
+def test_a_batched_checkpoint_without_a_collection_snapshot_is_not_resumed(
+    tmp_path: Path
+) -> None:
+    config = load_ppo_config(write_configs(tmp_path, backend="batched"))
+    run = train(config, model_seed=0, total_steps=192)
+    checkpoint = run / "checkpoints" / "v00002"
+    stored = torch.load(checkpoint / "collection.pt", weights_only=False)
+    torch.save({**stored, "batched_environments": None}, checkpoint / "collection.pt")
     with pytest.raises(ConfigError, match="not resumed"):
         train(config, model_seed=0, resume_from=checkpoint)
