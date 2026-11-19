@@ -1,0 +1,167 @@
+{
+  "schema": "tapeforge.evidence.pilot-validation/1",
+  "summary": "Validation-only repeat of the BTCUSDT futures pilot with PPO trained by the batched backend on one Modal Tesla T4. Null result: no seed improves on the immediate baseline; seed 2 is marginally worse. Test days were not uploaded or evaluated.",
+  "source": {
+    "git_commit": "846999426db8d1172ba64740c5841bfddcb65221",
+    "tree_sha256": "7f586ecb7109a7416237931dc99bc01bbd7b4f0623f94861b02de3a6005f4b9e"
+  },
+  "configs": [
+    "experiments/configs/pilot-futures-btcusdt-2023-12.toml with test = []",
+    "experiments/configs/pilot-futures-btcusdt-2023-12-training.toml",
+    "experiments/configs/pilot-futures-btcusdt-2023-12-ppo.toml with device = cuda, backend = batched"
+  ],
+  "split": {
+    "train": "2023-12-01..11",
+    "validation": "2023-12-12..17",
+    "test": "2023-12-18..23 sealed: absent from the runtime configuration"
+  },
+  "evaluation_manifest_digest": "7c0bceccc132fdb4ec43749b77e86186ef4ce67c3da3758b255e9229dc01793c",
+  "evaluation_episodes_equal_to_cpu_pilot": true,
+  "n_validation_episodes": 300,
+  "uncertainty": "day-cluster bootstrap over 6 validation days, 2,000 resamples, percentile",
+  "selection_rule": "lowest validation mean shortfall over versions 0, 20, ..., 200 (on CUDA)",
+  "final_replay": "selected checkpoints replayed on the validation episodes on CPU; every seed's replay is within 1e-8 bps of its CUDA selection score",
+  "baselines_validation_mean_shortfall_bps": {
+    "twap": 16.1036,
+    "immediate": 11.3657,
+    "cap_aware_twap": 11.2634,
+    "zero_action": 33.4812
+  },
+  "untrained_policy_validation_mean_shortfall_bps": 11.434,
+  "seeds": [
+    {
+      "model_seed": 0,
+      "env_steps": 960000,
+      "resumed_from_version": null,
+      "selected_version": 200,
+      "selection_scores_bps": {
+        "0": 11.4344,
+        "20": 11.4133,
+        "40": 11.4044,
+        "60": 11.3969,
+        "80": 11.4074,
+        "100": 11.4264,
+        "120": 11.418,
+        "140": 11.4184,
+        "160": 11.3708,
+        "180": 11.3707,
+        "200": 11.3327
+      },
+      "validation_mean_shortfall_bps": 11.3327,
+      "completion_by_fills_rate": 0.07,
+      "mean_settlement_fraction": 0.073,
+      "paired_vs_immediate": {
+        "mean_diff_bps": -0.033,
+        "ci95_bps": [
+          -0.119,
+          0.0478
+        ],
+        "n_pairs": 300
+      },
+      "paired_vs_cap_aware_twap": {
+        "mean_diff_bps": 0.0693,
+        "ci95_bps": [
+          -0.3785,
+          0.5245
+        ],
+        "n_pairs": 300
+      },
+      "seconds": {
+        "collect": 890.6,
+        "update": 105.5,
+        "evaluate": 878.7
+      }
+    },
+    {
+      "model_seed": 1,
+      "env_steps": 960000,
+      "resumed_from_version": null,
+      "selected_version": 20,
+      "selection_scores_bps": {
+        "0": 11.4343,
+        "20": 11.4121,
+        "40": 11.4413,
+        "60": 11.5562,
+        "80": 11.5838,
+        "100": 11.5079,
+        "120": 11.5621,
+        "140": 11.4749,
+        "160": 11.4555,
+        "180": 11.4418,
+        "200": 11.4534
+      },
+      "validation_mean_shortfall_bps": 11.4121,
+      "completion_by_fills_rate": 0.0,
+      "mean_settlement_fraction": 0.0713,
+      "paired_vs_immediate": {
+        "mean_diff_bps": 0.0464,
+        "ci95_bps": [
+          -0.0332,
+          0.1338
+        ],
+        "n_pairs": 300
+      },
+      "paired_vs_cap_aware_twap": {
+        "mean_diff_bps": 0.1486,
+        "ci95_bps": [
+          -0.3213,
+          0.628
+        ],
+        "n_pairs": 300
+      },
+      "seconds": {
+        "collect": 812.9,
+        "update": 96.7,
+        "evaluate": 816.5
+      }
+    },
+    {
+      "model_seed": 2,
+      "env_steps": 960000,
+      "resumed_from_version": 120,
+      "selected_version": 200,
+      "selection_scores_bps": {
+        "0": 11.4344,
+        "20": 11.4275,
+        "40": 11.4183,
+        "60": 11.4246,
+        "80": 11.4267,
+        "100": 11.4277,
+        "120": 11.4367,
+        "140": 11.4313,
+        "160": 11.4346,
+        "180": 11.4181,
+        "200": 11.4155
+      },
+      "validation_mean_shortfall_bps": 11.4155,
+      "completion_by_fills_rate": 0.0033333333333333335,
+      "mean_settlement_fraction": 0.0719,
+      "paired_vs_immediate": {
+        "mean_diff_bps": 0.0498,
+        "ci95_bps": [
+          0.0053,
+          0.1043
+        ],
+        "n_pairs": 300
+      },
+      "paired_vs_cap_aware_twap": {
+        "mean_diff_bps": 0.1521,
+        "ci95_bps": [
+          -0.3149,
+          0.6306
+        ],
+        "n_pairs": 300
+      },
+      "seconds": {
+        "collect": 754.0,
+        "update": 92.0,
+        "evaluate": 770.6
+      }
+    }
+  ],
+  "notes": [
+    "The batched backend draws training episodes in a different sequence than the CPU backends, so these seeds are not replicas of the CPU pilot's seeds.",
+    "Seed 2 was interrupted by the runtime limit and resumed on CUDA from version 120; on CUDA a resume continues the same schedule but is not claimed bit-identical.",
+    "Wall times are from a shared Modal host and are not a CPU-versus-GPU comparison."
+  ]
+}

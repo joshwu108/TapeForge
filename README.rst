@@ -131,6 +131,18 @@ policies that wait are cheapest). These figures come from one instrument and
 one month under labelled settings. They are not out-of-sample evidence, and
 the sealed test days have not been evaluated.
 
+The validation pilot was repeated with PPO trained by the batched backend on
+one Tesla T4, with the same settings, frozen statistics, selection rule and
+the same 300 validation episodes; the runtime configuration contained no
+test dates. It is a second **null result**, not a confirmation of skill:
+the selected checkpoints score 11.33, 11.41 and 11.42 bps against 11.37 for
+``immediate`` (paired differences -0.03, +0.05 and +0.05 bps; only the
+third interval excludes zero, unfavourably) and are indistinguishable from
+``cap_aware_twap``. The batched backend draws training episodes in another
+order, so its seeds are not replicas of the CPU seeds. Moving training to a
+GPU does not change the conclusion. Record:
+``benchmarks/evidence/pilot-cuda-validation-2026-11-19.json``.
+
 Install
 =======
 
