@@ -5,4 +5,6 @@ profiles = ["uniform", "burst"]
 bucket_width_us = 1_000_000
 warmup = 5
 repeats = 20
-variants = ["pageable_sync", "pinned_sync", "pinned_streams"]
+variants = ["pageable_sync", "pinned_sync", "pinned_streams", "batched_sync"]
+batch_records = 1_048_576   # records per batch of the overlapped variants
+slots = 3                   # buffer sets in rotation for pinned_streams; batched_sync uses 1

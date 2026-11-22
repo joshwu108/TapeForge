@@ -16,9 +16,24 @@ Variants (``variants`` in the config):
 
     pageable_sync   ordinary host memory, blocking copies
     pinned_sync     page-locked host memory, non_blocking copies + synchronize
-    pinned_streams  NOT IMPLEMENTED: overlapping the copy of one chunk with
-                    the compute of the previous one on separate CUDA streams;
-                    reported as skipped until it exists
+    pinned_streams  tapeforge.pipelined.OverlappedAggregator: bucket-aligned
+                    batches of ``batch_records`` records staged from ordinary
+                    host memory through bounded pinned buffers, with copy in,
+                    compute and copy back on three streams and ``slots``
+                    buffer sets, so batch N + 1 is copied while batch N is
+                    computed
+    batched_sync    the same aggregator, batches and buffers with one slot:
+                    every stage waits for the previous batch, so nothing
+                    overlaps. The like-for-like control for pinned_streams.
+
+The two batched variants start from the same pageable columns as
+``pageable_sync`` and include the copy into pinned staging; their timed
+region is ``run()`` (setup -- validation, planning, pinned and device
+allocation -- is recorded once as ``setup_ms``), and they report only
+``end_to_end``, because their stages overlap by design. An extra traced run
+(CUDA events per stage, not timed) records how long copies and compute ran
+concurrently (``overlap_copy_in_compute_ms`` and friends); it is the proof
+that the overlap happens, separate from the timing.
 
 ``compute_ms`` is ``ops.aggregate`` as a caller uses it (validation,
 planning, allocation, launches), on whichever kernel path the workload's
@@ -49,7 +64,8 @@ from workload import check_features, features_dict, host_columns, make_workload
 from tapeforge import ops, reference
 
 # Variants with an implementation; any other configured variant is skipped.
-IMPLEMENTED_VARIANTS = ("pageable_sync", "pinned_sync")
+IMPLEMENTED_VARIANTS = ("pageable_sync", "pinned_sync", "pinned_streams", "batched_sync")
+BATCHED_VARIANTS = ("pinned_streams", "batched_sync")
 
 
 def _numpy_reference(trades: Any, offsets: Any) -> dict[str, Any]:
@@ -117,6 +133,51 @@ def _measure_variant(
     return metrics
 
 
+def _measure_batched(
+    trades: Any, offsets: Any, slots: int, batch_records: int, expected: reference.Features,
+    warmup: int, repeats: int,
+) -> dict[str, Any]:
+    """Gate, trace and time one ``OverlappedAggregator`` configuration.
+
+    Returns:
+        ``status`` ``"incorrect"`` with a reason when the gate fails; otherwise
+        ``end_to_end_*_ms`` of ``run()``, ``setup_ms``, the buffer sizes, the
+        batch count and the stage overlaps of one traced run.
+    """
+    from tapeforge import pipelined
+
+    aggregator = pipelined.OverlappedAggregator(
+        trades, offsets, batch_records=batch_records, slots=slots
+    )
+    try:
+        check_features(aggregator.run(), expected)
+    except AssertionError as exc:
+        return {"status": "incorrect", "reason": str(exc)[:500]}
+    timing = time_callable(aggregator.run, warmup=warmup, repeats=repeats, synchronize=True)
+    traced = pipelined.OverlappedAggregator(
+        trades, offsets, batch_records=batch_records, slots=slots, trace=True
+    )
+    check_features(traced.run(), expected)
+    rows = pipelined.timeline_intervals(traced.stats)
+    span = max(row["copy_out_end"] for row in rows) if rows else 0.0
+    stats = aggregator.stats
+    metrics: dict[str, Any] = {
+        "status": "ok", "correct": True,
+        "end_to_end_p50_ms": timing["p50_ms"], "end_to_end_p95_ms": timing["p95_ms"],
+        "end_to_end_p99_ms": timing["p99_ms"], "end_to_end_min_ms": timing["min_ms"],
+        "setup_ms": stats.setup_seconds * 1e3, "slots": stats.slots,
+        "batch_records": batch_records, "n_batches": stats.n_batches,
+        "capacity_records": stats.capacity_records, "pinned_bytes": stats.pinned_bytes,
+        "device_bytes": stats.device_bytes, "traced_span_ms": span,
+        "traced_copy_in_ms": sum(r["copy_in_end"] - r["copy_in_start"] for r in rows),
+        "traced_compute_ms": sum(r["compute_end"] - r["compute_start"] for r in rows),
+        "traced_copy_out_ms": sum(r["copy_out_end"] - r["copy_out_start"] for r in rows),
+    }
+    for a, b in (("copy_in", "compute"), ("copy_out", "compute"), ("copy_in", "copy_out")):
+        metrics[f"overlap_{a}_{b}_ms"] = pipelined.overlap_ms(rows, a, b)
+    return metrics
+
+
 def main(argv: list[str] | None = None) -> int:
     """Time every configured variant on every workload and print one JSON line per result.
 
@@ -132,8 +193,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profiles", nargs="+", help="override config profiles")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--no-record", action="store_true", help="print only, skip results.json")
+    parser.add_argument("--variants", nargs="+", help="override config variants")
+    parser.add_argument("--batch-records", type=int, help="override config batch_records")
+    parser.add_argument("--slots", type=int, help="override config slots")
     args = parser.parse_args(argv)
     config = tomllib.loads(Path(args.config).read_text())
+    for key in ("variants", "batch_records", "slots"):
+        if getattr(args, key) is not None:
+            config[key] = getattr(args, key)
 
     import torch
 
@@ -154,8 +221,15 @@ def main(argv: list[str] | None = None) -> int:
                 if variant not in IMPLEMENTED_VARIANTS:
                     print(f"skip {variant}: not implemented", file=sys.stderr)
                     continue
+                if variant in BATCHED_VARIANTS:
+                    slots = 1 if variant == "batched_sync" else int(config.get("slots", 2))
+                    results[variant] = _measure_batched(
+                        trades, offsets, slots, int(config.get("batch_records", 1 << 20)),
+                        expected, warmup, repeats,
+                    )
+                    continue
                 results[variant] = _measure_variant(
-                    trades, offsets, variant.startswith("pinned"), expected, warmup, repeats
+                    trades, offsets, variant == "pinned_sync", expected, warmup, repeats
                 )
             cpu = time_callable(
                 partial(_numpy_reference, trades, offsets),
@@ -171,6 +245,8 @@ def main(argv: list[str] | None = None) -> int:
                 run_config = {
                     "workload": info.as_dict(),
                     "variant": name,
+                    "batch_records": config.get("batch_records"),
+                    "slots": config.get("slots"),
                     "warmup": warmup,
                     "repeats": repeats,
                     "timing_method": TIMING_METHOD,
