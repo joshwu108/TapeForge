@@ -17,7 +17,6 @@ Dependencies:
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 from collections.abc import Sequence
@@ -57,6 +56,20 @@ __all__ = [
 ]
 
 
+def policy_copy(policy: Any, device: str) -> Any:
+    """Return an evaluation-mode copy of an SB3 policy on ``device``.
+
+    Rebuilt from the policy's constructor parameters and state dict, as SB3
+    saves and loads policies; ``copy.deepcopy`` fails on a policy that has
+    trained (its distribution holds non-leaf tensors).
+    """
+    clone = type(policy)(**policy._get_constructor_parameters())
+    clone.load_state_dict(policy.state_dict())
+    clone = clone.to(device)
+    clone.set_training_mode(False)
+    return clone
+
+
 def checkpoint_policy(
     model: PPO, statistics: ObservationStatistics | None, device: str | None = None
 ) -> Policy:
@@ -76,8 +89,7 @@ def checkpoint_policy(
     """
     policy = model.policy
     if device is not None and torch.device(device) != policy.device:
-        policy = copy.deepcopy(policy).to(device)
-        policy.set_training_mode(False)
+        policy = policy_copy(policy, device)
 
     def act(vector: np.ndarray) -> float:
         action, _ = policy.predict(vector, deterministic=True)

@@ -333,3 +333,20 @@ def test_a_cpu_evaluation_copy_of_a_cuda_policy_agrees_to_float32_rounding(
     on_cuda = _policy_actions("cuda", None)
     on_cpu = _policy_actions("cuda", "cpu")
     assert on_cpu == pytest.approx(on_cuda, abs=1e-6)
+
+
+def test_an_evaluation_copy_of_a_trained_policy_answers_like_the_original() -> None:
+    """A trained policy cannot be deep-copied; the rebuilt copy must still agree exactly."""
+    from tapeforge.execution.rl.ppo_eval import policy_copy
+
+    episodes = parity.random_episodes(8, 9)
+    vec = BatchedExecutionVecEnv(batched.EpisodeBatch.from_episodes(episodes), 4, seed=0)
+    model = PPO("MlpPolicy", vec, n_steps=8, batch_size=8, device="cpu", seed=0)
+    model.learn(32)
+    clone = policy_copy(model.policy, "cpu")
+    observations = np.random.default_rng(0).normal(size=(64, vec.observation_space.shape[0]))
+    observations = observations.astype(np.float32)
+    expected, _ = model.policy.predict(observations, deterministic=True)
+    got, _ = clone.predict(observations, deterministic=True)
+    assert got.tobytes() == expected.tobytes()
+    assert clone is not model.policy
