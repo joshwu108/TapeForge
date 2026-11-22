@@ -662,7 +662,7 @@ masked no-op; memory is 41 bytes per episode bucket.
 rollout buffer is host memory, that backend still copies actions,
 observations, rewards and done flags between host and device every step.
 
-Two optional PPO settings change how, not what, the trainer computes; both
+Three optional PPO settings change how, not what, the trainer computes; all
 are left out of the stored configuration at their defaults, so existing runs
 and resume checks are unaffected:
 
@@ -680,6 +680,23 @@ and resume checks are unaffected:
   metric and selection rule are unchanged; the copy's float32 outputs may
   differ from the CUDA policy's in the last bits, so a selection score is not
   bit-identical to one computed on CUDA.
+* ``schedule.lockstep_validation = true`` (any backend) replays the
+  validation episodes together on the reference simulator and asks the policy
+  once per decision round, for every episode still running, instead of once
+  per decision (``runner.run_episodes_lockstep``). A profile of the
+  per-decision replay showed about 85% of validation time inside the single
+  observation policy call. Episodes, statistics, simulator, metric and
+  selection rule are unchanged, and a batch policy that answers each
+  observation as it would alone reproduces the per-decision trajectories
+  exactly (tested); a network forward over several rows may round
+  differently from a one-row forward, so a selection score is not guaranteed
+  bit-identical. On the synthetic smoke benchmark on one laptop CPU
+  (96,000 samples, five validation passes of 50 episodes, one run per
+  variant, not a T4 measurement) validation fell from 4.5 to 1.1 s on the
+  serial backend and from 4.7 to 1.0 s on the batched CPU backend, each
+  variant pair selected the same checkpoint, and the selected scores differed
+  by at most 5e-9 bps. The fixed-checkpoint replay of ``ppo_eval`` still
+  uses the per-decision path.
 
 **Verification status.** On CPU tensors the batched simulator matches the
 reference on every compared transition. On CUDA it was executed on one Tesla
@@ -867,8 +884,9 @@ quantities and values using up to the whole int64 bound) and checks every
 path against the plain-loop oracle, listing the seeds of any failure.
 
 ``training.py`` backend entries take options after ``+``:
-``batched+compile`` sets ``rollout.compile_simulator`` and ``+cpu_eval``
-sets ``schedule.evaluation_device = "cpu"``; with ``core_compiled = true``
+``batched+compile`` sets ``rollout.compile_simulator``, ``+cpu_eval``
+sets ``schedule.evaluation_device = "cpu"`` and ``+lockstep`` (any backend,
+for example ``serial+lockstep``) sets ``schedule.lockstep_validation``; with ``core_compiled = true``
 the batched-core section also times the compiled vector step.
 
 ``training.py`` (needs the ``train`` extra) compares serial, subprocess and

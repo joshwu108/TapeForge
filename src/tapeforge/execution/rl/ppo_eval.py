@@ -41,13 +41,15 @@ from tapeforge.execution.rl.evaluation import (
     evaluate_policy,
     evaluation_manifest,
     validate_checkpoint_provenance,
+    vector_batch_policy,
     vector_policy,
 )
 from tapeforge.execution.rl.normalization import ObservationStatistics, statistics_from_json
 from tapeforge.execution.rl.ppo_env import policy_action_to_env
-from tapeforge.execution.runner import Policy
+from tapeforge.execution.runner import BatchPolicy, Policy
 
 __all__ = [
+    "checkpoint_batch_policy",
     "checkpoint_policy",
     "evaluate_checkpoint",
     "load_checkpoint",
@@ -96,6 +98,30 @@ def checkpoint_policy(
         return policy_action_to_env(action)
 
     return vector_policy(act, statistics)
+
+
+def checkpoint_batch_policy(
+    model: PPO, statistics: ObservationStatistics | None, device: str | None = None
+) -> BatchPolicy:
+    """Return ``checkpoint_policy`` answering many pending decisions per network call.
+
+    The same standardisation, Gaussian mean and ``policy_action_to_env`` as
+    ``checkpoint_policy``, applied to a matrix with one row per observation.
+    A row's output can differ from the one-row forward in the last float32
+    bits (the linear layers may sum in another order for another batch
+    size), so scores from the two are close, not guaranteed bit-identical.
+    ``device`` is as in ``checkpoint_policy``; with one call per decision
+    round the device round trip is paid per round, not per decision.
+    """
+    policy = model.policy
+    if device is not None and torch.device(device) != policy.device:
+        policy = policy_copy(policy, device)
+
+    def act(vectors: np.ndarray) -> list[float]:
+        actions, _ = policy.predict(vectors, deterministic=True)
+        return [policy_action_to_env(action) for action in actions]
+
+    return vector_batch_policy(act, statistics)
 
 
 def sha256_of_file(path: Path) -> str:

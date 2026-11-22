@@ -394,3 +394,38 @@ def test_day_tape_round_trip_through_a_run_record_source(tmp_path: Path) -> None
     splits = build_splits([day], SplitDates((DATES[0],), ()), SPEC)
     record, _ = run_policy(splits, "train", twap, "twap", SPEC, 1, seed=1)
     assert record["split"]["days"][0]["source"] == "rows"
+
+
+def test_lockstep_replay_equals_one_episode_at_a_time() -> None:
+    """A batch policy that answers each observation alone reproduces ``run_policy`` exactly."""
+    from tapeforge.execution.runner import run_episodes_lockstep
+
+    splits = _synthetic_splits()
+    calls: list[int] = []
+
+    def batch_twap(observations: list[Observation]) -> list[float]:
+        calls.append(len(observations))
+        return [twap(o) for o in observations]
+
+    one_by_one, expected = run_policy(splits, "train", twap, "twap", SPEC, 12, seed=4)
+    together, got = run_policy(splits, "train", None, "twap", SPEC, 12, seed=4,
+                               batch_policy=batch_twap)
+    assert together["episodes"] == one_by_one["episodes"]
+    assert together["summary"] == one_by_one["summary"]
+    for a, b in zip(got, expected, strict=True):
+        assert a.states == b.states and a.results == b.results and a.actions == b.actions
+        assert all(np.array_equal(x, y) for x, y in zip(a.observations, b.observations,
+                                                        strict=True))
+    # One call per decision round; later rounds hold only the episodes still running.
+    assert len(calls) == max(len(t.actions) for t in expected)
+    assert sum(calls) == sum(len(t.actions) for t in expected)
+    assert calls == sorted(calls, reverse=True) and calls[0] == 12
+    assert run_episodes_lockstep([], batch_twap) == ()
+
+
+def test_lockstep_replay_rejects_a_wrong_number_of_actions_and_a_missing_policy() -> None:
+    splits = _synthetic_splits()
+    with pytest.raises(ValueError, match="1 actions for 3 observations"):
+        run_policy(splits, "train", None, "bad", SPEC, 3, seed=4, batch_policy=lambda o: [0.5])
+    with pytest.raises(ValueError, match="needs a policy"):
+        run_policy(splits, "train", None, "none", SPEC, 3, seed=4)

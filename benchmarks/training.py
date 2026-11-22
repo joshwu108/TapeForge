@@ -228,17 +228,19 @@ def _variant(config: PPOConfig, backend: str, device: str) -> PPOConfig:
     """Return ``config`` with the backend replaced; the batched backend also takes the device.
 
     A backend entry may carry options after ``+``: ``batched+compile`` sets
-    ``compile_simulator``, ``+cpu_eval`` sets ``evaluation_device = "cpu"``.
-    Everything else in the PPO configuration stays as written.
+    ``compile_simulator``, ``+cpu_eval`` sets ``evaluation_device = "cpu"``
+    (both ``batched`` only) and ``+lockstep`` sets ``lockstep_validation``
+    (any backend). Everything else in the PPO configuration stays as written.
     """
     name, *options = backend.split("+")
-    unknown = set(options) - {"compile", "cpu_eval"}
-    if unknown or (options and name != "batched"):
+    unknown = set(options) - {"compile", "cpu_eval", "lockstep"}
+    if unknown or (name != "batched" and set(options) - {"lockstep"}):
         raise ValueError(f"unknown backend variant {backend!r}")
     return replace(
         config, backend=name, device=device if name == "batched" else "cpu",
         compile_simulator="compile" in options,
         evaluation_device="cpu" if "cpu_eval" in options else None,
+        lockstep_validation="lockstep" in options,
     )
 
 
@@ -419,6 +421,7 @@ def run_end_to_end(config: PPOConfig, benchmark: dict[str, Any], out_dir: Path) 
         "device": config.device,
         "compile_simulator": config.compile_simulator,
         "evaluation_device": config.evaluation_device or config.device,
+        "lockstep_validation": config.lockstep_validation,
         "n_envs": config.n_envs,
         "env_steps": summary["env_steps"],
         "seconds": {k: seconds[k] for k in ("data_load", "statistics", "setup", "collect",

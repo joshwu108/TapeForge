@@ -58,6 +58,7 @@ from tapeforge.execution.state import MarketSlice, State, StepResult
 
 __all__ = [
     "RUN_RECORD_SCHEMA",
+    "BatchPolicy",
     "EpisodeSummary",
     "Observation",
     "Policy",
@@ -67,6 +68,7 @@ __all__ = [
     "nearest_rank_percentile",
     "observation_for",
     "run_episode",
+    "run_episodes_lockstep",
     "run_policy",
     "summarize_episode",
     "summarize_set",
@@ -114,6 +116,10 @@ class Observation:
 
 # A policy maps an observation to the fraction of the remaining quantity to submit.
 Policy = Callable[[Observation], float]
+
+# A batch policy answers several episodes' pending decisions in one call: one fraction
+# per observation, in order. The observations belong to different episodes.
+BatchPolicy = Callable[[Sequence[Observation]], Sequence[float]]
 
 
 def observation_for(state: State, market: MarketSlice, spec: EpisodeSpec) -> Observation:
@@ -194,6 +200,62 @@ def run_episode(spec: EpisodeSpec, market: MarketSlice, policy: Policy) -> Traje
         observations=tuple(observations),
         actions=tuple(actions),
         results=tuple(results),
+    )
+
+
+def run_episodes_lockstep(
+    episodes: Sequence[tuple[EpisodeSpec, MarketSlice]], policy: BatchPolicy
+) -> tuple[Trajectory, ...]:
+    """Replay several episodes together, one policy call per decision round.
+
+    Round ``k`` collects the pending observation of every episode that has
+    not ended, asks ``policy`` for all of them at once and applies each
+    answer to its own episode with the same ``reset`` and ``step`` as
+    ``run_episode``. The episodes do not interact, so a batch policy that
+    returns for every observation what a ``Policy`` returns for it alone
+    yields exactly the trajectories of ``run_episode``; only the number of
+    policy calls changes (the longest episode's decision count instead of
+    the sum over episodes). A learned policy evaluated on a batch can round
+    differently from the same policy on one row, which is the only source
+    of difference.
+
+    Returns:
+        One trajectory per episode, in the order given.
+
+    Raises:
+        ValueError: ``reset`` or ``step`` rejects an episode or an action,
+            or ``policy`` does not return one action per observation.
+        OverflowError: The int64 bounds check in ``reset`` fails.
+    """
+    states = [reset(spec, market) for spec, market in episodes]
+    histories: list[tuple[list[State], list[np.ndarray], list[float], list[StepResult]]] = [
+        ([state], [], [], []) for state in states
+    ]
+    active = [k for k, (spec, _) in enumerate(episodes) if not is_done(states[k], spec)]
+    while active:
+        pending = [observation_for(states[k], episodes[k][1], episodes[k][0]) for k in active]
+        answers = policy(pending)
+        if len(answers) != len(pending):
+            raise ValueError(
+                f"batch policy returned {len(answers)} actions for {len(pending)} observations"
+            )
+        still_active = []
+        for k, observation, answer in zip(active, pending, answers, strict=True):
+            spec, market = episodes[k]
+            action = float(answer)
+            states[k], result = step(states[k], action, market, spec)
+            history = histories[k]
+            history[0].append(states[k])
+            history[1].append(observation.vector)
+            history[2].append(action)
+            history[3].append(result)
+            if not (result.terminated or result.truncated or is_done(states[k], spec)):
+                still_active.append(k)
+        active = still_active
+    return tuple(
+        Trajectory(spec=spec, states=tuple(h[0]), observations=tuple(h[1]),
+                   actions=tuple(h[2]), results=tuple(h[3]))
+        for (spec, _), h in zip(episodes, histories, strict=True)
     )
 
 
@@ -513,20 +575,22 @@ def _template_json(template: EpisodeSpec) -> dict[str, Any]:
 def run_policy(
     splits: Splits,
     role: str,
-    policy: Policy,
+    policy: Policy | None,
     policy_name: str,
     template: EpisodeSpec,
     n_episodes: int,
     seed: int,
     rho_choices_bps: tuple[int, ...] = ACCEPTED_TARGET_FRACTIONS_BPS,
     observation_statistics: dict[str, Any] | None = None,
+    batch_policy: BatchPolicy | None = None,
 ) -> tuple[dict[str, Any], tuple[Trajectory, ...]]:
     """Sample ``n_episodes`` of ``role``, replay ``policy`` on each and build the run record.
 
     Args:
         splits: Split tapes and record.
         role: One of ``ROLES``.
-        policy: The policy to replay.
+        policy: The policy to replay; unused (and may be ``None``) when
+            ``batch_policy`` is given.
         policy_name: Name stored in the record's ``config``.
         template: Spec template; side and target come from each draw.
         n_episodes: Number of draws; positive.
@@ -535,28 +599,42 @@ def run_policy(
         observation_statistics: Stored verbatim in the record when given
             (see ``normalization``); the runner does not apply it, since the
             baselines read raw observations.
+        batch_policy: When given, the episodes are replayed together with
+            ``run_episodes_lockstep`` and this policy answers each decision
+            round; the draws, specs, summaries and record are built the same
+            way. All market slices of the role are then held at once.
 
     Returns:
         The JSON-ready record and the trajectories. The trajectories are not
         stored in the record, which keeps per-episode summaries only.
 
     Raises:
-        ValueError: ``n_episodes < 1``, a template that does not match the
+        ValueError: ``n_episodes < 1``, neither policy given, a template that does not match the
             split geometry, or a role without admissible starts.
     """
     if n_episodes < 1:
         raise ValueError(f"n_episodes must be positive, got {n_episodes}")
+    if policy is None and batch_policy is None:
+        raise ValueError("run_policy needs a policy or a batch_policy")
     draws = sample_episodes(splits.record, role, n_episodes, seed, rho_choices_bps)
-    trajectories: list[Trajectory] = [] # detailed histories
-    episodes: list[dict[str, Any]] = [] # compact JSON episode summaries
-    for draw in draws:
-        # receive execution rules and historical market slice
-        spec, market = materialize(splits, draw, template)
-        # run the episode: the policy repeatedly receives an observation and chooses an
-        # action, and the simulator calculates the outcome
-        trajectory = run_episode(spec, market, policy)
-        trajectories.append(trajectory)
-        episodes.append(_episode_json(draw, spec, summarize_episode(trajectory)))
+    specs: list[EpisodeSpec] = []
+    trajectories: list[Trajectory] = []
+    if batch_policy is None:
+        assert policy is not None  # Checked above; narrows the type.
+        # One slice at a time: only the trajectories outlive their episode.
+        for draw in draws:
+            spec, market = materialize(splits, draw, template)
+            specs.append(spec)
+            trajectories.append(run_episode(spec, market, policy))
+    else:
+        materialized = [materialize(splits, draw, template) for draw in draws]
+        specs = [spec for spec, _ in materialized]
+        trajectories = list(run_episodes_lockstep(materialized, batch_policy))
+    summaries = [summarize_episode(trajectory) for trajectory in trajectories]
+    episodes = [
+        _episode_json(draw, spec, summary)
+        for draw, spec, summary in zip(draws, specs, summaries, strict=True)
+    ]
     record = {
         "schema": RUN_RECORD_SCHEMA,
         "simulator_version": SIMULATOR_VERSION,
@@ -573,7 +651,7 @@ def run_policy(
         "split": splits.record.to_json(),
         "observation_statistics": observation_statistics,
         "episodes": episodes,
-        "summary": summarize_set([summarize_episode(t) for t in trajectories]).to_json(),
+        "summary": summarize_set(summaries).to_json(),
     }
     return record, tuple(trajectories)
 

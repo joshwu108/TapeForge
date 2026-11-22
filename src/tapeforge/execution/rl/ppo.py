@@ -122,6 +122,7 @@ from tapeforge.execution.rl.normalization import ObservationStatistics, save_sta
 from tapeforge.execution.rl.ppo_config import PPOConfig, load_ppo_config
 from tapeforge.execution.rl.ppo_env import ACTION_MAP, make_vec_env
 from tapeforge.execution.rl.ppo_eval import (
+    checkpoint_batch_policy,
     checkpoint_policy,
     evaluate_checkpoint,
     sha256_of_file,
@@ -444,6 +445,7 @@ def _optional(value: Any) -> float | None:
 def _validation_evaluator(
     experiment: ExperimentConfig, training: TrainingConfig, splits: Splits,
     statistics: ObservationStatistics, metric: str, device: str | None = None,
+    lockstep: bool = False,
 ) -> Callable[[PPO], dict[str, Any]]:
     """Return the function that scores a model on the fixed validation episodes.
 
@@ -451,16 +453,19 @@ def _validation_evaluator(
     in the validation role, with ``n`` the experiment's validation count:
     exactly the identifiers a baseline run of the same experiment replays.
     ``device`` is ``PPOConfig.evaluation_device`` (``checkpoint_policy``).
+    ``lockstep`` is ``PPOConfig.lockstep_validation``: the same episodes on
+    the same simulator, the policy asked once per decision round.
     """
     n_episodes = experiment.n_episodes("validation")
 
     def evaluate(model: PPO) -> dict[str, Any]:
-        policy = checkpoint_policy(model, statistics, device)
+        policy = None if lockstep else checkpoint_policy(model, statistics, device)
+        batch_policy = checkpoint_batch_policy(model, statistics, device) if lockstep else None
         per_seed = {}
         for seed in training.eval_seeds:
             record, _ = run_policy(
                 splits, "validation", policy, "ppo", experiment.template, n_episodes, seed,
-                experiment.rho_choices_bps,
+                experiment.rho_choices_bps, batch_policy=batch_policy,
             )
             per_seed[str(seed)] = {
                 k: record["summary"][k]
@@ -666,7 +671,7 @@ def train(
     log = _TrainingLog(
         run_dir, config,
         _validation_evaluator(experiment, training, splits, statistics, config.selection_metric,
-                              config.evaluation_device),
+                              config.evaluation_device, config.lockstep_validation),
         provenance,
     )
     try:

@@ -76,6 +76,7 @@ from tapeforge.execution.rl.normalization import (
     statistics_from_json,
 )
 from tapeforge.execution.runner import (
+    BatchPolicy,
     Observation,
     Policy,
     code_revision,
@@ -89,6 +90,7 @@ __all__ = [
     "EVALUATION_MANIFEST_SCHEMA",
     "TRAINING_CONFIG_SCHEMA",
     "TrainingConfig",
+    "VectorBatchPolicy",
     "VectorPolicy",
     "canonical_sha256",
     "checkpoint_provenance",
@@ -99,6 +101,7 @@ __all__ = [
     "training_config_from_mapping",
     "training_statistics",
     "validate_checkpoint_provenance",
+    "vector_batch_policy",
     "vector_policy",
     "write_evaluation_manifest",
 ]
@@ -430,6 +433,42 @@ def vector_policy(
         if statistics is not None:
             vector = normalize(vector, statistics)
         return _action_value(fn(vector.astype(np.float32)))
+
+    return policy
+
+
+# Maps the float32 observation matrix ``[n, len(OBSERVATION_FIELDS)]`` of ``n`` pending
+# decisions to ``n`` actions, each a float in ``[0, 1]`` (or a shape-(1,) array).
+VectorBatchPolicy = Callable[[np.ndarray], Sequence[Any]]
+
+
+def vector_batch_policy(
+    fn: VectorBatchPolicy, statistics: ObservationStatistics | None = None
+) -> BatchPolicy:
+    """Adapt a callable over a matrix of observation vectors to the runner's ``BatchPolicy``.
+
+    Row ``i`` of the matrix is exactly the vector ``vector_policy`` would
+    hand its callable for observation ``i``: standardised per row with
+    ``statistics`` when given, cast to float32. Every returned action is
+    validated by ``_action_value`` and never clipped.
+
+    Raises:
+        ValueError: The statistics do not cover ``OBSERVATION_FIELDS``, or
+            (when called) ``fn`` returns a different number of actions.
+    """
+    if statistics is not None and tuple(statistics.fields) != OBSERVATION_FIELDS:
+        raise ValueError("statistics must cover exactly OBSERVATION_FIELDS, in order")
+
+    def policy(observations: Sequence[Observation]) -> list[float]:
+        vectors = [o.vector for o in observations]
+        if statistics is not None:
+            vectors = [normalize(v, statistics) for v in vectors]
+        actions = fn(np.stack(vectors).astype(np.float32))
+        if len(actions) != len(observations):
+            raise ValueError(
+                f"policy returned {len(actions)} actions for {len(observations)} observations"
+            )
+        return [_action_value(a) for a in actions]
 
     return policy
 

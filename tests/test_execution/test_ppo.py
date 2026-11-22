@@ -383,6 +383,63 @@ def test_a_short_run_writes_finite_diagnostics_and_a_validation_selection(
     assert stored["ppo"]["gamma"] == 1.0 and stored["training"]["train_role"] == "train"
 
 
+def test_lockstep_validation_scores_the_same_checkpoints_like_the_per_decision_replay(
+    trained: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """Same seed, same checkpoints: only how often the policy is called differs."""
+    from dataclasses import replace
+
+    _, run = trained
+    config = load_ppo_config(write_configs(tmp_path))
+    assert config.lockstep_validation is False and "lockstep_validation" not in config.to_json()
+    lockstep = replace(config, lockstep_validation=True)
+    assert lockstep.to_json()["lockstep_validation"] is True
+    with pytest.raises(ConfigError, match="boolean"):
+        replace(config, lockstep_validation=1)  # type: ignore[arg-type]
+    other = train(lockstep, model_seed=0)
+
+    def evaluations(path: Path) -> list[dict[str, object]]:
+        lines = (path / "evaluations.jsonl").read_text().splitlines()
+        return [json.loads(line) for line in lines]
+
+    reference, got = evaluations(run), evaluations(other)
+    assert [e["policy_version"] for e in got] == [e["policy_version"] for e in reference]
+    for a, b in zip(got, reference, strict=True):
+        assert a["validation_mean_shortfall_bps"] == pytest.approx(
+            b["validation_mean_shortfall_bps"], abs=1e-6
+        )
+        for seed, per_seed in a["validation"].items():  # type: ignore[union-attr]
+            expected = b["validation"][seed]  # type: ignore[index]
+            assert per_seed["n_episodes"] == expected["n_episodes"]
+            assert per_seed["n_truncated"] == expected["n_truncated"]
+    selected = [json.loads((p / "selection.json").read_text())["selected"]["policy_version"]
+                for p in (run, other)]
+    assert selected[0] == selected[1]
+
+
+def test_the_batch_checkpoint_policy_agrees_with_the_one_row_policy_to_float32_rounding(
+    trained: tuple[Path, Path]
+) -> None:
+    from tapeforge.execution.rl.ppo_eval import checkpoint_batch_policy, checkpoint_policy
+    from tapeforge.execution.runner import observation_for
+
+    _, run = trained
+    model, _, statistics = load_checkpoint(selected_checkpoint(run))
+    spec = worksheet_spec()
+    market = worksheet_tape()
+    state = reset(spec, market)
+    observations = []
+    for _ in range(3):
+        observations.append(observation_for(state, market, spec))
+        state, _ = step(state, 0.01, market, spec)
+    single = checkpoint_policy(model, statistics)
+    together = checkpoint_batch_policy(model, statistics)(observations)
+    assert together == pytest.approx([single(o) for o in observations], abs=1e-6)
+    assert checkpoint_batch_policy(model, statistics)(observations[:1]) == [
+        single(observations[0])
+    ]
+
+
 def test_a_reloaded_checkpoint_predicts_identically_and_carries_its_provenance(
     trained: tuple[Path, Path]
 ) -> None:

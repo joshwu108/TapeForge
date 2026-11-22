@@ -112,8 +112,16 @@ class PPOConfig:
             selection rule are unchanged, but the policy's float32 outputs
             on another device can differ in the last bits, so a selection
             score is not bit-identical to one computed on ``device``.
+        lockstep_validation: Optional ``schedule.lockstep_validation``:
+            score checkpoints by replaying the validation episodes together
+            on the reference simulator, with one policy call per decision
+            round instead of one per decision (``runner.run_episodes_lockstep``).
+            The episodes, statistics, simulator, metric and selection rule
+            are unchanged; a batched policy forward can differ from the
+            one-row forward in the last float32 bits, so a selection score
+            is not guaranteed bit-identical to the per-decision one.
 
-    Both optional settings are omitted from ``to_json`` at their defaults,
+    The optional settings are omitted from ``to_json`` at their defaults,
     so configurations that do not use them keep their stored form.
     """
 
@@ -147,6 +155,7 @@ class PPOConfig:
     selection_metric: str
     compile_simulator: bool = False
     evaluation_device: str | None = None
+    lockstep_validation: bool = False
 
     def __post_init__(self) -> None:
         """Validate every field.
@@ -216,6 +225,8 @@ class PPOConfig:
             raise ConfigError("rollout.compile_simulator applies to the batched backend only")
         if self.evaluation_device is not None and not self.evaluation_device:
             raise ConfigError("schedule.evaluation_device must name a device")
+        if not isinstance(self.lockstep_validation, bool):
+            raise ConfigError("schedule.lockstep_validation must be a boolean")
 
     @property
     def rollout_steps(self) -> int:
@@ -229,6 +240,8 @@ class PPOConfig:
             del values["compile_simulator"]
         if values["evaluation_device"] is None:
             del values["evaluation_device"]
+        if not values["lockstep_validation"]:
+            del values["lockstep_validation"]
         return {"schema": PPO_CONFIG_SCHEMA, **values}
 
 
@@ -275,8 +288,9 @@ def _integers(value: Any, key: str) -> tuple[int, ...]:
 def ppo_config_from_mapping(mapping: Mapping[str, Any]) -> PPOConfig:
     """Build a ``PPOConfig`` from a parsed TOML mapping, strictly.
 
-    Every key except ``update.target_kl``, ``rollout.compile_simulator`` and
-    ``schedule.evaluation_device`` is required.
+    Every key except ``update.target_kl``, ``rollout.compile_simulator``,
+    ``schedule.evaluation_device`` and ``schedule.lockstep_validation`` is
+    required.
 
     Raises:
         ConfigError: Wrong schema, a missing or unknown key, or a bad value.
@@ -304,7 +318,7 @@ def ppo_config_from_mapping(mapping: Mapping[str, Any]) -> PPOConfig:
     )
     schedule = _section(
         mapping, "schedule", ("total_steps", "eval_every_rollouts", "selection_metric"),
-        optional=("evaluation_device",),
+        optional=("evaluation_device", "lockstep_validation"),
     )
     if not isinstance(update["normalize_advantage"], bool):
         raise ConfigError("update.normalize_advantage must be a boolean")
@@ -343,6 +357,7 @@ def ppo_config_from_mapping(mapping: Mapping[str, Any]) -> PPOConfig:
         compile_simulator=rollout.get("compile_simulator", False),
         evaluation_device=(None if schedule.get("evaluation_device") is None
                            else str(schedule["evaluation_device"])),
+        lockstep_validation=schedule.get("lockstep_validation", False),
     )
 
 
