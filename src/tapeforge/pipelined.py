@@ -47,6 +47,16 @@ Memory:
     except through the result arrays, which are ordinary host arrays of
     ``n_buckets`` entries.
 
+Narrow transfer (opt-in, ``int32_transfer=True``):
+    Prices and quantities cross the bus as int32 when every value in the
+    window is at most ``INT32_MAX`` (checked on the host in the
+    constructor), and are widened to int64 on the device, on the compute
+    stream, before the unchanged kernels read them. 9 instead of 17 bytes
+    per record are copied in; the cast is exact because the values fit, and
+    accumulation stays int64. When a value does not fit, the batches are
+    sent as int64 and ``stats.int32_transfer`` records that the option was
+    not applied.
+
 Not covered:
     The grouped short-bucket path; sparse tapes therefore pay the one-pass
     kernel's one program per bucket. The function needs CUDA and Triton and
@@ -202,6 +212,8 @@ class PipelineStats:
         device_bytes: Device bytes allocated for slot buffers and scratch.
         setup_seconds: Validation, planning and allocation (host wall clock).
         run_seconds: The batch loop through the last result copy.
+        int32_transfer: Whether prices and quantities were sent as int32.
+        bytes_in_per_record: Bytes per record copied host to device.
         timeline: With ``trace=True``, one entry per batch with the start and
             end of its ``copy_in``, ``compute`` and ``copy_out`` in
             milliseconds from the first recorded event (CUDA events, so the
@@ -217,6 +229,8 @@ class PipelineStats:
     setup_seconds: float = 0.0
     run_seconds: float = 0.0
     timeline: list[dict[str, Any]] = field(default_factory=list)
+    int32_transfer: bool = False
+    bytes_in_per_record: int = 17
 
 
 def _columns(trades: Any) -> dict[str, np.ndarray]:
@@ -229,6 +243,19 @@ def _columns(trades: Any) -> dict[str, np.ndarray]:
         columns = {name: np.ascontiguousarray(trades[name]) for name, _ in INPUT_COLUMNS}
         return {name: c if c.strides == (c.itemsize,) else c.copy() for name, c in columns.items()}
     raise TypeError("trades must be a TRADE_DTYPE array or a mapping of NumPy columns")
+
+
+INT32_MAX = int(np.iinfo(np.int32).max)
+
+
+def _fits_int32(columns: dict[str, np.ndarray], offsets: np.ndarray) -> bool:
+    """Return whether every price and quantity in the offsets' window is at most INT32_MAX.
+
+    Called after ``_validate_host``, so the values are known non-negative.
+    """
+    window = slice(int(offsets[0]), int(offsets[-1]))
+    return all(int(columns[name][window].max(initial=0)) <= INT32_MAX
+               for name in ("price", "quantity"))
 
 
 def _validate_host(columns: dict[str, np.ndarray], offsets: np.ndarray) -> int:
@@ -279,16 +306,22 @@ def _meta_length(n_buckets: int, n_chunks: int) -> int:
 class _Slot:
     """One set of pinned staging, device buffers and events; used by one batch at a time."""
 
-    def __init__(self, torch: Any, records: int, buckets: int, chunks: int, trace: bool) -> None:
+    def __init__(self, torch: Any, records: int, buckets: int, chunks: int, trace: bool,
+                 int32_transfer: bool = False) -> None:
         def pinned(n: int, dtype: Any) -> torch.Tensor:
             return torch.empty(n, dtype=dtype, pin_memory=True)
 
         def device(n: int, dtype: Any) -> torch.Tensor:
             return torch.empty(n, dtype=dtype, device="cuda")
 
-        dtypes = {"price": torch.int64, "quantity": torch.int64, "buyer_is_maker": torch.bool}
+        wire = torch.int32 if int32_transfer else torch.int64
+        dtypes = {"price": wire, "quantity": wire, "buyer_is_maker": torch.bool}
         self.host_in = {name: pinned(records, dtype) for name, dtype in dtypes.items()}
         self.dev_in = {name: device(records, dtype) for name, dtype in dtypes.items()}
+        # With int32 transfer the kernels read these int64 copies, written on the compute
+        # stream from dev_in; dev_in itself is what copy_in writes.
+        self.dev_wide = ({name: device(records, torch.int64) for name in ("price", "quantity")}
+                         if int32_transfer else {})
         # Offsets plus, on two-pass batches, the chunk schedule share one int64 buffer.
         self.meta_len = _meta_length(buckets, chunks)
         self.host_meta = pinned(self.meta_len, torch.int64)
@@ -309,7 +342,8 @@ class _Slot:
         self.pinned_bytes = sum(t.numel() * t.element_size() for t in
                                 [*self.host_in.values(), *self.host_out.values(), self.host_meta])
         self.device_bytes = sum(t.numel() * t.element_size() for t in
-                                [*self.dev_in.values(), *self.dev_out.values(), self.dev_meta,
+                                [*self.dev_in.values(), *self.dev_wide.values(),
+                                 *self.dev_out.values(), self.dev_meta,
                                  *self.partials.values()])
 
     def mark(self, torch: Any) -> Any:
@@ -336,6 +370,8 @@ class OverlappedAggregator:
         batch_records: Record budget per batch.
         slots: Buffer sets in rotation, at least 1; 1 serialises the batches.
         trace: Record CUDA timing events per stage into ``stats.timeline``.
+        int32_transfer: Send prices and quantities as int32 when they fit
+            (see the module docstring).
 
     Raises:
         RuntimeError: CUDA or Triton is unavailable.
@@ -351,6 +387,7 @@ class OverlappedAggregator:
         batch_records: int = 1 << 20,
         slots: int = 2,
         trace: bool = False,
+        int32_transfer: bool = False,
     ) -> None:
         kernels._require_triton()
         import torch
@@ -365,6 +402,7 @@ class OverlappedAggregator:
         columns = _columns(trades)
         self.offsets = np.ascontiguousarray(offsets)
         _validate_host(columns, self.offsets)
+        narrow = int32_transfer and _fits_int32(columns, self.offsets)
         self.plans = plan_batches(self.offsets, batch_records)
         capacity_records = max(plan.n_records for plan in self.plans)
         capacity_buckets = max(plan.n_buckets for plan in self.plans)
@@ -372,11 +410,14 @@ class OverlappedAggregator:
         self._host_columns = {name: torch.from_numpy(column) for name, column in columns.items()}
         self._ring: list[_Slot] = []
         if capacity_records:
-            self._ring = [_Slot(torch, capacity_records, capacity_buckets, capacity_chunks, trace)
+            self._ring = [_Slot(torch, capacity_records, capacity_buckets, capacity_chunks, trace,
+                                narrow)
                           for _ in range(min(slots, len(self.plans)))]
         self._streams = tuple(torch.cuda.Stream() for _ in range(3))  # type: ignore[no-untyped-call]
         stats = self.stats
         stats.n_batches, stats.slots = len(self.plans), len(self._ring)
+        stats.int32_transfer = narrow
+        stats.bytes_in_per_record = 9 if narrow else 17
         stats.capacity_records, stats.capacity_buckets = capacity_records, capacity_buckets
         stats.pinned_bytes = sum(slot.pinned_bytes for slot in self._ring)
         stats.device_bytes = sum(slot.device_bytes for slot in self._ring)
@@ -418,6 +459,7 @@ def aggregate_host(
     slots: int = 2,
     trace: bool = False,
     stats: PipelineStats | None = None,
+    int32_transfer: bool = False,
 ) -> dict[str, np.ndarray]:
     """Aggregate host trades on the GPU in overlapped batches and return host features.
 
@@ -429,7 +471,8 @@ def aggregate_host(
         ``n_buckets`` entries with the contract dtypes.
     """
     aggregator = OverlappedAggregator(
-        trades, offsets, batch_records=batch_records, slots=slots, trace=trace
+        trades, offsets, batch_records=batch_records, slots=slots, trace=trace,
+        int32_transfer=int32_transfer,
     )
     results = aggregator.run()
     if stats is not None:
@@ -492,6 +535,9 @@ def _launch(torch: Any, slot: _Slot, plan: BatchPlan, copy_in: Any, compute: Any
         compute.wait_event(slot.copied_out)  # Device outputs of this slot are free.
         marks.append(slot.mark(torch))
         trades = {name: device[:n_records] for name, device in slot.dev_in.items()}
+        for name, wide in slot.dev_wide.items():        # int32 transfer: exact widening
+            wide[:n_records].copy_(trades[name])
+            trades[name] = wide[:n_records]
         local_offsets = slot.dev_meta[: n_buckets + 1]
         outputs = {name: device[:n_buckets] for name, device in slot.dev_out.items()}
         if plan.two_pass:

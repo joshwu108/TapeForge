@@ -25,6 +25,11 @@ Variants (``variants`` in the config):
     batched_sync    the same aggregator, batches and buffers with one slot:
                     every stage waits for the previous batch, so nothing
                     overlaps. The like-for-like control for pinned_streams.
+    pinned_streams_int32
+                    pinned_streams with ``int32_transfer=True``: prices and
+                    quantities cross the bus as int32 when every value fits
+                    (else int64; the row records which), widened on the
+                    device before the same kernels run
 
 The two batched variants start from the same pageable columns as
 ``pageable_sync`` and include the copy into pinned staging; their timed
@@ -64,8 +69,14 @@ from workload import check_features, features_dict, host_columns, make_workload
 from tapeforge import ops, reference
 
 # Variants with an implementation; any other configured variant is skipped.
-IMPLEMENTED_VARIANTS = ("pageable_sync", "pinned_sync", "pinned_streams", "batched_sync")
-BATCHED_VARIANTS = ("pinned_streams", "batched_sync")
+# OverlappedAggregator options per batched variant; batched_sync also forces one slot.
+BATCHED_OPTIONS: dict[str, dict[str, Any]] = {
+    "pinned_streams": {},
+    "batched_sync": {},
+    "pinned_streams_int32": {"int32_transfer": True},
+}
+BATCHED_VARIANTS = tuple(BATCHED_OPTIONS)
+IMPLEMENTED_VARIANTS = ("pageable_sync", "pinned_sync", *BATCHED_VARIANTS)
 
 
 def _numpy_reference(trades: Any, offsets: Any) -> dict[str, Any]:
@@ -135,7 +146,7 @@ def _measure_variant(
 
 def _measure_batched(
     trades: Any, offsets: Any, slots: int, batch_records: int, expected: reference.Features,
-    warmup: int, repeats: int,
+    warmup: int, repeats: int, options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Gate, trace and time one ``OverlappedAggregator`` configuration.
 
@@ -146,8 +157,9 @@ def _measure_batched(
     """
     from tapeforge import pipelined
 
+    options = options or {}
     aggregator = pipelined.OverlappedAggregator(
-        trades, offsets, batch_records=batch_records, slots=slots
+        trades, offsets, batch_records=batch_records, slots=slots, **options
     )
     try:
         check_features(aggregator.run(), expected)
@@ -155,7 +167,7 @@ def _measure_batched(
         return {"status": "incorrect", "reason": str(exc)[:500]}
     timing = time_callable(aggregator.run, warmup=warmup, repeats=repeats, synchronize=True)
     traced = pipelined.OverlappedAggregator(
-        trades, offsets, batch_records=batch_records, slots=slots, trace=True
+        trades, offsets, batch_records=batch_records, slots=slots, trace=True, **options
     )
     check_features(traced.run(), expected)
     rows = pipelined.timeline_intervals(traced.stats)
@@ -169,6 +181,8 @@ def _measure_batched(
         "batch_records": batch_records, "n_batches": stats.n_batches,
         "capacity_records": stats.capacity_records, "pinned_bytes": stats.pinned_bytes,
         "device_bytes": stats.device_bytes, "traced_span_ms": span,
+        "options": options, "int32_transfer": stats.int32_transfer,
+        "bytes_in_per_record": stats.bytes_in_per_record,
         "traced_copy_in_ms": sum(r["copy_in_end"] - r["copy_in_start"] for r in rows),
         "traced_compute_ms": sum(r["compute_end"] - r["compute_start"] for r in rows),
         "traced_copy_out_ms": sum(r["copy_out_end"] - r["copy_out_start"] for r in rows),
@@ -225,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
                     slots = 1 if variant == "batched_sync" else int(config.get("slots", 2))
                     results[variant] = _measure_batched(
                         trades, offsets, slots, int(config.get("batch_records", 1 << 20)),
-                        expected, warmup, repeats,
+                        expected, warmup, repeats, BATCHED_OPTIONS[variant],
                     )
                     continue
                 results[variant] = _measure_variant(

@@ -26,8 +26,9 @@ reports:
                        allocation); prepared execution under CUDA events
 
 Paths: ``auto`` (``prepared.prepare`` with automatic dispatch), ``two_pass``,
-any other path name ``prepared.prepare`` accepts, and ``pipelined``
-(``tapeforge.pipelined.OverlappedAggregator`` from host memory, which
+any other path name ``prepared.prepare`` accepts, and ``pipelined`` or
+``pipelined_int32`` (``tapeforge.pipelined.OverlappedAggregator`` from host
+memory, the latter with ``int32_transfer=True``, which
 holds only bounded batches on the device). A path the installed library does
 not provide is reported ``not_available``.
 
@@ -64,6 +65,14 @@ FEATURES = contract.FEATURE_NAMES
 HOST_BYTES_PER_RECORD = 120  # generation temporaries plus columns, measured locally
 DEVICE_BYTES_PER_RECORD = 17  # int64 price, int64 quantity, bool maker
 OUTPUT_BYTES_PER_BUCKET = 33  # three int64, one float64, one bool
+
+
+
+# OverlappedAggregator options of each host-to-host path name.
+PIPELINE_OPTIONS: dict[str, dict[str, Any]] = {
+    "pipelined": {},
+    "pipelined_int32": {"int32_transfer": True},
+}
 
 
 def estimate(n_records: int, n_buckets: int) -> dict[str, int]:
@@ -130,12 +139,13 @@ def _run_path(work: Path, path: str, repeats: int) -> dict[str, Any]:
     offsets_host = np.load(work / "offsets.npy")
     torch.cuda.reset_peak_memory_stats()
     result: dict[str, Any] = {"path": path}
-    if path == "pipelined":
+    if path in PIPELINE_OPTIONS:
         from tapeforge import pipelined
 
         columns = {n: np.ascontiguousarray(c) for n, c in columns_host.items()}
         started = time.perf_counter()
-        aggregator = pipelined.OverlappedAggregator(columns, offsets_host)
+        aggregator = pipelined.OverlappedAggregator(columns, offsets_host,
+                                                    **PIPELINE_OPTIONS[path])
         result["prepare_ms"] = (time.perf_counter() - started) * 1e3
         got = aggregator.run()
         samples = []
@@ -146,6 +156,7 @@ def _run_path(work: Path, path: str, repeats: int) -> dict[str, Any]:
         result["timing_method"] = "wall clock around run(), host memory to host memory"
         result["batches"] = aggregator.stats.n_batches
         result["pinned_bytes"] = aggregator.stats.pinned_bytes
+        result["int32_transfer"] = aggregator.stats.int32_transfer
         outputs = {name: (lambda n=name: got[n]) for name in FEATURES}
     else:
         from tapeforge import ops, prepared

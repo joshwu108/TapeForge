@@ -103,8 +103,11 @@ def run_path(path: str, trades: np.ndarray, offsets: np.ndarray, rng: np.random.
     from tapeforge import ops, pipelined, prepared
 
     if path == "pipelined":
-        options = {"batch_records": int(rng.choice([1, 7, 64, 1000, 1 << 20])),
-                   "slots": int(rng.integers(1, 4))}
+        options: dict[str, Any] = {"batch_records": int(rng.choice([1, 7, 64, 1000, 1 << 20])),
+                                   "slots": int(rng.integers(1, 4))}
+        # The int32 transfer applies only when the case's values fit; otherwise it
+        # falls back to int64, which the comparison covers as well.
+        options["int32_transfer"] = bool(rng.random() < 0.5)
         return {"features": pipelined.aggregate_host(trades, offsets, **options),
                 "options": options}
     columns = {n: torch.from_numpy(trades[n].copy()).cuda()
@@ -112,7 +115,7 @@ def run_path(path: str, trades: np.ndarray, offsets: np.ndarray, rng: np.random.
     device_offsets = torch.from_numpy(offsets).cuda()
     if path == "auto":
         return {"features": ops.aggregate(columns, device_offsets), "options": {}}
-    options: dict[str, Any] = {}
+    options = {}
     if path == "grouped":
         tiles = [None, 2, 4, 16, 64, 128, 1024]     # None: the library's own tile choice
         options = {"block_size": tiles[int(rng.integers(len(tiles)))],

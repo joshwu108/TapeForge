@@ -167,3 +167,59 @@ def test_a_trace_has_ordered_intervals_for_every_batch(gpu_ready: None) -> None:
         assert row["compute_start"] <= row["compute_end"] <= row["copy_out_start"]
         assert row["copy_out_start"] <= row["copy_out_end"]
     assert pipelined.overlap_ms(rows, "copy_in", "compute") >= 0.0
+
+
+# --- int32 transfer ------------------------------------------------------------
+
+
+def test_the_int32_transfer_bound_covers_only_the_window() -> None:
+    limit = pipelined.INT32_MAX
+    columns = {"price": np.array([limit + 1, limit, 5], dtype=np.int64),
+               "quantity": np.array([1, limit, 0], dtype=np.int64),
+               "buyer_is_maker": np.zeros(3, dtype=np.bool_)}
+    assert pipelined._fits_int32(columns, np.array([1, 3], dtype=np.int64))
+    assert not pipelined._fits_int32(columns, np.array([0, 3], dtype=np.int64))
+    columns["quantity"][2] = limit + 1
+    assert not pipelined._fits_int32(columns, np.array([1, 3], dtype=np.int64))
+    assert pipelined._fits_int32(columns, np.array([2, 2], dtype=np.int64))  # empty window
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("profile", ["sparse", "uniform", "burst"])
+@pytest.mark.parametrize(("budget", "slots"), [(1 << 20, 2), (997, 1), (4096, 3)])
+def test_int32_transfer_matches_the_oracle(
+    gpu_ready: None, profile: str, budget: int, slots: int
+) -> None:
+    n_buckets = {"sparse": 6000, "uniform": 300, "burst": 400}[profile]
+    trades = generate.generate_trades(seed=27, n_buckets=n_buckets, profile=profile)  # type: ignore[arg-type]
+    offsets = windows.build_offsets(trades["timestamp"], 0, n_buckets, W)
+    stats = pipelined.PipelineStats()
+    got = pipelined.aggregate_host(trades, offsets, batch_records=budget, slots=slots,
+                                   int32_transfer=True, stats=stats)
+    _assert_matches_oracle(got, trades, offsets)
+    assert stats.int32_transfer and stats.bytes_in_per_record == 9
+
+
+@pytest.mark.gpu
+def test_int32_transfer_is_exact_at_the_bound_and_falls_back_past_it(gpu_ready: None) -> None:
+    limit = pipelined.INT32_MAX
+    lengths = [0, 3, kernels.CHUNK_SIZE + 1, 1, 0, 2 * kernels.MAX_ONE_PASS_BUCKET + 5]
+    n = 2 + sum(lengths)
+    rng = np.random.default_rng(8)
+    trades = np.zeros(n, dtype=contract.TRADE_DTYPE)
+    trades["price"] = rng.integers(limit - 1000, limit, n, endpoint=True)
+    trades["quantity"] = rng.integers(0, 3, n)
+    trades["price"][5] = limit
+    trades["buyer_is_maker"] = rng.random(n) < 0.5
+    offsets = _offsets(lengths, head=2)
+    for budget in (7, 5000, 1 << 22):
+        stats = pipelined.PipelineStats()
+        got = pipelined.aggregate_host(trades, offsets, batch_records=budget,
+                                       int32_transfer=True, stats=stats)
+        _assert_matches_oracle(got, trades, offsets)
+        assert stats.int32_transfer
+    trades["price"][6] = limit + 1
+    stats = pipelined.PipelineStats()
+    got = pipelined.aggregate_host(trades, offsets, int32_transfer=True, stats=stats)
+    _assert_matches_oracle(got, trades, offsets)
+    assert not stats.int32_transfer and stats.bytes_in_per_record == 17
