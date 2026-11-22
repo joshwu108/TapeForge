@@ -389,7 +389,7 @@ def reset_where(
     fresh = reset(batch, torch.where(mask, episode, state.episode))
     return BatchedState(**{
         f.name: torch.where(mask, getattr(fresh, f.name), getattr(state, f.name))
-        for f in fields(BatchedState)
+        for f in fields(state)
     })
 
 

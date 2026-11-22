@@ -102,6 +102,19 @@ class PPOConfig:
         eval_every_rollouts: A checkpoint is saved and evaluated every this
             many policy versions (and before the first and after the last).
         selection_metric: One of ``SELECTION_METRICS``.
+        compile_simulator: Optional ``rollout.compile_simulator``: compile
+            the batched backend's vector step with ``torch.compile``
+            (``batched`` backend only). It computes the same tensors as the
+            eager step; see ``rl.batched_env``.
+        evaluation_device: Optional ``schedule.evaluation_device``: the
+            device of the policy copy that scores checkpoints on validation;
+            ``None`` uses ``device``. The episodes, statistics, metric and
+            selection rule are unchanged, but the policy's float32 outputs
+            on another device can differ in the last bits, so a selection
+            score is not bit-identical to one computed on ``device``.
+
+    Both optional settings are omitted from ``to_json`` at their defaults,
+    so configurations that do not use them keep their stored form.
     """
 
     name: str
@@ -132,6 +145,8 @@ class PPOConfig:
     total_steps: int
     eval_every_rollouts: int
     selection_metric: str
+    compile_simulator: bool = False
+    evaluation_device: str | None = None
 
     def __post_init__(self) -> None:
         """Validate every field.
@@ -195,6 +210,12 @@ class PPOConfig:
             )
         if self.selection_metric not in SELECTION_METRICS:
             raise ConfigError(f"schedule.selection_metric must be one of {SELECTION_METRICS}")
+        if not isinstance(self.compile_simulator, bool):
+            raise ConfigError("rollout.compile_simulator must be a boolean")
+        if self.compile_simulator and self.backend != "batched":
+            raise ConfigError("rollout.compile_simulator applies to the batched backend only")
+        if self.evaluation_device is not None and not self.evaluation_device:
+            raise ConfigError("schedule.evaluation_device must name a device")
 
     @property
     def rollout_steps(self) -> int:
@@ -203,7 +224,12 @@ class PPOConfig:
 
     def to_json(self) -> dict[str, Any]:
         """Return the configuration as plain values with its schema tag."""
-        return {"schema": PPO_CONFIG_SCHEMA, **asdict(self)}
+        values = asdict(self)
+        if not values["compile_simulator"]:
+            del values["compile_simulator"]
+        if values["evaluation_device"] is None:
+            del values["evaluation_device"]
+        return {"schema": PPO_CONFIG_SCHEMA, **values}
 
 
 def _section(mapping: Mapping[str, Any], name: str, keys: Sequence[str],
@@ -249,7 +275,8 @@ def _integers(value: Any, key: str) -> tuple[int, ...]:
 def ppo_config_from_mapping(mapping: Mapping[str, Any]) -> PPOConfig:
     """Build a ``PPOConfig`` from a parsed TOML mapping, strictly.
 
-    Every key except ``update.target_kl`` is required.
+    Every key except ``update.target_kl``, ``rollout.compile_simulator`` and
+    ``schedule.evaluation_device`` is required.
 
     Raises:
         ConfigError: Wrong schema, a missing or unknown key, or a bad value.
@@ -267,7 +294,8 @@ def ppo_config_from_mapping(mapping: Mapping[str, Any]) -> PPOConfig:
         raise ConfigError(f"missing required top-level key(s): {missing}")
     network = _section(mapping, "network", ("hidden_sizes", "activation", "log_std_init"))
     optimizer = _section(mapping, "optimizer", ("learning_rate", "adam_eps"))
-    rollout = _section(mapping, "rollout", ("backend", "n_envs", "n_steps", "pool_episodes"))
+    rollout = _section(mapping, "rollout", ("backend", "n_envs", "n_steps", "pool_episodes"),
+                       optional=("compile_simulator",))
     update = _section(
         mapping, "update",
         ("batch_size", "n_epochs", "gamma", "gae_lambda", "clip_range", "entropy_coef",
@@ -275,7 +303,8 @@ def ppo_config_from_mapping(mapping: Mapping[str, Any]) -> PPOConfig:
         optional=("target_kl",),
     )
     schedule = _section(
-        mapping, "schedule", ("total_steps", "eval_every_rollouts", "selection_metric")
+        mapping, "schedule", ("total_steps", "eval_every_rollouts", "selection_metric"),
+        optional=("evaluation_device",),
     )
     if not isinstance(update["normalize_advantage"], bool):
         raise ConfigError("update.normalize_advantage must be a boolean")
@@ -311,6 +340,9 @@ def ppo_config_from_mapping(mapping: Mapping[str, Any]) -> PPOConfig:
             schedule["eval_every_rollouts"], "schedule.eval_every_rollouts"
         ),
         selection_metric=str(schedule["selection_metric"]),
+        compile_simulator=rollout.get("compile_simulator", False),
+        evaluation_device=(None if schedule.get("evaluation_device") is None
+                           else str(schedule["evaluation_device"])),
     )
 
 

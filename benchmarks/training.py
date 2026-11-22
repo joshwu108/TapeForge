@@ -225,8 +225,21 @@ def measure_features(data: TrainingData, n_episodes: int) -> dict[str, Any]:
 
 
 def _variant(config: PPOConfig, backend: str, device: str) -> PPOConfig:
-    """Return ``config`` with the backend replaced; the batched backend also takes the device."""
-    return replace(config, backend=backend, device=device if backend == "batched" else "cpu")
+    """Return ``config`` with the backend replaced; the batched backend also takes the device.
+
+    A backend entry may carry options after ``+``: ``batched+compile`` sets
+    ``compile_simulator``, ``+cpu_eval`` sets ``evaluation_device = "cpu"``.
+    Everything else in the PPO configuration stays as written.
+    """
+    name, *options = backend.split("+")
+    unknown = set(options) - {"compile", "cpu_eval"}
+    if unknown or (options and name != "batched"):
+        raise ValueError(f"unknown backend variant {backend!r}")
+    return replace(
+        config, backend=name, device=device if name == "batched" else "cpu",
+        compile_simulator="compile" in options,
+        evaluation_device="cpu" if "cpu_eval" in options else None,
+    )
 
 
 def measure_env_stepping(config: PPOConfig, data: TrainingData, steps: int) -> dict[str, Any]:
@@ -260,7 +273,8 @@ def measure_env_stepping(config: PPOConfig, data: TrainingData, steps: int) -> d
 
 
 def measure_batched_core(
-    data: TrainingData, config: PPOConfig, device: str, batch_sizes: list[int], steps: int
+    data: TrainingData, config: PPOConfig, device: str, batch_sizes: list[int], steps: int,
+    compile_rows: bool = False,
 ) -> list[dict[str, Any]]:
     """Time the tensor simulator alone: device-drawn actions, automatic resets, no host copies."""
     from tapeforge.execution.rl.gym_env import SplitPool
@@ -273,36 +287,49 @@ def measure_batched_core(
     build_seconds = time.perf_counter() - started
     generator = torch.Generator(device=device)
     generator.manual_seed(0)
+
+    def vector_step(state: batched.BatchedState, actions: torch.Tensor,
+                    draws: torch.Tensor) -> batched.BatchedState:
+        batched.observe(state, batch)
+        state, result = batched.step(state, actions, batch, validate=False)
+        return batched.reset_where(state, result.terminated | result.truncated, draws, batch)
+
+    # One compiled function per batch size (static shapes), traced during warm-up.
+    compiled_step = torch.compile(vector_step, fullgraph=True, dynamic=False)
     rows = []
     for size in batch_sizes:
         def draw(size: int = size) -> torch.Tensor:
             return torch.randint(batch.n_episodes, (size,), generator=generator, device=device)
 
-        def run(n: int, state: batched.BatchedState, size: int = size) -> batched.BatchedState:
+        def run(n: int, state: batched.BatchedState, size: int = size,
+                core: Any = vector_step) -> batched.BatchedState:
             for _ in range(n):
                 actions = torch.rand(size, dtype=torch.float64, generator=generator,
                                      device=device)
-                batched.observe(state, batch)
-                state, result = batched.step(state, actions, batch, validate=False)
-                state = batched.reset_where(
-                    state, result.terminated | result.truncated, draw(), batch
-                )
+                state = core(state, actions, draw())
             return state
 
-        state = run(20, batched.reset(batch, draw()))    # warm-up, not timed
-        _synchronize(device)
-        started = time.perf_counter()
-        run(steps, state)
-        _synchronize(device)
-        elapsed = time.perf_counter() - started
-        rows.append({
-            "status": "ok", "batch_size": size, "vector_steps": steps, "seconds": elapsed,
-            "env_steps_per_second": steps * size / elapsed,
-            "microseconds_per_vector_step": elapsed / steps * 1e6,
-            "bank_episodes": batch.n_episodes, "bank_bytes": batch.nbytes,
-            "bank_build_seconds": build_seconds,
-            "includes": "observe + step + masked reset per vector step; no host transfer",
-        })
+        for compiled in (False, True) if compile_rows else (False,):
+            core = compiled_step if compiled else vector_step
+            started = time.perf_counter()
+            state = run(20, batched.reset(batch, draw()), core=core)  # warm-up, not timed
+            _synchronize(device)
+            warmup_seconds = time.perf_counter() - started
+            started = time.perf_counter()
+            run(steps, state, core=core)
+            _synchronize(device)
+            elapsed = time.perf_counter() - started
+            rows.append({
+                "status": "ok", "batch_size": size, "vector_steps": steps, "seconds": elapsed,
+                "compiled": compiled, "warmup_seconds_including_compile": warmup_seconds,
+                "env_steps_per_second": steps * size / elapsed,
+                "microseconds_per_vector_step": elapsed / steps * 1e6,
+                "bank_episodes": batch.n_episodes, "bank_bytes": batch.nbytes,
+                "bank_build_seconds": build_seconds,
+                "includes": "observe + step + masked reset per vector step; no host transfer"
+                + ("; torch.compile(fullgraph, static shapes), compiled during warm-up"
+                   if compiled else ""),
+            })
     return rows
 
 
@@ -390,6 +417,8 @@ def run_end_to_end(config: PPOConfig, benchmark: dict[str, Any], out_dir: Path) 
         "status": "ok",
         "backend": config.backend,
         "device": config.device,
+        "compile_simulator": config.compile_simulator,
+        "evaluation_device": config.evaluation_device or config.device,
         "n_envs": config.n_envs,
         "env_steps": summary["env_steps"],
         "seconds": {k: seconds[k] for k in ("data_load", "statistics", "setup", "collect",
@@ -459,7 +488,8 @@ def main(argv: list[str] | None = None) -> int:
 
     entries: list[tuple[str, dict[str, Any]]] = []
     failed = False
-    gate = _gate_batched(device) if "batched" in benchmark["backends"] else None
+    gate = (_gate_batched(device)
+            if any(b.startswith("batched") for b in benchmark["backends"]) else None)
     data = prepare_training(base)
     torch.set_num_threads(base.torch_threads)
     sections = benchmark["sections"]
@@ -467,9 +497,11 @@ def main(argv: list[str] | None = None) -> int:
         entries.append(("features", measure_features(data, int(benchmark["feature_episodes"]))))
     if "env_step" in sections:
         for backend in benchmark["backends"]:
-            row = gate if backend == "batched" and gate is not None else measure_env_stepping(
-                _variant(base, backend, device), data, int(benchmark["env_step_vector_steps"])
-            )
+            if backend.startswith("batched") and gate is not None:
+                row = gate
+            else:
+                row = measure_env_stepping(_variant(base, backend, device), data,
+                                           int(benchmark["env_step_vector_steps"]))
             entries.append((f"env_step/{backend}", row))
     if "batched_core" in sections:
         if gate is not None:
@@ -477,13 +509,15 @@ def main(argv: list[str] | None = None) -> int:
         else:
             for row in measure_batched_core(data, base, device,
                                             [int(b) for b in benchmark["core_batch_sizes"]],
-                                            int(benchmark["core_vector_steps"])):
-                entries.append((f"batched_core/b{row['batch_size']}", row))
+                                            int(benchmark["core_vector_steps"]),
+                                            bool(benchmark.get("core_compiled", False))):
+                prefix = "batched_core_compiled" if row["compiled"] else "batched_core"
+                entries.append((f"{prefix}/b{row['batch_size']}", row))
     if "policy" in sections:
         entries.append(("policy", measure_policy(base, data)))
     if "end_to_end" in sections:
         for backend in benchmark["backends"]:
-            if backend == "batched" and gate is not None:
+            if backend.startswith("batched") and gate is not None:
                 entries.append((f"end_to_end/{backend}", gate))
                 continue
             with tempfile.TemporaryDirectory() as tmp:

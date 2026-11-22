@@ -17,6 +17,7 @@ Dependencies:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from collections.abc import Sequence
@@ -26,6 +27,7 @@ from typing import Any
 import numpy as np
 
 try:
+    import torch
     from stable_baselines3 import PPO
 except ImportError as exc:  # pragma: no cover - exercised in a subprocess test
     raise ImportError(
@@ -55,17 +57,30 @@ __all__ = [
 ]
 
 
-def checkpoint_policy(model: PPO, statistics: ObservationStatistics | None) -> Policy:
+def checkpoint_policy(
+    model: PPO, statistics: ObservationStatistics | None, device: str | None = None
+) -> Policy:
     """Return the deterministic evaluation policy of a trained model.
 
     The policy standardises ``simulator.observe`` with ``statistics`` (the
     frozen training statistics), takes the Gaussian mean and applies
     ``policy_action_to_env``: the training-time observation and action path
     without the sampling noise.
+
+    With ``device`` other than the model's, the policy network is copied to
+    that device once and the copy answers; the model itself (and training)
+    is untouched. The episode reaches the reference simulator one decision
+    at a time, so on CUDA each decision is one small device round trip; a
+    CPU copy avoids it. Outputs of the copy can differ from the original's
+    in the last float32 bits.
     """
+    policy = model.policy
+    if device is not None and torch.device(device) != policy.device:
+        policy = copy.deepcopy(policy).to(device)
+        policy.set_training_mode(False)
 
     def act(vector: np.ndarray) -> float:
-        action, _ = model.policy.predict(vector, deterministic=True)
+        action, _ = policy.predict(vector, deterministic=True)
         return policy_action_to_env(action)
 
     return vector_policy(act, statistics)

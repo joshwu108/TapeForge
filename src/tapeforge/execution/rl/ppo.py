@@ -443,18 +443,19 @@ def _optional(value: Any) -> float | None:
 
 def _validation_evaluator(
     experiment: ExperimentConfig, training: TrainingConfig, splits: Splits,
-    statistics: ObservationStatistics, metric: str,
+    statistics: ObservationStatistics, metric: str, device: str | None = None,
 ) -> Callable[[PPO], dict[str, Any]]:
     """Return the function that scores a model on the fixed validation episodes.
 
     The episodes are draws ``0 .. n - 1`` of every ``evaluation.seeds`` entry
     in the validation role, with ``n`` the experiment's validation count:
     exactly the identifiers a baseline run of the same experiment replays.
+    ``device`` is ``PPOConfig.evaluation_device`` (``checkpoint_policy``).
     """
     n_episodes = experiment.n_episodes("validation")
 
     def evaluate(model: PPO) -> dict[str, Any]:
-        policy = checkpoint_policy(model, statistics)
+        policy = checkpoint_policy(model, statistics, device)
         per_seed = {}
         for seed in training.eval_seeds:
             record, _ = run_policy(
@@ -664,7 +665,8 @@ def train(
 
     log = _TrainingLog(
         run_dir, config,
-        _validation_evaluator(experiment, training, splits, statistics, config.selection_metric),
+        _validation_evaluator(experiment, training, splits, statistics, config.selection_metric,
+                              config.evaluation_device),
         provenance,
     )
     try:

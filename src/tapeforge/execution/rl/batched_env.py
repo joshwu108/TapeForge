@@ -36,6 +36,20 @@ Differences from the CPU environments:
       guaranteed deterministic there, so a resumed CUDA run is a valid
       continuation of the same schedule, not a bit-identical replay.
 
+Compiled transition:
+    With ``compile_step=True`` the device part of one vector step (action
+    map, ``batched.step``, rewards, accumulators, the observation of the
+    ended state, the episode summary, the masked reset and the next
+    observation) is one function compiled with ``torch.compile(fullgraph=True,
+    dynamic=False)``. It computes the same tensors as the eager function: all
+    accounting is int64, and the float64 steps are the same elementwise
+    operations, which the compiler does not reorder; a test compares the two
+    exactly, and on CUDA the parity of compiled and eager steps must be
+    re-checked on the device. Episode draws are taken from the selection
+    generator before the function runs, in the same order as the eager path,
+    so the generator state is unchanged by compilation. The first step pays
+    the compilation.
+
 Dependencies:
     ``stable-baselines3`` and ``torch`` (``pip install -e '.[train]'``).
 """
@@ -98,6 +112,7 @@ class BatchedExecutionVecEnv(VecEnv):
         statistics: ObservationStatistics | None = None,
         reward_unit: str = "bps",
         episode_ids: Sequence[str] | None = None,
+        compile_step: bool = False,
     ) -> None:
         """Build the spaces and the selection generator; nothing is stepped until ``reset``.
 
@@ -139,6 +154,11 @@ class BatchedExecutionVecEnv(VecEnv):
         self._risk_ticks = torch.zeros(n_envs, dtype=torch.int64, device=device)
         self._steps = torch.zeros(n_envs, dtype=torch.int64, device=device)
         self._actions: np.ndarray | None = None
+        self.compile_step = compile_step
+        self._core = (
+            torch.compile(self._transition, fullgraph=True, dynamic=False)
+            if compile_step else self._transition
+        )
 
     # --- helpers ---------------------------------------------------------------------------
 
@@ -293,46 +313,15 @@ class BatchedExecutionVecEnv(VecEnv):
             raise ValueError("policy actions must be finite")
         device = self.batch.device
         raw = torch.as_tensor(actions, device=device).reshape(-1).to(torch.float64)
-        fraction = (torch.clamp(raw, -1.0, 1.0) + 1.0) / 2.0      # ppo_env.ACTION_MAP
         before = self._state
-        state, result = batched.step(before, fraction, self.batch, validate=False)
-
-        notional = (
-            state.arrival_price_ticks.double()
-            * self.batch.target_qty_ticks[state.episode].double()
-        )
-        reward = result.reward_ticks.double()
-        if self.reward_unit == "bps":
-            reward = reward * 10_000.0 / notional
-        done = result.terminated | result.truncated
-        self._reward_sum += reward
-        self._cost_ticks += result.cost_component
-        self._risk_ticks += result.risk_component
-        self._steps += result.active.to(torch.int64)
-
-        final_observation, available = self._observation(state)
-        terminal_observation = torch.where(
-            available.unsqueeze(1), final_observation, self._last_observation
-        )
-        target = self.batch.target_qty_ticks[state.episode].double()
-        summary = torch.stack(
-            [
-                self._reward_sum,
-                (self._cost_ticks + result.terminal_component).double() * 10_000.0 / notional,
-                result.terminal_component.double() * 10_000.0 / notional,
-                self._risk_ticks.double() * 10_000.0 / notional,
-                state.filled_qty_ticks.double() / target,
-                state.settled_qty_ticks.double() / target,
-                self._steps.double(),
-            ],
-            dim=1,
-        )
-
-        self._state = batched.reset_where(state, done, self._draw(), self.batch)
-        for accumulator in (self._reward_sum, self._cost_ticks, self._risk_ticks, self._steps):
-            accumulator.masked_fill_(done, 0)
-        self._last_observation = torch.where(
-            done.unsqueeze(1), self._observation(self._state)[0], terminal_observation
+        draws = self._draw()  # Drawn before the transition, as the eager order requires.
+        (
+            self._state, reward, done, terminal_observation, summary, result_truncated,
+            self._last_observation, self._reward_sum, self._cost_ticks, self._risk_ticks,
+            self._steps,
+        ) = self._core(
+            before, raw, draws, self._reward_sum, self._cost_ticks, self._risk_ticks,
+            self._steps, self._last_observation,
         )
 
         dones = done.cpu().numpy()
@@ -342,7 +331,7 @@ class BatchedExecutionVecEnv(VecEnv):
             rows = torch.as_tensor(ended, device=device)
             terminal_host = terminal_observation[rows].cpu().numpy()
             summary_host = summary[rows].cpu().numpy()
-            truncated_host = result.truncated[rows].cpu().numpy()
+            truncated_host = result_truncated[rows].cpu().numpy()
             episode_host = before.episode[rows].cpu().numpy()
             for j, index in enumerate(ended):
                 values = dict(zip(_SUMMARY_FIELDS, summary_host[j].tolist(), strict=True))
@@ -360,10 +349,67 @@ class BatchedExecutionVecEnv(VecEnv):
                 }
         return (
             self._last_observation.cpu().numpy(),
-            reward.to(torch.float32).cpu().numpy(),
+            reward.cpu().numpy(),
             dones,
             infos,
         )
+
+    def _transition(
+        self, before: batched.BatchedState, raw: torch.Tensor, draws: torch.Tensor,
+        reward_sum: torch.Tensor, cost_ticks: torch.Tensor, risk_ticks: torch.Tensor,
+        steps: torch.Tensor, last_observation: torch.Tensor,
+    ) -> tuple[Any, ...]:
+        """Device part of one vector step, without host transfers or in-place updates.
+
+        Returns the next state, the float32 rewards, the done flags, the
+        terminal observations, the episode summaries (``_SUMMARY_FIELDS``),
+        the truncation flags, the next observations and the four updated
+        accumulators. Pure in its tensor arguments, so it can be compiled.
+        """
+        fraction = (torch.clamp(raw, -1.0, 1.0) + 1.0) / 2.0      # ppo_env.ACTION_MAP
+        state, result = batched.step(before, fraction, self.batch, validate=False)
+
+        notional = (
+            state.arrival_price_ticks.double()
+            * self.batch.target_qty_ticks[state.episode].double()
+        )
+        reward = result.reward_ticks.double()
+        if self.reward_unit == "bps":
+            reward = reward * 10_000.0 / notional
+        done = result.terminated | result.truncated
+        reward_sum = reward_sum + reward
+        cost_ticks = cost_ticks + result.cost_component
+        risk_ticks = risk_ticks + result.risk_component
+        steps = steps + result.active.to(torch.int64)
+
+        final_observation, available = self._observation(state)
+        terminal_observation = torch.where(
+            available.unsqueeze(1), final_observation, last_observation
+        )
+        target = self.batch.target_qty_ticks[state.episode].double()
+        summary = torch.stack(
+            [
+                reward_sum,
+                (cost_ticks + result.terminal_component).double() * 10_000.0 / notional,
+                result.terminal_component.double() * 10_000.0 / notional,
+                risk_ticks.double() * 10_000.0 / notional,
+                state.filled_qty_ticks.double() / target,
+                state.settled_qty_ticks.double() / target,
+                steps.double(),
+            ],
+            dim=1,
+        )
+
+        next_state = batched.reset_where(state, done, draws, self.batch)
+        reward_sum = torch.where(done, torch.zeros_like(reward_sum), reward_sum)
+        cost_ticks = torch.where(done, torch.zeros_like(cost_ticks), cost_ticks)
+        risk_ticks = torch.where(done, torch.zeros_like(risk_ticks), risk_ticks)
+        steps = torch.where(done, torch.zeros_like(steps), steps)
+        next_observation = torch.where(
+            done.unsqueeze(1), self._observation(next_state)[0], terminal_observation
+        )
+        return (next_state, reward.to(torch.float32), done, terminal_observation, summary,
+                result.truncated, next_observation, reward_sum, cost_ticks, risk_ticks, steps)
 
     def close(self) -> None:
         """Drop the running state; the episode bank is untouched."""
@@ -427,4 +473,5 @@ def make_batched_vec_env(
     return BatchedExecutionVecEnv(
         batch, config.n_envs, seed=environment_seed(model_seed, 0), statistics=statistics,
         reward_unit=training.reward_unit, episode_ids=identifiers,
+        compile_step=config.compile_simulator,
     )

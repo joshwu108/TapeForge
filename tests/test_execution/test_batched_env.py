@@ -243,3 +243,93 @@ def test_cuda_generator_states_for_other_devices_are_refused(
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     with pytest.raises(ConfigError, match="2 devices but 1"):
         ppo._set_generator_states((*states[:3], [torch.zeros(16, dtype=torch.uint8)] * 2))
+
+
+def _rollout(vec: BatchedExecutionVecEnv, steps: int, seed: int) -> list[tuple]:
+    rng = np.random.default_rng(seed)
+    trace = [vec.reset()]
+    for _ in range(steps):
+        raw = rng.uniform(-1.3, 1.3, size=(vec.num_envs, 1)).astype(np.float32)
+        observations, rewards, dones, infos = vec.step(raw)
+        trace.append((observations, rewards, dones, json.dumps(infos, default=repr)))
+    return trace
+
+
+def _assert_compiled_equals_eager(device: str, n_envs: int) -> None:
+    episodes = parity.random_episodes(64, 5)
+    runs = []
+    for compile_step in (False, True):
+        batch = batched.EpisodeBatch.from_episodes(episodes, device)
+        vec = BatchedExecutionVecEnv(batch, n_envs, seed=3, statistics=_statistics(),
+                                     compile_step=compile_step)
+        runs.append((_rollout(vec, 120, 11), vec.collection_snapshot()))
+    (eager, eager_snapshot), (compiled, compiled_snapshot) = runs
+    assert eager[0].tobytes() == compiled[0].tobytes()
+    for (o1, r1, d1, i1), (o2, r2, d2, i2) in zip(eager[1:], compiled[1:], strict=True):
+        assert o1.tobytes() == o2.tobytes()
+        assert r1.tobytes() == r2.tobytes()
+        assert d1.tobytes() == d2.tobytes()
+        assert i1 == i2
+    for key in ("reward_sum", "cost_ticks", "risk_ticks", "steps", "last_observation",
+                "generator"):
+        assert torch.equal(eager_snapshot[key], compiled_snapshot[key]), key
+    for name, tensor in eager_snapshot["state"].items():
+        assert torch.equal(tensor, compiled_snapshot["state"][name]), name
+
+
+def test_the_compiled_transition_equals_the_eager_one_on_cpu_tensors() -> None:
+    """Observations, rewards, infos, accumulators, state and generator agree bit for bit."""
+    _assert_compiled_equals_eager("cpu", 16)
+
+
+@pytest.mark.gpu
+def test_the_compiled_transition_equals_the_eager_one_on_cuda(gpu_ready: None) -> None:
+    _assert_compiled_equals_eager("cuda", 16)
+
+
+def test_compile_simulator_is_an_optional_batched_only_setting(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    ppo_path = write_configs(tmp_path, backend="batched")
+    config = load_ppo_config(ppo_path)
+    assert config.compile_simulator is False and config.evaluation_device is None
+    assert "compile_simulator" not in config.to_json()
+    assert "evaluation_device" not in config.to_json()
+    compiled = replace(config, compile_simulator=True, evaluation_device="cpu")
+    assert compiled.to_json()["compile_simulator"] is True
+    assert compiled.to_json()["evaluation_device"] == "cpu"
+    with pytest.raises(ConfigError, match="batched backend only"):
+        replace(config, backend="serial", compile_simulator=True)
+    with pytest.raises(ConfigError, match="boolean"):
+        replace(config, compile_simulator=1)  # type: ignore[arg-type]
+    text = Path(ppo_path).read_text().replace("[rollout]", "[rollout]\ncompile_simulator = true")
+    Path(ppo_path).write_text(text)
+    assert load_ppo_config(ppo_path).compile_simulator is True
+
+
+def _policy_actions(device: str, evaluation_device: str | None) -> list[float]:
+    """Actions of the deterministic evaluation policy of an untrained model over fixed episodes."""
+    from tapeforge.execution.rl.ppo_eval import checkpoint_policy
+    from tapeforge.execution.runner import run_episode
+
+    episodes = parity.random_episodes(8, 9)
+    vec = BatchedExecutionVecEnv(batched.EpisodeBatch.from_episodes(episodes), 4, seed=0)
+    model = PPO("MlpPolicy", vec, n_steps=8, batch_size=8, device=device, seed=0)
+    policy = checkpoint_policy(model, _statistics(), evaluation_device)
+    actions: list[float] = []
+    for spec, market in episodes:
+        actions.extend(run_episode(spec, market, policy).actions)
+    return actions
+
+
+def test_an_evaluation_copy_on_the_same_device_answers_like_the_model() -> None:
+    assert _policy_actions("cpu", "cpu") == _policy_actions("cpu", None)
+
+
+@pytest.mark.gpu
+def test_a_cpu_evaluation_copy_of_a_cuda_policy_agrees_to_float32_rounding(
+    gpu_ready: None
+) -> None:
+    on_cuda = _policy_actions("cuda", None)
+    on_cpu = _policy_actions("cuda", "cpu")
+    assert on_cpu == pytest.approx(on_cuda, abs=1e-6)
