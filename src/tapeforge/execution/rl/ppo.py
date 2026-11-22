@@ -134,6 +134,7 @@ __all__ = [
     "CHECKPOINTS_SUBDIR",
     "TRAINING_RUN_SCHEMA",
     "TrainingData",
+    "build_model",
     "prepare_training",
     "train",
 ]
@@ -540,6 +541,29 @@ def prepare_training(config: PPOConfig) -> TrainingData:
     )
 
 
+def build_model(config: PPOConfig, vec_env: VecEnv) -> PPO:
+    """Return the untrained PPO model ``train`` builds for ``config`` on ``vec_env``.
+
+    The policy, value network, optimiser and update settings all come from
+    ``config``; the model's own seed is unset because ``train`` seeds the
+    global generators first (``set_random_seed``).
+    """
+    return PPO(
+        "MlpPolicy", vec_env, learning_rate=config.learning_rate, n_steps=config.n_steps,
+        batch_size=config.batch_size, n_epochs=config.n_epochs, gamma=config.gamma,
+        gae_lambda=config.gae_lambda, clip_range=config.clip_range,
+        normalize_advantage=config.normalize_advantage, ent_coef=config.entropy_coef,
+        vf_coef=config.value_coef, max_grad_norm=config.max_grad_norm,
+        target_kl=config.target_kl, device=config.device, seed=None, verbose=0,
+        policy_kwargs={
+            "net_arch": {"pi": list(config.hidden_sizes), "vf": list(config.hidden_sizes)},
+            "activation_fn": _ACTIVATIONS[config.activation],
+            "log_std_init": config.log_std_init,
+            "optimizer_kwargs": {"eps": config.adam_eps},
+        },
+    )
+
+
 def train(
     config: PPOConfig,
     model_seed: int,
@@ -676,20 +700,7 @@ def train(
     )
     try:
         if resume_state is None:
-            model = PPO(
-                "MlpPolicy", vec_env, learning_rate=config.learning_rate, n_steps=config.n_steps,
-                batch_size=config.batch_size, n_epochs=config.n_epochs, gamma=config.gamma,
-                gae_lambda=config.gae_lambda, clip_range=config.clip_range,
-                normalize_advantage=config.normalize_advantage, ent_coef=config.entropy_coef,
-                vf_coef=config.value_coef, max_grad_norm=config.max_grad_norm,
-                target_kl=config.target_kl, device=config.device, seed=None, verbose=0,
-                policy_kwargs={
-                    "net_arch": {"pi": list(config.hidden_sizes), "vf": list(config.hidden_sizes)},
-                    "activation_fn": _ACTIVATIONS[config.activation],
-                    "log_std_init": config.log_std_init,
-                    "optimizer_kwargs": {"eps": config.adam_eps},
-                },
-            )
+            model = build_model(config, vec_env)
             remaining = config.total_steps
         else:
             model = PPO.load(Path(resume_from) / "model.zip",  # type: ignore[arg-type]
