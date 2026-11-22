@@ -618,20 +618,23 @@ def run_policy(
         raise ValueError("run_policy needs a policy or a batch_policy")
     draws = sample_episodes(splits.record, role, n_episodes, seed, rho_choices_bps)
     specs: list[EpisodeSpec] = []
-    trajectories: list[Trajectory] = []
+    trajectories: list[Trajectory] = []  # detailed histories
     if batch_policy is None:
         assert policy is not None  # Checked above; narrows the type.
         # One slice at a time: only the trajectories outlive their episode.
         for draw in draws:
+            # receive execution rules and historical market slice
             spec, market = materialize(splits, draw, template)
             specs.append(spec)
+            # run the episode: the policy repeatedly receives an observation and chooses an
+            # action, and the simulator calculates the outcome
             trajectories.append(run_episode(spec, market, policy))
     else:
         materialized = [materialize(splits, draw, template) for draw in draws]
         specs = [spec for spec, _ in materialized]
         trajectories = list(run_episodes_lockstep(materialized, batch_policy))
     summaries = [summarize_episode(trajectory) for trajectory in trajectories]
-    episodes = [
+    episodes = [  # compact JSON episode summaries
         _episode_json(draw, spec, summary)
         for draw, spec, summary in zip(draws, specs, summaries, strict=True)
     ]
