@@ -139,3 +139,16 @@ def test_readme_python_examples_run() -> None:
     assert blocks, "README has no Python example to check"
     for block in blocks:
         exec(compile(block, "README.rst", "exec"), {})  # noqa: S102 - repository-owned docs
+
+
+def test_readme_optimisation_figures_rest_on_recorded_t4_evidence() -> None:
+    """The optimisation figures cite a T4 record whose correctness checks all passed."""
+    path = README.parent / "benchmarks/evidence/t4-optimisation-2026-11-21.json"
+    assert "benchmarks/evidence/t4-optimisation-2026-11-21.json" in README.read_text()
+    evidence = json.loads(path.read_text())
+    assert evidence["device"]["gpu_name"] == "Tesla T4"
+    assert evidence["gpu_tests"]["passed"] > 0 and evidence["gpu_tests"]["skipped"] == 0
+    assert all(c["n_failures"] == 0 for c in evidence["adversarial_cases"])
+    assert all(p["correct"] and p["invariants"] for w in evidence["scale_48m"] for p in w["paths"])
+    assert all(r["correct"] for r in evidence["transfer_pipeline"])
+    assert all(r["correct"] for r in evidence["kernel_scheduling"] if r["config"] != "torch_eager")

@@ -15,6 +15,9 @@ temporal semantics. The batched simulator matches the CPU reference on every
 compared transition on CPU tensors and on one CUDA device (a Tesla T4). On
 that device no end-to-end training speedup was measured: at eight
 environments the batched CUDA backend was the slowest of the three backends.
+Compiling its vector step and validating with a CPU copy of the policy
+reduced that run from 139.8 s to 65.7 s, still slower than serial CPU
+(53.9 s; ``benchmarks/evidence/t4-optimisation-2026-11-21.json``).
 
 Architecture
 ============
@@ -93,13 +96,14 @@ Status
        (``benchmarks/evidence/cuda-t4-2026-11-19.json``). Other GPUs,
        drivers and PyTorch versions are not covered.
    * - Performance evaluation
-     - Kernel, stage, and pageable/pinned transfer benchmarks implemented;
-       a training-pipeline benchmark compares serial, subprocess and batched
-       environments stage by stage. One synthetic run on one T4 host is
-       summarised in ``benchmarks/evidence/``; it shows no GPU training
-       speedup. A T4 kernel sweep was run but is not adopted into
-       ``benchmarks/results.json``. Tuning decisions and pinned-stream overlap
-       remain pending.
+     - Kernel, stage, transfer (including overlapped pinned streams), scale
+       and seeded adversarial-case benchmarks implemented; a
+       training-pipeline benchmark compares serial, subprocess and batched
+       environments stage by stage, with the compiled step and CPU-policy
+       validation as variants. Synthetic runs on one T4 host are summarised
+       in ``benchmarks/evidence/``; none shows a GPU training speedup over
+       serial CPU. Kernel sweeps are not adopted into
+       ``benchmarks/results.json``; kernel tuning decisions remain pending.
    * - Robustness
      - One-factor experiment matrices (fee, latency, data delay, terminal
        surcharge, risk coefficient, period) implemented and run locally for
@@ -658,6 +662,25 @@ masked no-op; memory is 41 bytes per episode bucket.
 rollout buffer is host memory, that backend still copies actions,
 observations, rewards and done flags between host and device every step.
 
+Two optional PPO settings change how, not what, the trainer computes; both
+are left out of the stored configuration at their defaults, so existing runs
+and resume checks are unaffected:
+
+* ``rollout.compile_simulator = true`` (batched backend only) compiles the
+  device part of each vector step (action map, transition, rewards,
+  accumulators, observations, episode summary, masked reset) with
+  ``torch.compile(fullgraph=True, dynamic=False)``. Episode draws are taken
+  before the compiled function in the eager order, so the selection
+  generator is unchanged; a test checks that compiled and eager steps agree
+  bit for bit on CPU tensors and on CUDA. The first step pays the compilation.
+* ``schedule.evaluation_device = "cpu"`` scores checkpoints on validation
+  with a copy of the policy on that device, for example during CUDA training.
+  The reference simulator asks the policy for one action at a time, so on
+  CUDA each decision is a small device round trip. Episodes, statistics,
+  metric and selection rule are unchanged; the copy's float32 outputs may
+  differ from the CUDA policy's in the last bits, so a selection score is not
+  bit-identical to one computed on CUDA.
+
 **Verification status.** On CPU tensors the batched simulator matches the
 reference on every compared transition. On CUDA it was executed on one Tesla
 T4 (PyTorch 2.14.1, CUDA 13.0) in two runs at different source revisions:
@@ -741,6 +764,23 @@ plans, and allocates once. ``execute()`` reuses output/scratch buffers;
 not be mutated. One prepared object cannot be executed concurrently, and
 cross-stream consumers must synchronize. There is no global cache.
 
+For trades in host memory, ``pipelined.aggregate_host(trades, offsets,
+batch_records=..., slots=...)`` (or ``OverlappedAggregator``, which separates
+setup from ``run()``) returns the same features while overlapping transfers
+with computation. It cuts the buckets into batches of whole buckets of at
+most ``batch_records`` records (a longer bucket forms a batch alone), copies
+each batch through its slot's pinned buffers on a copy-in stream, reduces it
+with the one-pass or two-pass kernel on a compute stream and copies the
+result back on a copy-out stream; CUDA events order the three, so batch
+``N + 1`` is copied in while batch ``N`` is reduced. Each of the ``slots``
+buffer sets is reused only after the host has waited for the copy that last
+read or wrote it, and the host reads results only after their copy-out
+event. Validation runs once on the host, and two-pass chunk schedules are
+built with NumPy, so the loop reads nothing back from the device to plan.
+``trace=True`` records a CUDA-event interval per stage and batch;
+``pipelined.overlap_ms`` measures how long two stages ran concurrently. The
+pinned and device memory held is bounded by ``slots`` times one batch.
+
 ``StreamingAggregator.push`` accepts timestamp-ordered chunks and emits
 closed buckets; ``finalize`` emits remaining buckets. It preserves batch
 feature semantics, rejects decreasing timestamps, and does not deduplicate
@@ -806,7 +846,30 @@ forced two-pass execution, eager/compiled PyTorch, and the CPU reference.
 Stage rows separate validation, metadata, allocation, and preparation; these
 overlap with end-to-end rows and must not be added to them.
 ``pipeline.py`` measures host/device transfers and compute using pageable or
-pinned memory. Pinned-stream overlap remains unimplemented.
+pinned memory, whole-input synchronous variants, ``batched_sync`` (the
+pipelined batches with one slot, so nothing overlaps) and ``pinned_streams``
+(``pipelined.OverlappedAggregator`` with ``slots`` buffer sets). The
+overlapped rows also report setup time, the bytes of pinned and device memory
+held, and, from one traced run, the time copy-in, compute and copy-out each
+spent running concurrently with another stage.
+
+``scale.py`` checks one synthetic workload per profile at a requested record
+count (48 million by default; requested and generated counts are both
+recorded): it estimates host and device memory first and skips a workload
+that would not fit, then runs every path in a fresh process against the CPU
+reference -- exact integer features, VWAP within tolerance, independent sum
+invariants, the overflow refusal -- and records peak allocated and reserved
+device memory, peak host RSS, preparation time and execution percentiles.
+``cases.py`` generates seeded adversarial inputs (a *case* is one
+``(trades, offsets)`` pair from one seed; lengths concentrate on tile,
+one-pass-limit and chunk boundaries, with empty runs, clipped windows, zero
+quantities and values using up to the whole int64 bound) and checks every
+path against the plain-loop oracle, listing the seeds of any failure.
+
+``training.py`` backend entries take options after ``+``:
+``batched+compile`` sets ``rollout.compile_simulator`` and ``+cpu_eval``
+sets ``schedule.evaluation_device = "cpu"``; with ``core_compiled = true``
+the batched-core section also times the compiled vector step.
 
 ``training.py`` (needs the ``train`` extra) compares serial, subprocess and
 batched environments under one PPO configuration: same simulator settings,
@@ -832,6 +895,34 @@ costs about 3 to 4 ms per vector step at every batch size from 8 to 4,096,
 so at eight environments a near-constant per-step device cost dominates.
 That is not a speedup, and larger batches were not trained.
 
+A second synthetic run on a T4 host (same experiment, configuration, seed and
+sample budget; ``benchmarks/evidence/t4-optimisation-2026-11-21.json``)
+measured the optional settings. Compiling the vector step brought the
+device-only batched core from 2.95 ms to 0.20 ms per vector step at eight
+environments (3.06 ms to 0.21 ms at 4,096), and environment stepping with
+host copies from 4.41 ms to 0.57 ms. End to end, batched CUDA took 139.8 s
+eager, 82.2 s compiled, 122.2 s with CPU-policy validation and 65.7 s with
+both (collection 70.3 s to 24.5 s, evaluation 55.9 s to 27.4 s); serial CPU
+took 53.9 s. Every batched variant selected the same checkpoint, and the
+CPU-copy validation score differed from the CUDA one by 2.8e-9 bps. One
+repeat per variant; differences of a few seconds are within run-to-run
+variation.
+
+Transfer scope, same evidence file: for 10 million synthetic records
+(uniform profile) in host memory, ``pinned_streams`` (1,048,576-record
+batches, three slots) returned features in 30.2 ms against 35.2 ms for the
+best whole-input variant (``pinned_sync``) and 46.7 ms for the same batches
+without overlap; the event trace shows 4.1 of 4.4 ms of compute running
+concurrently with copy-in, so the remaining time is the 27.6 ms host-to-device
+copy. Setup (pinned allocation and planning, about 150 ms) is excluded and
+reported separately; at one million records the input is one batch and
+nothing overlaps. ``scale.py`` checked 48.0, 53.3 and 48.0 million records
+(uniform, burst, sparse with 96 million buckets) on every path: exact
+integer features, VWAP within tolerance, invariants and the overflow
+refusal held. ``torch.compile`` of the ``index_add`` baseline traced one
+graph with no breaks yet ran 3.8 to 4.8 times slower than eager on that GPU
+(1 and 10 million records).
+
 Correctness is checked before timing. Warm-up excludes compilation. Results
 record wall-clock or CUDA-event timing, workload distribution, setup included
 in each region, hardware, software, revision, dirty state, and snapshot hash
@@ -850,6 +941,7 @@ Repository layout
      windows.py                      packed bucket offsets
      reference.py, streaming.py      batch and incremental CPU features
      kernels.py, prepared.py, ops.py  GPU kernels and public feature API
+     pipelined.py                    batched host-to-device aggregation on overlapping streams
      execution/
        spec.py, state.py             execution rules and data structures
        simulator.py                  fills, accounting and state transitions

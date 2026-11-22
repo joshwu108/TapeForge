@@ -34,8 +34,9 @@ Component responsibilities
    * - ``contract``, ``validation``, ``reference``, ``streaming``
      - Units, bounds and the CPU feature reference
      - Depend on torch
-   * - ``kernels``, ``prepared``, ``ops``
-     - GPU feature kernels and their public API
+   * - ``kernels``, ``prepared``, ``pipelined``, ``ops``
+     - GPU feature kernels, their public API and the overlapped
+       host-to-device path built on the existing launchers
      - Change without the kernel maintainer's approval (``kernels.py``)
    * - ``execution.spec``, ``state``, ``simulator``
      - The transition rules: fills, fees, settlement, rewards, episode ends
