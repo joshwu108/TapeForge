@@ -12,6 +12,12 @@ reference.
 The baseline is representative rather than deliberately weak: it reads each
 input once and writes each output once, like the fused kernel, but through
 several separate PyTorch kernels and a searchsorted.
+
+Compiled, it is not a stronger baseline: with PyTorch 2.14 inductor lowers
+int64 ``index_add`` to ``index_put_(accumulate=True)``, which runs a radix
+sort and a sorted reduction instead of eager's atomic scatter (on a T4,
+15.8 ms against 0.75 ms for one 10M-record ``index_add``), so the compiled
+baseline is slower than the eager one. Comparisons use the eager baseline.
 """
 
 from __future__ import annotations

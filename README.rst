@@ -939,7 +939,32 @@ nothing overlaps. ``scale.py`` checked 48.0, 53.3 and 48.0 million records
 integer features, VWAP within tolerance, invariants and the overflow
 refusal held. ``torch.compile`` of the ``index_add`` baseline traced one
 graph with no breaks yet ran 3.8 to 4.8 times slower than eager on that GPU
-(1 and 10 million records).
+(1 and 10 million records). The cause, from a per-kernel profile: inductor
+lowers int64 ``index_add`` to ``index_put_(accumulate=True)``, a radix sort
+and sorted reduction (15.8 ms for one 10M-record call against 0.75 ms
+eager), so the eager baseline is the one compared against.
+
+A third T4 session (``benchmarks/evidence/t4-optimisation-2026-11-22.json``,
+synthetic data and synthetic checkpoints) checked the optional settings
+above. Lockstep validation replayed five fixed checkpoints (50 episodes
+each): with a batch policy that calls the scalar policy per row, the
+trajectories equal the per-decision replay exactly; with the batched forward,
+actions differ by at most 6e-8 and the validation metric by at most 3.2e-9
+bps, and the same checkpoint is selected on CPU and CUDA policies. A
+validation pass took 0.9 to 1.3 s instead of 7.0 to 8.0 s (CPU policy) or
+12.5 to 13.5 s (CUDA policy), two timed passes per checkpoint. End to end (96,000 samples, one repeat),
+serial CPU took 59.7 s without lockstep and 30.9 s with it (evaluation 32.8
+to 4.5 s); batched CUDA with the compiled step and CPU-policy validation
+took 78.0 s and 42.4 s. Each backend selected the same checkpoint with and
+without lockstep. A collection profile at eight environments puts the
+compiled batched rollout at 2.20 ms per vector step against 1.63 ms serial,
+with the device environment step alone (0.96 ms) no faster than the CPU one
+(0.87 ms), so collection is not faster on this GPU at that batch size.
+``int32_transfer=True`` (bounds checked per window, widened on the device,
+bit-identical) cut 10 million uniform records from 30.0 to 16.8 ms in
+``pinned_streams`` and one million from 4.6 to 2.8 ms; at 100,000 records
+it saved under 0.1 ms. It costs device memory for the int64 widening
+buffers (77 against 53 MB at 10 million records).
 
 Correctness is checked before timing. Warm-up excludes compilation. Results
 record wall-clock or CUDA-event timing, workload distribution, setup included

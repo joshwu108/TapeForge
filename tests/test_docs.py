@@ -152,3 +152,17 @@ def test_readme_optimisation_figures_rest_on_recorded_t4_evidence() -> None:
     assert all(p["correct"] and p["invariants"] for w in evidence["scale_48m"] for p in w["paths"])
     assert all(r["correct"] for r in evidence["transfer_pipeline"])
     assert all(r["correct"] for r in evidence["kernel_scheduling"] if r["config"] != "torch_eager")
+
+
+def test_readme_continuation_figures_rest_on_recorded_t4_evidence() -> None:
+    """The 2026-11-22 figures cite a T4 record whose correctness checks all passed."""
+    path = README.parent / "benchmarks/evidence/t4-optimisation-2026-11-22.json"
+    assert "benchmarks/evidence/t4-optimisation-2026-11-22.json" in README.read_text()
+    evidence = json.loads(path.read_text())
+    assert evidence["device"]["gpu_name"] == "Tesla T4"
+    assert all(t["passed"] > 0 and t["failed"] == 0 for t in evidence["gpu_tests"])
+    assert all(c["n_failures"] == 0 for c in evidence["adversarial_cases"])
+    assert all(r["correct"] for r in evidence["transfer_pipeline"])
+    assert all(p["correct"] and p["invariants"] for w in evidence["scale_48m"] for p in w["paths"])
+    assert evidence["validation_replay"]["same_selection"]
+    assert all(r["status"] == "ok" for r in evidence["training"])
