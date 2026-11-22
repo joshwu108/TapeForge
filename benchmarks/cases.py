@@ -114,7 +114,8 @@ def run_path(path: str, trades: np.ndarray, offsets: np.ndarray, rng: np.random.
         return {"features": ops.aggregate(columns, device_offsets), "options": {}}
     options: dict[str, Any] = {}
     if path == "grouped":
-        options = {"block_size": int(rng.choice([2, 4, 16, 64, 128, 1024])),
+        tiles = [None, 2, 4, 16, 64, 128, 1024]     # None: the library's own tile choice
+        options = {"block_size": tiles[int(rng.integers(len(tiles)))],
                    "group_lanes": int(rng.choice([2, 64, 1024, 4096]))}
     prep = prepared.prepare(columns, device_offsets, path=path, **options)
     return {"features": prep.execute_owned(), "options": options}
