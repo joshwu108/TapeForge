@@ -156,6 +156,19 @@ def test_no_records_at_all(to_format: Formatter) -> None:
 
 
 @FORMATS
+def test_a_single_record_is_aggregated(to_format: Formatter) -> None:
+    """One record: its structured-field view keeps the record stride, which must be packed."""
+    trades = _trades([(0, 100.0, 2.0, True)])
+    offsets = windows.build_offsets(trades["timestamp"], 0, 1, W)
+    got = _run(to_format, trades, offsets)
+
+    assert got["event_count"].tolist() == [1]
+    assert got["total_quantity"].tolist() == [2 * Q]
+    assert got["signed_quantity"].tolist() == [-2 * Q]
+    assert got["vwap"].tolist() == [100.0]
+
+
+@FORMATS
 def test_records_outside_the_window_leave_every_bucket_empty(to_format: Formatter) -> None:
     """Records before and after the window contribute to no bucket."""
     # The window starts at second 10; the record at second 0 precedes it and

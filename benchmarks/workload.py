@@ -151,7 +151,7 @@ def host_columns(trades: np.ndarray, pin: bool = False) -> dict[str, Any]:
     import torch
 
     columns = {
-        name: torch.from_numpy(np.ascontiguousarray(trades[name]))
+        name: torch.from_numpy(trades[name].copy())  # packed strides even for one record
         for name in ("price", "quantity", "buyer_is_maker")
     }
     return {k: v.pin_memory() for k, v in columns.items()} if pin else columns

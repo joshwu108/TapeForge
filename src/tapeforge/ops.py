@@ -69,10 +69,12 @@ def _import_torch() -> Any:
 def _structured_to_columns(trades: np.ndarray) -> dict[str, torch.Tensor]:
     """Return the three kernel columns of a ``TRADE_DTYPE`` array as CPU tensors."""
     torch = _import_torch()
-    # Structured fields are strided views; each is copied to a contiguous column
-    # because validation rejects non-contiguous tensors.
+    # Structured fields are strided views; each is copied to a packed column
+    # because validation rejects non-contiguous tensors. ``copy`` rather than
+    # ``ascontiguousarray``: a one-record field view already counts as
+    # contiguous, keeps the record stride, and torch.from_numpy rejects it.
     return {
-        name: torch.from_numpy(np.ascontiguousarray(trades[name]))
+        name: torch.from_numpy(trades[name].copy())
         for name in ("price", "quantity", "buyer_is_maker")
     }
 
