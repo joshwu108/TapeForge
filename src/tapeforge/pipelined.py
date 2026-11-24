@@ -47,6 +47,17 @@ Memory:
     except through the result arrays, which are ordinary host arrays of
     ``n_buckets`` entries.
 
+Grouped path (opt-in, ``path="grouped"``):
+    Each batch is reduced by ``kernels.launch_grouped_unchecked`` instead:
+    the batch's tile comes from ``kernels.choose_grouped_tile_host`` on its
+    bucket lengths, and its long-bucket schedule from
+    ``kernels.build_long_bucket_schedule`` run on host tensors, both in the
+    constructor; the schedule is staged after the local offsets in the
+    slot's int64 metadata buffer and copied with them. The loop therefore
+    still has no device-to-host synchronisation beyond the event waits.
+    With the default ``path="auto"`` each batch takes the one-pass or
+    two-pass kernel, so sparse tapes pay one program per bucket.
+
 Narrow transfer (opt-in, ``int32_transfer=True``):
     Prices and quantities cross the bus as int32 when every value in the
     window is at most ``INT32_MAX`` (checked on the host in the
@@ -58,9 +69,7 @@ Narrow transfer (opt-in, ``int32_transfer=True``):
     not applied.
 
 Not covered:
-    The grouped short-bucket path; sparse tapes therefore pay the one-pass
-    kernel's one program per bucket. The function needs CUDA and Triton and
-    raises otherwise.
+    The function needs CUDA and Triton and raises otherwise.
 """
 
 from __future__ import annotations
@@ -292,6 +301,52 @@ def _validate_host(columns: dict[str, np.ndarray], offsets: np.ndarray) -> int:
     return longest
 
 
+@dataclass(frozen=True)
+class _GroupedBatch:
+    """Host-side grouped plan of one batch: tile, lanes and long-bucket schedule.
+
+    ``schedule`` holds int64 NumPy arrays ``bucket_ids`` (batch-local),
+    ``chunk_starts``, ``chunk_ends`` (local record indices) and
+    ``chunk_offsets`` (``len(bucket_ids) + 1`` entries), exactly as
+    ``kernels.build_long_bucket_schedule`` lays them out.
+    """
+
+    tile: int
+    group_lanes: int
+    schedule: dict[str, np.ndarray]
+
+    @property
+    def n_long(self) -> int:
+        return int(self.schedule["bucket_ids"].size)
+
+    @property
+    def n_chunks(self) -> int:
+        return int(self.schedule["chunk_starts"].size)
+
+    def meta_length(self, n_buckets: int) -> int:
+        """Offsets, then bucket ids, chunk starts, chunk ends and chunk offsets."""
+        return n_buckets + 1 + self.n_long + 2 * self.n_chunks + self.n_long + 1
+
+
+def _grouped_batch(local_offsets: np.ndarray, group_lanes: int) -> _GroupedBatch:
+    """Plan one batch for the grouped path on the host (no device work)."""
+    import torch
+
+    lengths = np.diff(local_offsets)
+    tile = kernels.choose_grouped_tile_host(lengths)
+    schedule = kernels.build_long_bucket_schedule(
+        torch.from_numpy(np.ascontiguousarray(local_offsets)), tile, kernels.CHUNK_SIZE
+    )
+    chunks = schedule.chunks
+    arrays = {
+        "bucket_ids": schedule.bucket_ids.numpy(),
+        "chunk_starts": chunks.chunk_starts.numpy(),
+        "chunk_ends": chunks.chunk_ends.numpy(),
+        "chunk_offsets": chunks.chunk_offsets.numpy(),
+    }
+    return _GroupedBatch(tile, group_lanes, arrays)
+
+
 def _meta_length(n_buckets: int, n_chunks: int) -> int:
     """Return the int64 slots for local offsets and, with ``n_chunks >= 0``, a chunk schedule.
 
@@ -307,7 +362,7 @@ class _Slot:
     """One set of pinned staging, device buffers and events; used by one batch at a time."""
 
     def __init__(self, torch: Any, records: int, buckets: int, chunks: int, trace: bool,
-                 int32_transfer: bool = False) -> None:
+                 meta_len: int | None = None, int32_transfer: bool = False) -> None:
         def pinned(n: int, dtype: Any) -> torch.Tensor:
             return torch.empty(n, dtype=dtype, pin_memory=True)
 
@@ -322,8 +377,9 @@ class _Slot:
         # stream from dev_in; dev_in itself is what copy_in writes.
         self.dev_wide = ({name: device(records, torch.int64) for name in ("price", "quantity")}
                          if int32_transfer else {})
-        # Offsets plus, on two-pass batches, the chunk schedule share one int64 buffer.
-        self.meta_len = _meta_length(buckets, chunks)
+        # Offsets plus, on two-pass batches, the chunk schedule (on grouped batches the
+        # long-bucket schedule, whose length the caller passes) share one int64 buffer.
+        self.meta_len = _meta_length(buckets, chunks) if meta_len is None else meta_len
         self.host_meta = pinned(self.meta_len, torch.int64)
         self.dev_meta = device(self.meta_len, torch.int64)
         out_dtypes = {
@@ -370,12 +426,16 @@ class OverlappedAggregator:
         batch_records: Record budget per batch.
         slots: Buffer sets in rotation, at least 1; 1 serialises the batches.
         trace: Record CUDA timing events per stage into ``stats.timeline``.
+        path: ``"auto"`` (one-pass or two-pass per batch) or ``"grouped"``
+            (see the module docstring).
+        group_lanes: Lanes per program on the grouped path.
         int32_transfer: Send prices and quantities as int32 when they fit
             (see the module docstring).
 
     Raises:
         RuntimeError: CUDA or Triton is unavailable.
-        ValueError: The input fails validation or ``slots`` < 1.
+        ValueError: The input fails validation, ``slots`` < 1 or an unknown
+            ``path``.
         OverflowError: The int64 accumulation bound is exceeded.
     """
 
@@ -387,6 +447,8 @@ class OverlappedAggregator:
         batch_records: int = 1 << 20,
         slots: int = 2,
         trace: bool = False,
+        path: str = "auto",
+        group_lanes: int = kernels.GROUP_LANES,
         int32_transfer: bool = False,
     ) -> None:
         kernels._require_triton()
@@ -396,6 +458,8 @@ class OverlappedAggregator:
             raise RuntimeError("OverlappedAggregator needs a CUDA device")
         if slots < 1:
             raise ValueError(f"slots must be at least 1, got {slots}")
+        if path not in ("auto", "grouped"):
+            raise ValueError(f"path must be 'auto' or 'grouped', got {path!r}")
         started = time.perf_counter()
         self._torch = torch
         self.stats = PipelineStats()
@@ -404,14 +468,25 @@ class OverlappedAggregator:
         _validate_host(columns, self.offsets)
         narrow = int32_transfer and _fits_int32(columns, self.offsets)
         self.plans = plan_batches(self.offsets, batch_records)
+        self.path = path
+        self._grouped: list[_GroupedBatch] | None = None
         capacity_records = max(plan.n_records for plan in self.plans)
         capacity_buckets = max(plan.n_buckets for plan in self.plans)
         capacity_chunks = max(plan.n_chunks for plan in self.plans)
+        meta_len = None
+        if path == "grouped":
+            self._grouped = [
+                _grouped_batch(self.offsets[p.first: p.last + 1] - p.record_start, group_lanes)
+                for p in self.plans
+            ]
+            capacity_chunks = max(g.n_chunks for g in self._grouped)
+            meta_len = max(g.meta_length(p.n_buckets)
+                           for g, p in zip(self._grouped, self.plans, strict=True))
         self._host_columns = {name: torch.from_numpy(column) for name, column in columns.items()}
         self._ring: list[_Slot] = []
         if capacity_records:
             self._ring = [_Slot(torch, capacity_records, capacity_buckets, capacity_chunks, trace,
-                                narrow)
+                                meta_len, narrow)
                           for _ in range(min(slots, len(self.plans)))]
         self._streams = tuple(torch.cuda.Stream() for _ in range(3))  # type: ignore[no-untyped-call]
         stats = self.stats
@@ -441,9 +516,10 @@ class OverlappedAggregator:
         copy_in, compute, copy_out = self._streams
         for index, plan in enumerate(plans):
             slot = ring[index % len(ring)]
+            grouped = None if self._grouped is None else self._grouped[index]
             _drain(slot, results, self.stats)
-            _stage(slot, plan, self._host_columns, self.offsets)
-            _launch(self._torch, slot, plan, copy_in, compute, copy_out)
+            _stage(slot, plan, self._host_columns, self.offsets, grouped)
+            _launch(self._torch, slot, plan, copy_in, compute, copy_out, grouped)
         for slot in ring:
             _drain(slot, results, self.stats)
         self.stats.timeline.sort(key=lambda entry: entry["first_bucket"])
@@ -459,6 +535,8 @@ def aggregate_host(
     slots: int = 2,
     trace: bool = False,
     stats: PipelineStats | None = None,
+    path: str = "auto",
+    group_lanes: int = kernels.GROUP_LANES,
     int32_transfer: bool = False,
 ) -> dict[str, np.ndarray]:
     """Aggregate host trades on the GPU in overlapped batches and return host features.
@@ -471,8 +549,8 @@ def aggregate_host(
         ``n_buckets`` entries with the contract dtypes.
     """
     aggregator = OverlappedAggregator(
-        trades, offsets, batch_records=batch_records, slots=slots, trace=trace,
-        int32_transfer=int32_transfer,
+        trades, offsets, batch_records=batch_records, slots=slots, trace=trace, path=path,
+        group_lanes=group_lanes, int32_transfer=int32_transfer,
     )
     results = aggregator.run()
     if stats is not None:
@@ -495,7 +573,8 @@ def _drain(slot: _Slot, results: dict[str, np.ndarray], stats: PipelineStats) ->
     slot.batch = None
 
 
-def _stage(slot: _Slot, plan: BatchPlan, host: dict[str, Any], offsets: np.ndarray) -> None:
+def _stage(slot: _Slot, plan: BatchPlan, host: dict[str, Any], offsets: np.ndarray,
+           grouped: _GroupedBatch | None = None) -> None:
     """Copy one batch's columns, local offsets and chunk schedule into the slot's pinned buffers.
 
     The slot is free: ``_drain`` waited for its last copy back, which the
@@ -507,7 +586,13 @@ def _stage(slot: _Slot, plan: BatchPlan, host: dict[str, Any], offsets: np.ndarr
     local = offsets[plan.first: plan.last + 1] - plan.record_start
     meta = slot.host_meta.numpy()
     meta[: local.size] = local
-    if plan.two_pass:
+    if grouped is not None:
+        position = local.size
+        for name in ("bucket_ids", "chunk_starts", "chunk_ends", "chunk_offsets"):
+            values = grouped.schedule[name]
+            meta[position: position + values.size] = values
+            position += values.size
+    elif plan.two_pass:
         schedule = chunk_schedule(local, kernels.CHUNK_SIZE)
         position = local.size
         for name in ("chunk_starts", "chunk_ends", "chunk_offsets"):
@@ -517,10 +602,13 @@ def _stage(slot: _Slot, plan: BatchPlan, host: dict[str, Any], offsets: np.ndarr
 
 
 def _launch(torch: Any, slot: _Slot, plan: BatchPlan, copy_in: Any, compute: Any,
-            copy_out: Any) -> None:
+            copy_out: Any, grouped: _GroupedBatch | None = None) -> None:
     """Enqueue copy in, compute and copy back of one batch on the three streams."""
     n_records, n_buckets = plan.n_records, plan.n_buckets
-    meta_used = _meta_length(n_buckets, plan.n_chunks if plan.two_pass else -1)
+    if grouped is not None:
+        meta_used = grouped.meta_length(n_buckets)
+    else:
+        meta_used = _meta_length(n_buckets, plan.n_chunks if plan.two_pass else -1)
     marks = []
     with torch.cuda.stream(copy_in):
         copy_in.wait_event(slot.computed)  # Device inputs of this slot are free.
@@ -540,7 +628,9 @@ def _launch(torch: Any, slot: _Slot, plan: BatchPlan, copy_in: Any, compute: Any
             trades[name] = wide[:n_records]
         local_offsets = slot.dev_meta[: n_buckets + 1]
         outputs = {name: device[:n_buckets] for name, device in slot.dev_out.items()}
-        if plan.two_pass:
+        if grouped is not None and plan.max_bucket_len > 0:
+            _launch_grouped(slot, plan, grouped, trades, local_offsets, outputs)
+        elif plan.two_pass:
             base, n = n_buckets + 1, plan.n_chunks
             chunks = kernels.ChunkMetadata(
                 chunk_starts=slot.dev_meta[base: base + n],
@@ -569,6 +659,29 @@ def _launch(torch: Any, slot: _Slot, plan: BatchPlan, copy_in: Any, compute: Any
         slot.copied_out.record()
     slot.batch = plan
     slot.marks = marks
+
+
+def _launch_grouped(slot: _Slot, plan: BatchPlan, grouped: _GroupedBatch, trades: Any,
+                    local_offsets: Any, outputs: Any) -> None:
+    """Launch the grouped kernels of one batch on views of the slot's metadata buffer."""
+    n_buckets, n_long, n_chunks = plan.n_buckets, grouped.n_long, grouped.n_chunks
+    position = n_buckets + 1
+    views = {}
+    for name, size in (("bucket_ids", n_long), ("chunk_starts", n_chunks),
+                       ("chunk_ends", n_chunks), ("chunk_offsets", n_long + 1)):
+        views[name] = slot.dev_meta[position: position + size]
+        position += size
+    schedule = kernels.LongBucketSchedule(
+        bucket_ids=views["bucket_ids"],
+        chunks=kernels.ChunkMetadata(
+            chunk_starts=views["chunk_starts"], chunk_ends=views["chunk_ends"],
+            chunk_offsets=views["chunk_offsets"], n_chunks=n_chunks,
+            chunk_size=kernels.CHUNK_SIZE,
+        ),
+    )
+    dispatch = kernels.plan_grouped(plan.max_bucket_len, grouped.tile, grouped.group_lanes)
+    kernels.launch_grouped_unchecked(trades, local_offsets, outputs, dispatch, schedule,
+                                     slot.partials)
 
 
 def timeline_intervals(stats: PipelineStats) -> list[dict[str, float]]:

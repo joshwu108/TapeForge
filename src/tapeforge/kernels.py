@@ -10,6 +10,18 @@ combines each bucket's partials (``combine_partials``, one program per
 bucket). ``plan_dispatch`` chooses between them; ``launch_aggregate`` is
 the checked entry point behind ``ops.aggregate``.
 
+A third path, ``grouped``, is only taken when requested explicitly. It
+splits the buckets by length. Buckets of at most ``block_size`` records
+(the grouped tile, at most ``MAX_GROUPED_TILE`` unless given) are reduced
+``group_size`` at a time by ``aggregate_grouped``: one program owns a
+``[group_size, block_size]`` tile, so a tape of millions of empty or
+one-record buckets launches ``n_buckets / group_size`` programs instead
+of ``n_buckets``. Longer buckets are listed once (``LongBucketSchedule``)
+and reduced by the pass-1 kernel over their chunks followed by
+``combine_partials_indexed``, which writes each result at the bucket's
+own index. Every bucket is written by exactly one of the two, and VWAP is
+still divided once per bucket.
+
 Data contract:
     Inputs are the validated columns of ``tapeforge.validation``: 1-D
     contiguous CUDA tensors, int64 ``price`` and ``quantity`` ticks, bool
@@ -34,7 +46,7 @@ Not covered:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Literal
 
@@ -56,12 +68,18 @@ MAX_ONE_PASS_BUCKET: Final[int] = 4096  # Largest bucket (records) the one-pass 
 MIN_BLOCK_SIZE: Final[int] = 16         # Smallest one-pass tile chosen automatically.
 CHUNK_SIZE: Final[int] = 1024           # Records per pass-1 chunk on the two-pass path.
 
+# Grouped path: lanes per program (group_size * tile) and the default largest
+# tile; buckets longer than the tile go to the chunked long-bucket pass.
+GROUP_LANES: Final[int] = 1024
+MAX_GROUPED_TILE: Final[int] = 128
+MIN_GROUPED_TILE: Final[int] = 2
+
 # Partials per pass-2 tile. A bucket with more chunks than this is reduced by
 # looping over tiles inside its program (``combine_partials``).
 COMBINE_BLOCK_SIZE: Final[int] = 128
 
-DispatchPath = Literal["one_pass", "two_pass"]
-PathChoice = Literal["auto", "one_pass", "two_pass"]
+DispatchPath = Literal["one_pass", "two_pass", "grouped"]
+PathChoice = Literal["auto", "one_pass", "two_pass", "grouped"]
 
 
 class BucketTooLargeError(ValueError):
@@ -73,15 +91,19 @@ class DispatchPlan:
     """Kernel path chosen for a validated input, with the tile or chunk it uses.
 
     Attributes:
-        path: ``"one_pass"`` or ``"two_pass"``.
-        block_size: One-pass tile in records, a power of two; ``None`` on the
-            two-pass path.
+        path: ``"one_pass"``, ``"two_pass"`` or ``"grouped"``.
+        block_size: One-pass tile in records, a power of two; on the grouped
+            path the per-bucket tile, so buckets longer than it take the
+            long-bucket pass. ``None`` on the two-pass path.
         chunk_size: Pass-1 chunk in records; ``None`` on the one-pass path.
+        group_size: Buckets per program on the grouped path, a power of two;
+            ``None`` otherwise.
     """
 
     path: DispatchPath
     block_size: int | None
     chunk_size: int | None
+    group_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -145,6 +167,134 @@ def select_block_size(max_bucket_len: int, block_size: int | None = None) -> int
     return max(MIN_BLOCK_SIZE, 1 << max(0, max_bucket_len - 1).bit_length())
 
 
+def _check_power_of_two(name: str, value: int) -> None:
+    if value <= 0 or value & (value - 1):
+        raise ValueError(f"{name} must be a positive power of two, got {value}")
+
+
+def plan_grouped(
+    max_bucket_len: int, tile: int | None = None, group_lanes: int = GROUP_LANES
+) -> DispatchPlan:
+    """Plan the grouped path: a per-bucket tile and the buckets per program.
+
+    Without an explicit ``tile`` the tile is the smallest power of two that
+    holds the longest bucket, clamped to ``[MIN_GROUPED_TILE,
+    MAX_GROUPED_TILE]``; buckets longer than the tile are reduced by the
+    long-bucket pass, so no bucket is too large for this path.
+
+    Args:
+        max_bucket_len: Records in the longest bucket.
+        tile: Explicit per-bucket tile, a power of two in
+            ``[MIN_GROUPED_TILE, MAX_ONE_PASS_BUCKET]``.
+        group_lanes: Lanes per program (``group_size * tile``), a power of
+            two; when smaller than the tile, one bucket per program.
+
+    Raises:
+        ValueError: ``tile`` or ``group_lanes`` is not a power of two, or
+            ``tile`` is outside its range.
+    """
+    _check_power_of_two("group_lanes", group_lanes)
+    if tile is None:
+        tile = 1 << max(0, min(max_bucket_len, MAX_GROUPED_TILE) - 1).bit_length()
+        tile = max(MIN_GROUPED_TILE, tile)
+    else:
+        _check_power_of_two("tile", tile)
+        if not MIN_GROUPED_TILE <= tile <= MAX_ONE_PASS_BUCKET:
+            raise ValueError(
+                f"tile must lie in [{MIN_GROUPED_TILE}, {MAX_ONE_PASS_BUCKET}], got {tile}"
+            )
+    return DispatchPlan(
+        path="grouped",
+        block_size=tile,
+        chunk_size=CHUNK_SIZE,
+        group_size=max(1, group_lanes // tile),
+    )
+
+
+def grouped_tile_candidates() -> list[int]:
+    """Return the tiles the grouped-path tile choice considers, in increasing order."""
+    tiles = []
+    tile = MIN_GROUPED_TILE
+    while tile <= MAX_GROUPED_TILE:
+        tiles.append(tile)
+        tile *= 2
+    return tiles
+
+
+# Grouped tile cost model, in quarter lanes (integers, so ties are exact). Fitted on the T4
+# with benchmarks/tile_sweep.py: 16 bucket-length families (Poisson means 0.25..64, long-tail
+# mixtures, the generator profiles) at 2M records, seeds 21-22; checked on seed 23 at 2M and
+# seed 24 at 0.5M and 8M, where it picked the fastest measured tile in all 40 held-out
+# workloads (the earlier one-lane-per-chunk-lane model: mean regret 6-11 %, worst 82 %).
+GROUPED_COST_TILE_LANE: Final[int] = 4        # one lane of the [GROUP, TILE] tile
+GROUPED_COST_LONG_BUCKET: Final[int] = 512    # fixed cost of a long bucket (pass 1 + combine)
+GROUPED_COST_LONG_RECORD: Final[int] = 1      # one record read by pass 1
+
+
+def select_grouped_tile(n_buckets: int, n_long: Sequence[int],
+                        long_records: Sequence[int]) -> int:
+    """Return the cheapest tile given, per candidate tile, the buckets above it and their records.
+
+    The cost of a tile ``t`` (in quarter lanes) is
+    ``GROUPED_COST_TILE_LANE * n_buckets * t`` for the grouped kernel, which
+    spends a lane per tile slot whether a record is there or not, plus, for
+    the buckets longer than ``t``, ``GROUPED_COST_LONG_BUCKET`` each (their
+    pass-1 chunk programs and combine) and ``GROUPED_COST_LONG_RECORD`` per
+    record they hold (pass 1 reads only real records). Ties go to the larger
+    tile, which sends fewer buckets through the long pass. Entry ``i`` of
+    ``n_long`` and ``long_records`` belongs to
+    ``grouped_tile_candidates()[i]``. This is the one cost model of both
+    ``choose_grouped_tile`` (device lengths) and ``choose_grouped_tile_host``
+    (NumPy lengths). The weights are measurements on one GPU (see the
+    constants), not a law; other GPUs may favour other tiles.
+    """
+    candidates = grouped_tile_candidates()
+    if n_buckets == 0:
+        return MIN_GROUPED_TILE
+    costs = [
+        GROUPED_COST_TILE_LANE * n_buckets * t + GROUPED_COST_LONG_BUCKET * int(n)
+        + GROUPED_COST_LONG_RECORD * int(r)
+        for t, n, r in zip(candidates, n_long, long_records, strict=True)
+    ]
+    best = min(costs)
+    return max(t for t, c in zip(candidates, costs, strict=True) if c == best)
+
+
+def choose_grouped_tile(offsets: Any) -> int:
+    """Pick the grouped-path tile from the bucket lengths of ``offsets`` (validated, CUDA).
+
+    The cheapest power of two in ``[MIN_GROUPED_TILE, MAX_GROUPED_TILE]``
+    under ``select_grouped_tile``'s cost model. A tile below the longest
+    bucket is chosen when the buckets above it cost less in the long-bucket
+    pass than widening every bucket's tile would.
+
+    One device-to-host copy (the per-tile counts).
+    """
+    import torch
+
+    lengths = offsets[1:] - offsets[:-1]
+    n_buckets = int(lengths.numel())
+    if n_buckets == 0:
+        return MIN_GROUPED_TILE
+    tiles = grouped_tile_candidates()
+    counts = torch.stack(
+        [torch.stack([(lengths > t).sum(), torch.where(lengths > t, lengths, 0).sum()])
+         for t in tiles]
+    ).cpu().tolist()
+    return select_grouped_tile(n_buckets, [c[0] for c in counts], [c[1] for c in counts])
+
+
+def choose_grouped_tile_host(lengths: Any) -> int:
+    """``choose_grouped_tile`` for NumPy bucket lengths, without touching the device."""
+    import numpy as np
+
+    lengths = np.asarray(lengths, dtype=np.int64)
+    tiles = grouped_tile_candidates()
+    n_long = [int((lengths > t).sum()) for t in tiles]
+    long_records = [int(lengths[lengths > t].sum()) for t in tiles]
+    return select_grouped_tile(int(lengths.size), n_long, long_records)
+
+
 def plan_dispatch(
     max_bucket_len: int, block_size: int | None = None, path: PathChoice = "auto"
 ) -> DispatchPlan:
@@ -167,8 +317,13 @@ def plan_dispatch(
         BucketTooLargeError: The one-pass path was requested (explicitly or
             via ``block_size``) for a bucket longer than its tile.
     """
-    if path not in ("auto", "one_pass", "two_pass"):
-        raise ValueError(f"path must be 'auto', 'one_pass' or 'two_pass', got {path!r}")
+    if path not in ("auto", "one_pass", "two_pass", "grouped"):
+        raise ValueError(
+            f"path must be 'auto', 'one_pass', 'two_pass' or 'grouped', got {path!r}"
+        )
+    if path == "grouped":
+        # On this path block_size is the per-bucket tile, not a capacity limit.
+        return plan_grouped(max_bucket_len, block_size)
     if path == "two_pass":
         if block_size is not None:
             raise ValueError("block_size applies to the one-pass path only")
@@ -236,6 +391,74 @@ def build_chunk_metadata(offsets: torch.Tensor, chunk_size: int) -> ChunkMetadat
         chunk_offsets=chunk_offsets,
         n_chunks=n_chunks,
         chunk_size=chunk_size,
+    )
+
+
+@dataclass(frozen=True)
+class LongBucketSchedule:
+    """Device-resident schedule of the buckets the grouped path does not tile.
+
+    Derived from ``offsets`` and the grouped tile only.
+
+    Attributes:
+        bucket_ids: int64 indices of the buckets longer than the tile, in
+            increasing order.
+        chunks: Pass-1 schedule over those buckets only. Its
+            ``chunk_offsets`` has ``len(bucket_ids) + 1`` entries: long
+            bucket ``j`` (bucket ``bucket_ids[j]``) owns chunks
+            ``[chunk_offsets[j], chunk_offsets[j + 1])``.
+    """
+
+    bucket_ids: torch.Tensor
+    chunks: ChunkMetadata
+
+    @property
+    def n_long(self) -> int:
+        """Return the number of long buckets."""
+        return int(self.bucket_ids.numel())
+
+
+def build_long_bucket_schedule(
+    offsets: torch.Tensor, tile: int, chunk_size: int
+) -> LongBucketSchedule:
+    """List the buckets longer than ``tile`` and split each into ``chunk_size`` chunks.
+
+    Runs on the device of ``offsets`` (CPU included). Two host syncs: the
+    number of long buckets and the number of their chunks, which size the
+    launch grids. Long buckets hold more than ``tile >= 1`` records, so every
+    chunk holds at least one record, as on the two-pass path.
+
+    Raises:
+        ValueError: ``tile`` or ``chunk_size`` is not positive.
+    """
+    import torch
+
+    if tile <= 0 or chunk_size <= 0:
+        raise ValueError(f"tile and chunk_size must be positive, got {tile}, {chunk_size}")
+    lengths = offsets[1:] - offsets[:-1]
+    bucket_ids = torch.nonzero(lengths > tile).flatten()
+    starts = offsets[bucket_ids]
+    long_lengths = lengths[bucket_ids]
+    chunks_per_bucket = (long_lengths + chunk_size - 1) // chunk_size
+    chunk_offsets = torch.cat([offsets.new_zeros(1), chunks_per_bucket.cumsum(dim=0)])
+    n_chunks = int(chunk_offsets[-1].item())
+    owner = torch.repeat_interleave(
+        torch.arange(bucket_ids.numel(), device=offsets.device),
+        chunks_per_bucket,
+        output_size=n_chunks,
+    )
+    local_chunk = torch.arange(n_chunks, device=offsets.device) - chunk_offsets[owner]
+    chunk_starts = starts[owner] + local_chunk * chunk_size
+    chunk_ends = torch.minimum(chunk_starts + chunk_size, starts[owner] + long_lengths[owner])
+    return LongBucketSchedule(
+        bucket_ids=bucket_ids,
+        chunks=ChunkMetadata(
+            chunk_starts=chunk_starts,
+            chunk_ends=chunk_ends,
+            chunk_offsets=chunk_offsets,
+            n_chunks=n_chunks,
+            chunk_size=chunk_size,
+        ),
     )
 
 
@@ -404,6 +627,110 @@ if TRITON_AVAILABLE:
         tl.store(vwap_ptr + bucket, vwap)
         tl.store(valid_ptr + bucket, count > 0)
 
+    @triton.jit  # type: ignore[untyped-decorator]
+    def aggregate_grouped(  # type: ignore[no-untyped-def]
+        price_ptr,
+        quantity_ptr,
+        buyer_is_maker_ptr,
+        offsets_ptr,
+        n_buckets,
+        total_quantity_ptr,
+        event_count_ptr,
+        signed_quantity_ptr,
+        vwap_ptr,
+        valid_ptr,
+        GROUP: tl.constexpr,
+        TILE: tl.constexpr,
+        PRICE_SCALE: tl.constexpr,
+        SIGN_BUY: tl.constexpr,
+        SIGN_SELL: tl.constexpr,
+    ):
+        # Grouped short-bucket kernel: program p owns buckets [p * GROUP, (p + 1) * GROUP)
+        # as a [GROUP, TILE] tile, row g holding the records of one bucket.
+        # Buckets longer than TILE are skipped here (nothing is stored for
+        # them); the long-bucket pass writes them.
+        pid = tl.program_id(axis=0)
+        buckets = pid.to(tl.int64) * GROUP + tl.arange(0, GROUP)
+        in_range = buckets < n_buckets
+        start = tl.load(offsets_ptr + buckets, mask=in_range, other=0)
+        end = tl.load(offsets_ptr + buckets + 1, mask=in_range, other=0)
+        length = end - start
+        mine = in_range & (length <= TILE)
+
+        indices = start[:, None] + tl.arange(0, TILE)[None, :]
+        in_bucket = (indices < end[:, None]) & mine[:, None]
+
+        quantities = tl.load(quantity_ptr + indices, mask=in_bucket, other=0)
+        prices = tl.load(price_ptr + indices, mask=in_bucket, other=0)
+        makers = tl.load(buyer_is_maker_ptr + indices, mask=in_bucket, other=False)
+
+        # Same int64 sums and sign convention as aggregate_features, per row.
+        total_quantity = tl.sum(quantities, axis=1)
+        signed_quantity = tl.sum(quantities * tl.where(makers, SIGN_SELL, SIGN_BUY), axis=1)
+        numerator_sum = tl.sum(prices * quantities, axis=1)
+
+        # The single floating-point step per bucket, in the reference's order.
+        has_quantity = total_quantity > 0
+        denominator = tl.where(has_quantity, total_quantity, 1).to(tl.float64)
+        vwap = numerator_sum.to(tl.float64) / denominator / PRICE_SCALE
+        vwap = tl.where(has_quantity, vwap, 0.0)
+
+        tl.store(event_count_ptr + buckets, length, mask=mine)
+        tl.store(total_quantity_ptr + buckets, total_quantity, mask=mine)
+        tl.store(signed_quantity_ptr + buckets, signed_quantity, mask=mine)
+        tl.store(vwap_ptr + buckets, vwap, mask=mine)
+        tl.store(valid_ptr + buckets, length > 0, mask=mine)
+
+    @triton.jit  # type: ignore[untyped-decorator]
+    def combine_partials_indexed(  # type: ignore[no-untyped-def]
+        partial_total_ptr,
+        partial_signed_ptr,
+        partial_numerator_ptr,
+        chunk_offsets_ptr,
+        bucket_ids_ptr,
+        offsets_ptr,
+        total_quantity_ptr,
+        event_count_ptr,
+        signed_quantity_ptr,
+        vwap_ptr,
+        valid_ptr,
+        BLOCK_SIZE: tl.constexpr,
+        PRICE_SCALE: tl.constexpr,
+    ):
+        # Pass 2 of the long-bucket schedule: program j combines the partials of
+        # long bucket j and writes the features at its bucket index. The body is
+        # combine_partials with one indirection; every long bucket has a chunk.
+        j = tl.program_id(0)
+        bucket = tl.load(bucket_ids_ptr + j)
+        first_chunk = tl.load(chunk_offsets_ptr + j)
+        last_chunk = tl.load(chunk_offsets_ptr + j + 1)
+
+        lanes = tl.arange(0, BLOCK_SIZE)
+        totals = tl.full((BLOCK_SIZE,), 0, tl.int64)
+        signeds = tl.full((BLOCK_SIZE,), 0, tl.int64)
+        numerators = tl.full((BLOCK_SIZE,), 0, tl.int64)
+        for base in range(first_chunk, last_chunk, BLOCK_SIZE):
+            indices = base + lanes
+            mask = indices < last_chunk
+            totals += tl.load(partial_total_ptr + indices, mask=mask, other=0)
+            signeds += tl.load(partial_signed_ptr + indices, mask=mask, other=0)
+            numerators += tl.load(partial_numerator_ptr + indices, mask=mask, other=0)
+        total = tl.sum(totals, axis=0)
+        signed = tl.sum(signeds, axis=0)
+        numerator = tl.sum(numerators, axis=0)
+
+        count = tl.load(offsets_ptr + bucket + 1) - tl.load(offsets_ptr + bucket)
+        has_quantity = total > 0
+        denominator = tl.where(has_quantity, total, 1).to(tl.float64)
+        vwap = numerator.to(tl.float64) / denominator / PRICE_SCALE
+        vwap = tl.where(has_quantity, vwap, 0.0)
+
+        tl.store(total_quantity_ptr + bucket, total)
+        tl.store(signed_quantity_ptr + bucket, signed)
+        tl.store(event_count_ptr + bucket, count)
+        tl.store(vwap_ptr + bucket, vwap)
+        tl.store(valid_ptr + bucket, count > 0)
+
 
 def _require_triton() -> None:
     """Raise ``RuntimeError`` with installation guidance when Triton is unavailable."""
@@ -466,6 +793,12 @@ def launch_aggregate(
         if plan.path == "one_pass":
             assert plan.block_size is not None
             launch_one_pass_unchecked(trades, offsets, features, plan.block_size)
+            return features
+        if plan.path == "grouped":
+            assert plan.block_size is not None and plan.chunk_size is not None
+            schedule = build_long_bucket_schedule(offsets, plan.block_size, plan.chunk_size)
+            partials = allocate_partials(schedule.chunks.n_chunks, offsets.device)
+            launch_grouped_unchecked(trades, offsets, features, plan, schedule, partials)
             return features
         assert plan.chunk_size is not None
         chunks = build_chunk_metadata(offsets, plan.chunk_size)
@@ -640,3 +973,74 @@ def launch_two_pass_unchecked(
     """Launch both passes in order into preallocated outputs and scratch, without validation."""
     launch_pass_1_unchecked(trades, chunks, partials)
     launch_pass_2_unchecked(offsets, chunks, partials, features)
+
+
+def launch_grouped_unchecked(
+    trades: Mapping[str, torch.Tensor],
+    offsets: torch.Tensor,
+    features: Mapping[str, torch.Tensor],
+    plan: DispatchPlan,
+    schedule: LongBucketSchedule,
+    partials: Mapping[str, torch.Tensor],
+) -> None:
+    """Launch the grouped short-bucket kernel and the long-bucket passes, without validation.
+
+    Up to three launches on the current stream: ``aggregate_grouped`` over
+    every bucket (it stores only buckets of at most ``plan.block_size``
+    records), then, when long buckets exist, pass 1 over their chunks and
+    ``combine_partials_indexed``. The two writers touch disjoint buckets, so
+    their order does not affect the result.
+
+    Args:
+        trades: Validated CUDA columns.
+        offsets: Validated CUDA bucket boundaries.
+        features: Output tensors from ``empty_features``.
+        plan: A ``"grouped"`` plan from ``plan_grouped``.
+        schedule: ``build_long_bucket_schedule(offsets, plan.block_size,
+            plan.chunk_size)`` on these offsets.
+        partials: Scratch from ``allocate_partials`` with
+            ``schedule.chunks.n_chunks`` slots.
+    """
+    import torch
+
+    assert plan.path == "grouped" and plan.block_size is not None and plan.group_size
+    n_buckets = offsets.numel() - 1
+    tile, group = plan.block_size, plan.group_size
+    with torch.cuda.device(offsets.device):
+        aggregate_grouped[(triton.cdiv(n_buckets, group),)](
+            trades["price"],
+            trades["quantity"],
+            trades["buyer_is_maker"],
+            offsets,
+            n_buckets,
+            features["total_quantity"],
+            features["event_count"],
+            features["signed_quantity"],
+            features["vwap"],
+            features["valid"],
+            GROUP=group,
+            TILE=tile,
+            PRICE_SCALE=PRICE_SCALE,
+            SIGN_BUY=SIGN_BUY_INITIATED,
+            SIGN_SELL=SIGN_SELL_INITIATED,
+            num_warps=_num_warps(group * tile),
+        )
+        if schedule.n_long == 0:
+            return
+        launch_pass_1_unchecked(trades, schedule.chunks, partials)
+        combine_partials_indexed[(schedule.n_long,)](
+            partials["total"],
+            partials["signed"],
+            partials["numerator"],
+            schedule.chunks.chunk_offsets,
+            schedule.bucket_ids,
+            offsets,
+            features["total_quantity"],
+            features["event_count"],
+            features["signed_quantity"],
+            features["vwap"],
+            features["valid"],
+            BLOCK_SIZE=COMBINE_BLOCK_SIZE,
+            PRICE_SCALE=PRICE_SCALE,
+            num_warps=4,
+        )

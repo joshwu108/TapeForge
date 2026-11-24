@@ -43,7 +43,10 @@ Path forcing:
     ``path="two_pass"`` lets the benchmark measure both paths on one
     workload; results are identical by contract. ``block_size`` forces the
     one-pass path with an explicit capacity check, exactly as
-    ``kernels.launch_aggregate`` does.
+    ``kernels.launch_aggregate`` does. ``path="grouped"`` selects the
+    grouped short-bucket kernel plus the long-bucket pass; there
+    ``block_size`` is the per-bucket tile and ``group_lanes`` the lanes per
+    program, and the long-bucket schedule is built once here.
 """
 
 from __future__ import annotations
@@ -53,7 +56,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from tapeforge import kernels
-from tapeforge.kernels import ChunkMetadata, DispatchPlan, PathChoice
+from tapeforge.kernels import ChunkMetadata, DispatchPlan, LongBucketSchedule, PathChoice
 
 if TYPE_CHECKING:
     import torch
@@ -82,8 +85,12 @@ class PreparedAggregation:
         plan: The chosen path and tile or chunk size.
         features: The five output tensors, each of shape ``(n_buckets,)``.
             Owned by this object and overwritten by every ``execute``.
-        chunks: Pass-1 schedule on the two-pass path; ``None`` on one-pass.
-        partials: Pass-1 scratch on the two-pass path; ``None`` on one-pass.
+        chunks: Pass-1 schedule on the two-pass path; ``None`` otherwise.
+        partials: Pass-1 scratch on the two-pass and grouped paths (on the
+            grouped path sized for the long buckets' chunks); ``None`` on
+            one-pass.
+        long_buckets: Long-bucket schedule on the grouped path; ``None``
+            otherwise.
     """
 
     trades: Mapping[str, torch.Tensor]
@@ -93,6 +100,7 @@ class PreparedAggregation:
     features: dict[str, torch.Tensor]
     chunks: ChunkMetadata | None
     partials: dict[str, torch.Tensor] | None
+    long_buckets: LongBucketSchedule | None = None
 
     @property
     def path(self) -> str:
@@ -101,7 +109,9 @@ class PreparedAggregation:
 
     @property
     def n_chunks(self) -> int:
-        """Return the number of pass-1 programs on the two-pass path; 0 on one-pass."""
+        """Return the number of pass-1 programs (two-pass, or the grouped path's long buckets)."""
+        if self.long_buckets is not None:
+            return self.long_buckets.chunks.n_chunks
         return self.chunks.n_chunks if self.chunks is not None else 0
 
     def execute(self) -> dict[str, torch.Tensor]:
@@ -119,6 +129,12 @@ class PreparedAggregation:
             assert self.plan.block_size is not None
             kernels.launch_one_pass_unchecked(
                 self.trades, self.offsets, self.features, self.plan.block_size
+            )
+        elif self.plan.path == "grouped":
+            assert self.long_buckets is not None and self.partials is not None
+            kernels.launch_grouped_unchecked(
+                self.trades, self.offsets, self.features, self.plan, self.long_buckets,
+                self.partials,
             )
         else:
             assert self.chunks is not None and self.partials is not None
@@ -161,6 +177,7 @@ def prepare(
     *,
     block_size: int | None = None,
     path: PathChoice = "auto",
+    group_lanes: int | None = None,
 ) -> PreparedAggregation:
     """Validate once and preallocate everything ``execute`` needs.
 
@@ -170,8 +187,12 @@ def prepare(
     Args:
         trades: Mapping of column name to CUDA tensor.
         offsets: CUDA int64 bucket boundaries of length ``n_buckets + 1``.
-        block_size: Explicit one-pass tile; implies ``path="one_pass"``.
-        path: ``"auto"``, ``"one_pass"`` or ``"two_pass"``.
+        block_size: Explicit one-pass tile; implies ``path="one_pass"``
+            unless ``path="grouped"``, where it is the per-bucket tile
+            (default: ``kernels.choose_grouped_tile``, one extra host sync).
+        path: ``"auto"``, ``"one_pass"``, ``"two_pass"`` or ``"grouped"``.
+        group_lanes: Lanes per program on the grouped path (default
+            ``kernels.GROUP_LANES``); rejected on the other paths.
 
     Raises:
         ValueError: ``path`` is invalid, ``block_size`` is combined with
@@ -189,17 +210,34 @@ def prepare(
     if offsets.device.type != "cuda":
         raise ValueError("prepare needs CUDA tensors; use ops.aggregate for CPU inputs")
     summary = validate_columns(trades, offsets)
-    plan = kernels.plan_dispatch(summary.max_bucket_len, block_size, path)
+    if group_lanes is not None and path != "grouped":
+        raise ValueError("group_lanes applies to path='grouped' only")
+    if path == "grouped":
+        tile = block_size
+        if tile is None:
+            with torch.cuda.device(offsets.device):
+                tile = kernels.choose_grouped_tile(offsets)
+        plan = kernels.plan_grouped(
+            summary.max_bucket_len, tile, group_lanes or kernels.GROUP_LANES
+        )
+    else:
+        plan = kernels.plan_dispatch(summary.max_bucket_len, block_size, path)
 
     # Hold only the columns the kernels read, so extra columns are not kept alive.
     held = {name: trades[name] for name in COLUMNS}
     with torch.cuda.device(offsets.device):
         features = kernels.empty_features(summary.n_buckets, offsets.device)
-        chunks = partials = None
+        chunks = partials = long_buckets = None
         if plan.path == "two_pass":
             assert plan.chunk_size is not None
             chunks = kernels.build_chunk_metadata(offsets, plan.chunk_size)
             partials = kernels.allocate_partials(chunks.n_chunks, offsets.device)
+        elif plan.path == "grouped":
+            assert plan.block_size is not None and plan.chunk_size is not None
+            long_buckets = kernels.build_long_bucket_schedule(
+                offsets, plan.block_size, plan.chunk_size
+            )
+            partials = kernels.allocate_partials(long_buckets.chunks.n_chunks, offsets.device)
     return PreparedAggregation(
         trades=held,
         offsets=offsets,
@@ -208,4 +246,5 @@ def prepare(
         features=features,
         chunks=chunks,
         partials=partials,
+        long_buckets=long_buckets,
     )

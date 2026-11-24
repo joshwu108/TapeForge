@@ -72,6 +72,7 @@ OUTPUT_BYTES_PER_BUCKET = 33  # three int64, one float64, one bool
 PIPELINE_OPTIONS: dict[str, dict[str, Any]] = {
     "pipelined": {},
     "pipelined_int32": {"int32_transfer": True},
+    "pipelined_grouped": {"path": "grouped"},
 }
 
 

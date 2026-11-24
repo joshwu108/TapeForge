@@ -30,6 +30,9 @@ Variants (``variants`` in the config):
                     quantities cross the bus as int32 when every value fits
                     (else int64; the row records which), widened on the
                     device before the same kernels run
+    pinned_streams_grouped[_int32]
+                    pinned_streams with ``path="grouped"`` (each batch on the
+                    grouped short-bucket path), optionally with int32 transfer
 
 The two batched variants start from the same pageable columns as
 ``pageable_sync`` and include the copy into pinned staging; their timed
@@ -74,6 +77,8 @@ BATCHED_OPTIONS: dict[str, dict[str, Any]] = {
     "pinned_streams": {},
     "batched_sync": {},
     "pinned_streams_int32": {"int32_transfer": True},
+    "pinned_streams_grouped": {"path": "grouped"},
+    "pinned_streams_grouped_int32": {"path": "grouped", "int32_transfer": True},
 }
 BATCHED_VARIANTS = tuple(BATCHED_OPTIONS)
 IMPLEMENTED_VARIANTS = ("pageable_sync", "pinned_sync", *BATCHED_VARIANTS)

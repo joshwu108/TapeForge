@@ -14,7 +14,8 @@ time).
 Every case runs through every requested path: ``auto`` (``ops.aggregate``,
 the checked API), ``two_pass`` (prepared, forced), ``pipelined``
 (``tapeforge.pipelined.aggregate_host`` with a random batch budget and slot
-count) and any other ``prepared.prepare`` path name, with path options
+count; ``pipelined_grouped`` the same with ``path="grouped"`` and a random
+lane count) and any other ``prepared.prepare`` path name, with path options
 drawn from the seed. A path the installed library does not provide is
 reported ``not_available`` for the whole run. The output lists the seeds,
 the counts per path and the seeds of any failing case, so a failure can be
@@ -102,12 +103,14 @@ def run_path(path: str, trades: np.ndarray, offsets: np.ndarray, rng: np.random.
     """Run one path on one case; return its features and the options used."""
     from tapeforge import ops, pipelined, prepared
 
-    if path == "pipelined":
+    if path in ("pipelined", "pipelined_grouped"):
         options: dict[str, Any] = {"batch_records": int(rng.choice([1, 7, 64, 1000, 1 << 20])),
                                    "slots": int(rng.integers(1, 4))}
         # The int32 transfer applies only when the case's values fit; otherwise it
         # falls back to int64, which the comparison covers as well.
         options["int32_transfer"] = bool(rng.random() < 0.5)
+        if path == "pipelined_grouped":
+            options |= {"path": "grouped", "group_lanes": int(rng.choice([2, 64, 1024]))}
         return {"features": pipelined.aggregate_host(trades, offsets, **options),
                 "options": options}
     columns = {n: torch.from_numpy(trades[n].copy()).cuda()
